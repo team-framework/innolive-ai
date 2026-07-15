@@ -1,9 +1,11 @@
 syntax = "proto3";
 
 service AiProcessor {
-  rpc ProcessData(stream VideoChunk) returns (stream ProcessedVideoChunk);
+    rpc ProcessVideo(stream VideoChunk) returns (stream ProcessedVideoChunk);
+    rpc AddWhitelist(FaceData) returns (WhitelistResponse);
 }
 
+// ProcessVideo
 message VideoChunk {
     bytes data = 1;
     int64 timestamp = 2;
@@ -13,4 +15,14 @@ message ProcessedVideoChunk {
     bytes data = 1;
     int64 timestamp = 2;
     string status_message = 3;
+}
+
+// AddWhitelist
+message FaceData {
+    bytes data = 1;
+}
+
+message WhitelistResponse {
+    string status_message = 1;
+    int64 timestamp = 2;
 }
