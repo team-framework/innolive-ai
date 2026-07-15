@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+service AiProcessor {
+  rpc ProcessData(stream VideoChunk) returns (stream ProcessedVideoChunk);
+}
+
+message VideoChunk {
+    bytes data = 1;
+    int64 timestamp = 2;
+}
+
+message ProcessedVideoChunk {
+    bytes data = 1;
+    int64 timestamp = 2;
+    string status_message = 3;
+}
