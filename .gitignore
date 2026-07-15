@@ -1,0 +1,72 @@
+# ==========================================
+# Python Bytecode & Cache
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==========================================
+# Virtual Environments & Package Managers
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+lib/
+lib64/
+.parts/
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+wheels/
+share/python-wheels/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================================
+# Environment Variables & Secrets (CRITICAL)
+# ==========================================
+.env
+.env.local
+.env.*.local
+*.env
+.secret
+credentials.json
+# Allow committing an example template file if used
+!.env.example
+
+# ==========================================
+# Databases & Server Storage
+# ==========================================
+*.db
+*.sqlite3
+*.sqlite3-journal
+*.log
+*.pid
+media/
+staticfiles/
+dump.rdb
+
+# ==========================================
+# IDEs & Editors
+# ==========================================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm / JetBrains
+.idea/
+
+# General
+.DS_Store
+Thumbs.db
+*.swp
