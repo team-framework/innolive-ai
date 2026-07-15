@@ -3,3 +3,10 @@
 양방향 gRPC 프로토콜을 통해 클라이언트의 영상을 실시간으로 비식별화하는 작업을 수행합니다.
 
 주요 기술: Python, gRPC, YOLO, DeepFace, MediaPipe
+
+grpc 파일 생성 Command
+```bash
+python3 -m grpc_tools.protoc --proto_path=./protos  \
+ --python_out=__generated__ --pyi_out=__generated__ --grpc_python_out=__generated__ \
+ ./protos/ai_processor.proto 
+```
