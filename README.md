@@ -10,3 +10,8 @@ python3 -m grpc_tools.protoc --proto_path=./protos  \
  --python_out=__generated__ --pyi_out=__generated__ --grpc_python_out=__generated__ \
  ./protos/ai_processor.proto 
 ```
+
+실행 Command
+```bash
+python3 ai_processor_server.py
+```
