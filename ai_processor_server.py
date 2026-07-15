@@ -7,15 +7,32 @@ sys.path.insert(0, str(GENERATED_DIR))
 import logging
 import time
 from concurrent import futures
+from typing import Iterator
 
 import grpc
 from __generated__ import ai_processor_pb2_grpc
-from __generated__.ai_processor_pb2 import WhitelistResponse
+from __generated__.ai_processor_pb2 import WhitelistResponse, VideoChunk, ProcessedVideoChunk
+
+from service.transform_image import to_grayscale
 
 class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
 
-    def ProcessVideo(self, request, context):
-        return
+    def ProcessVideo(self, request_iterator: Iterator[VideoChunk], context):
+        for request in request_iterator:
+            try:
+                processed_image = to_grayscale(request.data)
+                yield ProcessedVideoChunk(
+                    data=processed_image,
+                    status_message="success",
+                    timestamp=request.timestamp,
+                )
+            except Exception as e:
+                print(f"error occurred while processing video: {e}")
+                yield ProcessedVideoChunk(
+                    data=None,
+                    status_message="failed",
+                    timestamp=request.timestamp,
+                )
 
     def AddWhitelist(self, request, context):
         return WhitelistResponse(
