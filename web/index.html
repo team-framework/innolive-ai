@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>InnoLive Face Blur</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">YOLO26 · GPU microbatch TensorRT · BoT-SORT</p>
+          <h1>Face blur stream</h1>
+        </div>
+        <div class="controls">
+          <button id="toggle">Start camera</button>
+        </div>
+      </header>
+
+      <section class="stage">
+        <video id="camera" playsinline muted></video>
+        <canvas id="output"></canvas>
+        <div id="empty">카메라를 시작하면 얼굴 영역만 블러 처리됩니다.</div>
+      </section>
+
+      <section class="metrics" aria-label="stream metrics">
+        <article><span>Status</span><strong id="status">Idle</strong></article>
+        <article>
+          <span>Capture→display / queue</span
+          ><strong id="latency">— / 0</strong>
+        </article>
+        <article>
+          <span>Capture JPEG / queue</span
+          ><strong id="capture-time">— / —</strong>
+        </article>
+        <article>
+          <span>WS + gateway + gRPC residual (total · q/w/g/r/o)</span
+          ><strong id="transport-time">—</strong>
+        </article>
+        <article>
+          <span>Server JPEG decode</span><strong id="decode-time">—</strong>
+        </article>
+        <article>
+          <span>TensorRT + tracking</span><strong id="ai-time">—</strong>
+        </article>
+        <article>
+          <span>Blur + JPEG encode</span><strong id="encode-time">—</strong>
+        </article>
+        <article>
+          <span>Browser JPEG decode</span
+          ><strong id="browser-decode-time">—</strong>
+        </article>
+        <article>
+          <span>Dropped capture / display</span
+          ><strong id="dropped">0 / 0</strong>
+        </article>
+      </section>
+    </main>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
