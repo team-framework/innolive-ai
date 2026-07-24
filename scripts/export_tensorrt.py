@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 from pathlib import Path
 
 from ultralytics import YOLO
@@ -18,7 +20,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default="0", help="CUDA device index")
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--batch", type=int, choices=(1, 4), default=1)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Defaults to models/best_b1.engine or models/best_b4.engine",
+    )
     parser.add_argument(
         "--workspace",
         type=float,
@@ -66,22 +73,34 @@ def main() -> None:
             f"Expected a segment model with class mapping 0: head, got {model.task=} {names=}"
         )
 
-    export_args = {
-        "format": "engine",
-        "device": args.device,
-        "imgsz": args.imgsz,
-        "batch": args.batch,
-        "dynamic": args.dynamic,
-        "workspace": args.workspace,
-        "quantize": 8 if args.int8 else 16,
-        "simplify": True,
-        "nms": True,
-    }
-    if args.int8:
-        export_args["data"] = str(args.data.expanduser().resolve())
-        export_args["fraction"] = args.fraction
+    output = (
+        args.output.expanduser().resolve()
+        if args.output
+        else ROOT / "models" / f"best_b{args.batch}.engine"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as directory:
+        staged_model = Path(directory) / model_path.name
+        shutil.copy2(model_path, staged_model)
+        staged = YOLO(str(staged_model), task="segment")
+        export_args = {
+            "format": "engine",
+            "device": args.device,
+            "imgsz": args.imgsz,
+            "batch": args.batch,
+            "dynamic": args.dynamic,
+            "workspace": args.workspace,
+            "quantize": 8 if args.int8 else 16,
+            "simplify": True,
+            "nms": True,
+        }
+        if args.int8:
+            export_args["data"] = str(args.data.expanduser().resolve())
+            export_args["fraction"] = args.fraction
+        exported = staged.export(**export_args)
+        shutil.move(exported, output)
 
-    engine_path = Path(model.export(**export_args)).resolve()
+    engine_path = output.resolve()
     print(f"TensorRT engine written to: {engine_path}")
     print("The server will automatically prefer it over best.pt on this GPU.")
 

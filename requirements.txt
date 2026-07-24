@@ -1,7 +1,8 @@
-grpcio>=1.70,<1.82
-grpcio-tools>=1.70,<1.82
+grpcio>=1.74,<1.82
+grpcio-tools>=1.74,<1.82
+lap>=0.5.12,<1
 numpy>=2.0,<3
-opencv-python-headless>=4.10,<5
+opencv-python!=4.13.0.90,>=4.11,<6
 Pillow>=11,<13
 protobuf>=6.31,<7
 # BoT-SORT is used through Ultralytics' tracker API, so keep this minor line pinned.
