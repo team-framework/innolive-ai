@@ -5,19 +5,53 @@ service AiProcessor {
     rpc AddWhitelist(FaceData) returns (WhitelistResponse);
 }
 
-// ProcessVideo
 message VideoChunk {
     bytes data = 1;
     int64 timestamp = 2;
+    int64 frame_id = 3;
+    uint32 batch_size = 4;
 }
 
 message ProcessedVideoChunk {
     bytes data = 1;
     int64 timestamp = 2;
     string status_message = 3;
+    repeated FaceMetadata faces = 4;
+    int32 width = 5;
+    int32 height = 6;
+    int64 frame_id = 7;
+    double processing_ms = 8;
+    ProcessingTiming timing = 9;
 }
 
-// AddWhitelist
+message ProcessingTiming {
+    double queue_ms = 1;
+    double decode_ms = 2;
+    double inference_ms = 3;
+    double tracking_ms = 4;
+    double blur_encode_ms = 5;
+    uint32 inference_batch_size = 6;
+}
+
+message Point {
+    float x = 1;
+    float y = 2;
+}
+
+message BoundingBox {
+    float x1 = 1;
+    float y1 = 2;
+    float x2 = 3;
+    float y2 = 4;
+}
+
+message FaceMetadata {
+    BoundingBox bbox = 1;
+    float confidence = 2;
+    repeated Point polygon = 3;
+    optional int64 track_id = 4;
+}
+
 message FaceData {
     bytes data = 1;
 }
