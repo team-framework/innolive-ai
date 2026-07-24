@@ -72,3 +72,11 @@ dump.rdb
 .DS_Store
 Thumbs.db
 *.swp
+
+# Local benchmark tooling and generated performance reports
+/.benchmark-tools/
+/benchmark-results/
+
+# TensorRT engines are compiled for one NVIDIA GPU/TensorRT stack. Build them on
+# the deployment machine from the tracked best.pt checkpoint.
+/models/*.engine
