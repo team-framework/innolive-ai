@@ -1,0 +1,18 @@
+# BoT-SORT settings tuned for stable head masks in a real-time video stream.
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.80
+fuse_score: true
+
+# Camera motion compensation keeps IDs stable when the camera itself moves.
+gmc_method: sparseOptFlow
+
+# ReID adds another model and synchronization point. Motion + IoU association is
+# faster for the short head occlusions handled by mask_hold_frames.
+proximity_thresh: 0.50
+appearance_thresh: 0.80
+with_reid: false
+model: auto
