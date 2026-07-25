@@ -619,6 +619,7 @@ class App {
   updateMetrics(item, latency, now) {
     const timing = item.metadata.timing_ms || {};
     const elapsedMs = Math.max(0, now - this.measurementStartedAt);
+    const elapsedSeconds = Math.max(elapsedMs / 1000, Number.EPSILON);
     const metrics = {
       profile: PROFILE,
       seq: item.sequence,
@@ -633,6 +634,9 @@ class App {
       result_frames: this.frameCounts.result,
       display_frames: this.frameCounts.display,
       run_elapsed_ms: Number(elapsedMs.toFixed(3)),
+      exact_capture_fps: Number((this.frameCounts.capture / elapsedSeconds).toFixed(6)),
+      exact_result_fps: Number((this.frameCounts.result / elapsedSeconds).toFixed(6)),
+      exact_display_fps: Number((this.frameCounts.display / elapsedSeconds).toFixed(6)),
       exact_display_capture_ratio: this.frameCounts.capture
         ? Number((this.frameCounts.display / this.frameCounts.capture).toFixed(6))
         : 0,
