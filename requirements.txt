@@ -1,6 +1,7 @@
 fastapi>=0.116,<1
 lap>=0.5.12,<1
 numpy>=2.0,<3
+nvidia-ml-py>=13,<14
 opencv-python!=4.13.0.90,>=4.11,<6
 ultralytics==8.4.104
 uvicorn[standard]>=0.35,<1
