@@ -3,60 +3,53 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>InnoLive Face Blur</title>
+    <title>InnoLive B1-640-Q90-W5</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <main>
-      <header>
-        <div>
-          <p class="eyebrow">YOLO26 · GPU microbatch TensorRT · BoT-SORT</p>
-          <h1>Face blur stream</h1>
-        </div>
-        <div class="controls">
-          <button id="toggle">Start camera</button>
-        </div>
-      </header>
+    <header>
+      <div>
+        <p>INNOLIVE / ILF1 / LOW LATENCY</p>
+        <h1>B1-640-Q90-W5 face anonymizer</h1>
+      </div>
+      <strong id="status" data-online="false">보호 결과 대기 중</strong>
+    </header>
 
-      <section class="stage">
-        <video id="camera" playsinline muted></video>
-        <canvas id="output"></canvas>
-        <div id="empty">카메라를 시작하면 얼굴 영역만 블러 처리됩니다.</div>
+    <main>
+      <section class="controls panel">
+        <button id="start">카메라 시작</button>
+        <button id="stop" disabled>중지</button>
+        <span>static FP16 B1 · long edge 640 · JPEG Q90 · window 5</span>
       </section>
 
-      <section class="metrics" aria-label="stream metrics">
-        <article><span>Status</span><strong id="status">Idle</strong></article>
-        <article>
-          <span>Capture→display / queue</span
-          ><strong id="latency">— / 0</strong>
+      <section class="viewers">
+        <article class="panel danger">
+          <h2>개발용 원본 preview <em>보호 출력 아님</em></h2>
+          <video id="source" autoplay muted playsinline></video>
         </article>
-        <article>
-          <span>Capture JPEG / queue</span
-          ><strong id="capture-time">— / —</strong>
+        <article class="panel protected">
+          <h2>Fail-closed 보호 출력</h2>
+          <canvas id="output" width="640" height="360"></canvas>
         </article>
-        <article>
-          <span>WS + gateway + gRPC residual (total · q/w/g/r/o)</span
-          ><strong id="transport-time">—</strong>
-        </article>
-        <article>
-          <span>Server JPEG decode</span><strong id="decode-time">—</strong>
-        </article>
-        <article>
-          <span>TensorRT + tracking</span><strong id="ai-time">—</strong>
-        </article>
-        <article>
-          <span>Blur + JPEG encode</span><strong id="encode-time">—</strong>
-        </article>
-        <article>
-          <span>Browser JPEG decode</span
-          ><strong id="browser-decode-time">—</strong>
-        </article>
-        <article>
-          <span>Dropped capture / display</span
-          ><strong id="dropped">0 / 0</strong>
-        </article>
+      </section>
+
+      <section class="metrics panel" aria-label="pipeline metrics">
+        <div><span>Capture / encoded FPS</span><strong id="capture-fps">0 / 0</strong></div>
+        <div><span>Result FPS</span><strong id="result-fps">0</strong></div>
+        <div><span>Displayed FPS</span><strong id="display-fps">0</strong></div>
+        <div><span>RTT / p95</span><strong id="round-trip">—</strong></div>
+        <div><span>Server total</span><strong id="server-time">—</strong></div>
+        <div><span>Pending / in-flight</span><strong id="queue">0 / 0</strong></div>
+        <div><span>Dropped capture / result</span><strong id="dropped">0 / 0</strong></div>
+      </section>
+
+      <section class="panel diagnostics">
+        <h2>현재 terminal metadata와 분리 metric</h2>
+        <pre id="diagnostics">아직 유효한 보호 결과가 없습니다.</pre>
       </section>
     </main>
+
+    <canvas id="capture" hidden></canvas>
     <script type="module" src="/static/app.js"></script>
   </body>
 </html>
