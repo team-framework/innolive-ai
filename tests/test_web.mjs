@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 
 import {
+  BitmapLease,
+  LatestRenderQueue,
   PROFILE,
+  captureDeadline,
   fitLongEdge,
   framePacket,
   parseTerminal,
@@ -37,5 +40,64 @@ assert.throws(() => parseTerminal('{"v":1,"type":"result"}'));
 assert.equal(percentile([1, 2, 3, 4], 0.50), 2);
 assert.equal(percentile([1, 2, 3, 4], 0.95), 4);
 assert.equal(percentile([], 0.95), null);
+
+let deadline = null;
+let dueFrames = 0;
+for (let index = 0; index < 60; index += 1) {
+  const jitter = index % 2 ? -0.9 : 0.7;
+  const decision = captureDeadline(deadline, index * (1000 / 30) + jitter);
+  deadline = decision.nextDeadline;
+  if (decision.due) dueFrames += 1;
+}
+assert.equal(dueFrames, 60, "normal 32.x ms jitter must not halve capture cadence");
+const delayed = captureDeadline(100, 240);
+assert.equal(delayed.due, true);
+assert.ok(delayed.nextDeadline > 242, "missed deadlines must not create a catch-up burst");
+
+let clock = 10;
+let normalCloses = 0;
+let normalReleases = 0;
+const normalLease = new BitmapLease(
+  jpeg,
+  () => Promise.resolve({ close: () => { normalCloses += 1; } }),
+  () => clock,
+  () => { normalReleases += 1; },
+);
+clock = 14;
+assert.ok(await normalLease.promise);
+assert.equal(normalLease.decodeMs, 4);
+assert.equal(normalLease.release(), true);
+assert.equal(normalLease.release(), false);
+assert.equal(normalCloses, 1, "a rendered bitmap must close exactly once");
+assert.equal(normalReleases, 1, "a bitmap ownership lease must release exactly once");
+
+let resolveLateBitmap;
+let lateCloses = 0;
+const lateLease = new BitmapLease(
+  jpeg,
+  () => new Promise((resolve) => { resolveLateBitmap = resolve; }),
+  () => 0,
+);
+assert.equal(lateLease.release(), true);
+resolveLateBitmap({ close: () => { lateCloses += 1; } });
+assert.equal(await lateLease.promise, null);
+assert.equal(lateCloses, 1, "a decode-late-resolve bitmap must close exactly once");
+
+const renderQueue = new LatestRenderQueue();
+const frame1 = { sequence: 1 };
+const frame2 = { sequence: 2 };
+const frame3 = { sequence: 3 };
+assert.equal(renderQueue.enqueue(frame1).accepted, true);
+assert.equal(renderQueue.begin(), frame1);
+assert.equal(renderQueue.enqueue(frame2).dropped, null);
+assert.equal(renderQueue.enqueue(frame3).dropped, frame2);
+assert.equal(renderQueue.active, frame1, "a newer result must not cancel active render");
+assert.equal(renderQueue.commit(frame1), true);
+renderQueue.finish(frame1);
+assert.equal(renderQueue.begin(), frame3, "only the latest not-started render may survive");
+assert.equal(renderQueue.commit(frame3), true);
+renderQueue.finish(frame3);
+assert.equal(renderQueue.lastCommittedSequence, 3);
+assert.equal(renderQueue.enqueue(frame2).accepted, false, "commit sequence must be monotonic");
 
 console.log("ILF1 B1-640-Q90-W5 browser contract passed");
