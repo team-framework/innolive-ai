@@ -77,6 +77,6 @@ Thumbs.db
 /.benchmark-tools/
 /benchmark-results/
 
-# TensorRT engines are compiled for one NVIDIA GPU/TensorRT stack. Build them on
-# the deployment machine from the tracked best.pt checkpoint.
+# The standard B1 engine is compiled for one NVIDIA GPU/TensorRT stack. Build it
+# on the deployment machine; its tracked manifest validates the local artifact.
 /models/*.engine

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "standard_profile": "B1-640-Q90-W5",
+  "created_at": "2026-07-25T06:48:07+00:00",
+  "source_checkpoint": "best.pt",
+  "source_sha256": "c1b62c95c8a901411d46767a8377b9ec27d50c408b396ad15fbab9b9748ae35b",
+  "engine": "best_b1.engine",
+  "engine_sha256": "24ee6b3a421ba104fd9b7b10382880defd77ce6e900c03b36402363f62b33d42",
+  "precision": "fp16",
+  "dynamic": false,
+  "batch": 1,
+  "image_size": 640,
+  "class_names": {
+    "0": "face"
+  },
+  "workspace_gib": 4.0,
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "torch": "2.11.0+cu128",
+  "ultralytics": "8.4.104",
+  "tensorrt": "11.1.0.106",
+  "python": "3.12.13",
+  "note": "Rebuild and re-run acceptance tests on every deployment GPU/TensorRT stack."
+}
