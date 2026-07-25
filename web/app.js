@@ -207,6 +207,8 @@ class App {
     this.lastTerminalSequence = 0;
     this.renderQueue = new LatestRenderQueue();
     this.measurementStartedAt = null;
+    this.lastMetricSampleAt = null;
+    this.metricHistory = [];
     this.frameCounts = { capture: 0, encoded: 0, sent: 0, result: 0, display: 0 };
     this.counters = {
       captureDropped: 0,
@@ -232,6 +234,7 @@ class App {
       captureToDisplay: [],
     };
     window.__INNOLIVE_BITMAP_OWNERS__ = 0;
+    window.__INNOLIVE_METRIC_HISTORY__ = this.metricHistory;
   }
 
   async start() {
@@ -278,6 +281,7 @@ class App {
         if (generation !== this.generation || socket !== this.socket) return;
         this.running = true;
         this.measurementStartedAt = performance.now();
+        this.lastMetricSampleAt = this.measurementStartedAt;
         this.elements.stop.disabled = false;
         this.setStatus("연결됨 · ILF1 B1-640-Q90-W5", true);
         this.blackout("첫 보호 결과 대기 중");
@@ -667,6 +671,13 @@ class App {
     this.elements.dropped.textContent = `${metrics.capture_dropped} / ${metrics.stale_results + metrics.render_dropped}`;
     this.elements.diagnostics.textContent = JSON.stringify(metrics, null, 2);
     window.__INNOLIVE_METRICS__ = metrics;
+    if (now - this.lastMetricSampleAt >= 1000) {
+      this.lastMetricSampleAt = now;
+      const browserSample = { ...metrics };
+      delete browserSample.server;
+      this.metricHistory.push(browserSample);
+      if (this.metricHistory.length > 300) this.metricHistory.shift();
+    }
     window.dispatchEvent(new CustomEvent("innolive:metrics", { detail: metrics }));
   }
 
