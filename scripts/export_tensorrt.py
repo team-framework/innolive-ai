@@ -1,108 +1,135 @@
 #!/usr/bin/env python3
-"""Build a GPU-specific TensorRT engine for the head segmentation model."""
+"""Export the standard static B1-640 FP16 TensorRT face model."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import platform
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
+import tensorrt
+import torch
+import ultralytics
 from ultralytics import YOLO
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = ROOT / "models" / "best.pt"
+DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
+DEFAULT_OUTPUT = ROOT / "models" / "best_b1.engine"
+IMAGE_SIZE = 640
+MODEL_CLASS = {0: "face"}
+STANDARD_PROFILE = "B1-640-Q90-W5"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--device", default="0", help="CUDA device index")
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, choices=(1, 4), default=1)
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Defaults to models/best_b1.engine or models/best_b4.engine",
-    )
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--device", default="0")
     parser.add_argument(
         "--workspace",
         type=float,
         default=4.0,
-        help="Maximum TensorRT builder workspace in GiB",
+        help="TensorRT builder workspace in GiB",
     )
     parser.add_argument(
-        "--dynamic",
+        "--force",
         action="store_true",
-        help="Support variable shapes/batches at a small performance cost",
-    )
-    parser.add_argument(
-        "--int8",
-        action="store_true",
-        help="Build INT8 instead of FP16; requires representative calibration data",
-    )
-    parser.add_argument(
-        "--data",
-        type=Path,
-        help="Ultralytics dataset YAML used for INT8 calibration",
-    )
-    parser.add_argument(
-        "--fraction",
-        type=float,
-        default=1.0,
-        help="Fraction of the calibration dataset to use for INT8",
+        help="atomically replace an existing engine and manifest",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    model_path = args.model.expanduser().resolve()
-    if not model_path.is_file():
-        raise SystemExit(f"Model does not exist: {model_path}")
-    if args.int8 and args.data is None:
-        raise SystemExit("--int8 requires --data with representative head images")
-    if args.data is not None and not args.data.expanduser().is_file():
-        raise SystemExit(f"Dataset YAML does not exist: {args.data.expanduser()}")
+    checkpoint = args.checkpoint.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise SystemExit(f"checkpoint not found: {checkpoint}")
+    if output.suffix.lower() != ".engine":
+        raise SystemExit("--output must end in .engine")
+    if output.exists() and not args.force:
+        raise SystemExit(f"output already exists: {output} (use --force to replace it)")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is unavailable; build on the deployment NVIDIA host")
 
-    model = YOLO(str(model_path), task="segment")
-    names = {int(key): str(value) for key, value in model.names.items()}
-    if model.task != "segment" or names.get(0, "").lower() != "head":
+    source = YOLO(str(checkpoint), task="segment")
+    names = {int(key): str(value).strip().lower() for key, value in source.names.items()}
+    if source.task != "segment" or names != MODEL_CLASS:
         raise SystemExit(
-            f"Expected a segment model with class mapping 0: head, got {model.task=} {names=}"
+            f"expected a face segmentation checkpoint with names={MODEL_CLASS}, "
+            f"got task={source.task!r}, names={names!r}"
         )
 
-    output = (
-        args.output.expanduser().resolve()
-        if args.output
-        else ROOT / "models" / f"best_b{args.batch}.engine"
-    )
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as directory:
-        staged_model = Path(directory) / model_path.name
-        shutil.copy2(model_path, staged_model)
-        staged = YOLO(str(staged_model), task="segment")
-        export_args = {
-            "format": "engine",
-            "device": args.device,
-            "imgsz": args.imgsz,
-            "batch": args.batch,
-            "dynamic": args.dynamic,
-            "workspace": args.workspace,
-            "quantize": 8 if args.int8 else 16,
-            "simplify": True,
-            "nms": True,
-        }
-        if args.int8:
-            export_args["data"] = str(args.data.expanduser().resolve())
-            export_args["fraction"] = args.fraction
-        exported = staged.export(**export_args)
-        shutil.move(exported, output)
+    with tempfile.TemporaryDirectory(prefix=".trt-export-", dir=output.parent) as temporary:
+        temporary_path = Path(temporary)
+        staged_checkpoint = temporary_path / "best.pt"
+        shutil.copy2(checkpoint, staged_checkpoint)
+        model = YOLO(str(staged_checkpoint), task="segment")
+        exported = Path(
+            model.export(
+                format="engine",
+                imgsz=IMAGE_SIZE,
+                batch=1,
+                quantize=16,
+                dynamic=False,
+                simplify=True,
+                nms=False,
+                workspace=args.workspace,
+                device=args.device,
+            )
+        )
+        if not exported.is_file():
+            raise RuntimeError(f"Ultralytics did not create an engine: {exported}")
+        staged_engine = output.with_suffix(output.suffix + ".tmp")
+        shutil.copy2(exported, staged_engine)
+        staged_engine.replace(output)
 
-    engine_path = output.resolve()
-    print(f"TensorRT engine written to: {engine_path}")
-    print("The server will automatically prefer it over best.pt on this GPU.")
+    manifest = {
+        "schema_version": 1,
+        "standard_profile": STANDARD_PROFILE,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_checkpoint": checkpoint.name,
+        "source_sha256": sha256_file(checkpoint),
+        "engine": output.name,
+        "engine_sha256": sha256_file(output),
+        "precision": "fp16",
+        "dynamic": False,
+        "batch": 1,
+        "image_size": IMAGE_SIZE,
+        "class_names": {"0": "face"},
+        "workspace_gib": args.workspace,
+        "gpu": torch.cuda.get_device_name(int(args.device)),
+        "torch": torch.__version__,
+        "ultralytics": ultralytics.__version__,
+        "tensorrt": tensorrt.__version__,
+        "python": platform.python_version(),
+        "note": "Rebuild and re-run acceptance tests on every deployment GPU/TensorRT stack.",
+    }
+    manifest_path = output.with_suffix(output.suffix + ".json")
+    staged_manifest = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    staged_manifest.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    staged_manifest.replace(manifest_path)
+    print(f"engine:   {output}")
+    print(f"manifest: {manifest_path}")
+    print(f"sha256:   {manifest['engine_sha256']}")
 
 
 if __name__ == "__main__":
