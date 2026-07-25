@@ -1,6 +1,7 @@
 # InnoLive B1-640-Q90-W5 face anonymizer
 
-InnoLive의 표준 저지연 경로만 구현한 face segmentation/tracking 서버입니다.
+InnoLive 초저지연 영상 추론 서빙 표준 **1.1**의 고정 경로만 구현한 face
+segmentation/tracking 서버입니다.
 클라이언트는 long edge 640 JPEG Q90 frame을 ILF1 WebSocket으로 전송하고, 서버는
 정적 FP16 TensorRT B1 추론과 connection-local BoT-SORT를 순서대로 실행한 뒤
 metadata JSON만 반환합니다. 입력 JPEG나 원본 pixel은 응답하지 않습니다.
@@ -14,9 +15,11 @@ metadata JSON만 반환합니다. 입력 JPEG나 원본 pixel은 응답하지 �
 | 전송 frame | aspect ratio 유지, long edge 640 |
 | 작은 입력 | 확대하지 않음 (`upscale_small_inputs=false`) |
 | JPEG | Q90 |
-| WebSocket protocol | ILF1 single-frame request |
+| WebSocket protocol | persistent WS, binary ILF1 request / text JSON response |
 | client window | in-flight 최대 5 |
 | capture 대기열 | latest 1 |
+| local decode | 실제 send한 exact JPEG를 send 직후 비동기 predecode |
+| render | active 1 + latest-waiting 1, monotonic commit, playout 없음 |
 | process당 stream/runtime | 1 / 1 |
 | GPU scheduler | 직렬 B1 lane 1개 |
 | detector ingress | 0.01 |
@@ -29,15 +32,24 @@ W5는 GPU batch가 아닙니다. GPU는 한 frame씩 sequence 순서대로 처�
 네트워크 RTT로 인한 stop-and-wait 공백만 겹칩니다. B4, dynamic engine, raw JPEG
 request, batch request, 응답 JPEG, gRPC 우회 경로는 지원하지 않습니다.
 
+WebRTC는 현재 표준 경로가 아닙니다. `capture/sent < 30`이면 capture/JPEG encode,
+`sent=30`인데 result가 낮고 WebSocket `bufferedAmount`가 증가하면 network/transport,
+server queue가 증가하면 runtime, `result=30`인데 display가 낮으면 local decode/render를
+먼저 진단합니다.
+
 ## 구조
 
 ```text
 web/app.js
   camera frame callback
+    -> accumulated 30 FPS deadline + 2 ms early tolerance
     -> aspect resize (long edge 640, no upscale)
     -> one JPEG Q90 encoder
     -> latest pending frame (0..1)
-    -> ILF1 sender (in-flight 0..5, local JPEG retained by seq)
+    -> ILF1 sender (in-flight 0..5)
+         -> socket.send(exact JPEG)
+         -> start exact-JPEG bitmap decode immediately
+         -> retain seq -> {JPEG, bitmap lease}
          |
          v
 server.py
@@ -51,8 +63,9 @@ server.py
          v
 web/app.js
   terminal result matched by seq
-    -> retained local JPEG + mask blur/bbox overlay
-    -> release local JPEG
+    -> active 1 + latest-waiting 1 renderer
+    -> exact bitmap + mask blur/bbox overlay
+    -> monotonic commit, close bitmap exactly once
 ```
 
 핵심 코드는 다음 다섯 경계로만 구성됩니다.
@@ -61,7 +74,8 @@ web/app.js
 - `server.py`: WebSocket lifecycle, boundary, readiness, admission, metric
 - `service/runtime.py`: manifest 검증, singleton TensorRT, 직렬 GPU lane
 - `service/tracking.py`: connection-local BoT-SORT와 1-frame mask hold
-- `web/app.js`: capture, Q90 encode, latest-1/W5 transport, fail-closed render
+- `web/app.js`: jitter-safe capture, send-time predecode, latest-1/W5 transport,
+  bounded monotonic fail-closed render
 
 ## 설치
 
@@ -188,6 +202,10 @@ offset  size  field
   frame을 폐기하고 output canvas를 검정색으로 덮습니다.
 - 유효 result와 일치한 local frame만 렌더하며 이미 표시한 sequence보다 과거
   frame으로 돌아가지 않습니다.
+- active render는 새 result 때문에 취소하지 않고, 아직 시작하지 않은 waiting 한 칸만
+  최신 result로 교체합니다. in-flight 5 + active 1 + waiting 1로 bitmap 소유권을
+  최대 7개로 제한하며 정상/교체/timeout/error/reset/decode-late 경로에서 정확히 한 번
+  해제합니다.
 - 객체에 유효한 bounded polygon이 없거나 browser blur를 사용할 수 없으면 원본을
   표시하지 않고 blackout합니다.
 - 화면의 source video는 **개발용 미보호 preview**입니다. 방송/제품 출력으로
@@ -197,11 +215,20 @@ offset  size  field
 
 브라우저 diagnostics는 다음을 분리해 기록합니다.
 
-- `capture_fps`, `encoded_fps`, `sent_fps`, `result_fps`, `displayed_fps`
+- `capture_fps`, `encoded_fps`, `sent_fps`, `result_fps`, `display_fps`
 - `pending_frames`, `inflight_requests`, `capture_dropped`, `stale_results`
+- `websocket_buffered_bytes`, `bitmap_owners`, `bitmap_owner_peak`
 - `jpeg_bytes`, `metadata_bytes`
 - `round_trip_ms`, RTT p50/p95
-- `capture_to_result_ms`, `capture_to_display_ms`와 p50/p95
+- `local_jpeg_decode_ms`, `result_to_display_ms`, `capture_to_display_ms`와 p50/p95
+- raw frame count, monotonic elapsed time, 반올림 전 exact capture/result/display FPS,
+  exact display/capture ratio
+
+현재 snapshot은 `window.__INNOLIVE_METRICS__`, 최대 300개의 1초 표본은
+`window.__INNOLIVE_METRIC_HISTORY__`, 현재 bitmap 소유 수는
+`window.__INNOLIVE_BITMAP_OWNERS__`에서 확인할 수 있습니다. 브라우저 gate 결과에는
+이 값과 browser build, hardware acceleration, camera source, display refresh,
+RTT/jitter를 함께 보존합니다.
 
 서버는 decode, queue, inference, tracking, serialize, total p50/p95와 runtime
 instance, readiness, active stream, GPU memory/utilization, detection/track/
@@ -223,7 +250,7 @@ node tests/test_web.mjs
 inference/tracking/serialization failure, timeout, readiness failure, stream admission,
 metadata-only response, B1 manifest와 tracker isolation/hold 검사가 포함됩니다.
 
-## 성능 acceptance
+## A. Server/transport result acceptance
 
 실제 배포 hardware/network profile과 120 frame 이상의 고정 영상으로 실행합니다.
 
@@ -244,6 +271,35 @@ metadata-only response, B1 manifest와 tracker isolation/hold 검사가 포함�
 - 응답에 JPEG/raw pixel이 없음
 - 첫/마지막 구간 RTT가 지속적으로 증가하지 않음
 
+이 CLI gate는 camera callback, browser JPEG encode/decode, overlay와 실제 display
+성능을 증명하지 않습니다.
+
+## B. 실제 browser/app display acceptance
+
+foreground target browser와 실제 camera 또는 30 FPS fake camera에서 최소 30초씩
+3회 측정합니다. 매 run 시작 전에 페이지의 `중지` 후 `카메라 시작`으로 session metric을
+초기화하고, DevTools에서 다음 값을 JSON으로 보존합니다.
+
+```js
+JSON.stringify({
+  samples: window.__INNOLIVE_METRIC_HISTORY__,
+  final: window.__INNOLIVE_METRICS__,
+  bitmap_owners: window.__INNOLIVE_BITMAP_OWNERS__,
+}, null, 2)
+```
+
+각 run의 필수 gate:
+
+- 1초 `capture_fps`, `result_fps`, `display_fps` 표본 중앙값이 각각 30 이상
+- `display_frames / capture_frames >= 0.99`
+- wall-clock exact FPS의 반올림 전 값과 frame count/elapsed time 보존
+- 최소 30초×3회이며 latency queue의 지속 증가와 인위적 playout delay가 없음
+- commit sequence 단조 증가, JPEG/metadata mismatch, timeout, protocol error 0
+- 중지 후 `bitmap_owners == 0`
+
+`node tests/test_web.mjs`는 누적 capture deadline, active/waiting renderer와 bitmap
+lifecycle 회귀 검사일 뿐 실제 browser display gate를 대체하지 않습니다.
+
 ## 모델 품질 gate는 별도
 
 `B1-640-Q90-W5`는 서빙 방법론이며 현재 `best.pt`의 production 품질 승인서가
@@ -263,7 +319,7 @@ server.py                       FastAPI/WebSocket lifecycle와 health/readiness
 service/protocol.py             ILF1 bounded codec
 service/runtime.py              singleton static-B1 TensorRT runtime
 service/tracking.py             connection-local BoT-SORT와 mask hold
-web/app.js                      Q90/latest-1/W5 client와 fail-closed render
+web/app.js                      1.1 capture/predecode/W5/bounded renderer client
 web/index.html, web/style.css   검증 UI
 config/botsort.yaml             0.05 continuation / 0.25 activation
 models/best.pt                  source checkpoint
