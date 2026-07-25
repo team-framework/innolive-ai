@@ -34,6 +34,14 @@ MAX_POLYGON_POINTS = 64
 EXPECTED_CLASS_NAMES = {0: "face"}
 
 
+class InferenceFailure(RuntimeError):
+    pass
+
+
+class TrackingFailure(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     engine: Path
@@ -184,22 +192,31 @@ class RuntimeManager:
 
     def _infer_sync(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
         started = time.perf_counter()
-        prediction = self._predict(image)
+        try:
+            prediction = self._predict(image)
+        except Exception as error:
+            raise InferenceFailure("TensorRT inference failed") from error
         inferred_at = time.perf_counter()
-        boxes = prediction.boxes.cpu().numpy()
-        tracks = tracker.update(boxes, image)
+        try:
+            boxes = prediction.boxes.cpu().numpy()
+            tracks = tracker.update(boxes, image)
+        except Exception as error:
+            raise TrackingFailure("BoT-SORT update failed") from error
         tracked_at = time.perf_counter()
-        detector_objects = self._objects(
-            prediction,
-            tracks,
-            image.shape[1],
-            image.shape[0],
-        )
-        objects, temporal = tracker.stabilize(
-            detector_objects,
-            image.shape[1],
-            image.shape[0],
-        )
+        try:
+            detector_objects = self._objects(
+                prediction,
+                tracks,
+                image.shape[1],
+                image.shape[0],
+            )
+            objects, temporal = tracker.stabilize(
+                detector_objects,
+                image.shape[1],
+                image.shape[0],
+            )
+        except Exception as error:
+            raise TrackingFailure("mask tracking failed") from error
         serialized_at = time.perf_counter()
         confidences = np.asarray(boxes.conf, dtype=np.float32)
         return {
