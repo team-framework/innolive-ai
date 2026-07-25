@@ -212,6 +212,7 @@ process 내부 monotonic clock만 사용하며 동기화되지 않은 one-way la
 ## 검사
 
 ```bash
+.venv/bin/pip install -r requirements-test.txt
 ruff check server.py service scripts tests
 python -m unittest discover -s tests
 node --check web/app.js
