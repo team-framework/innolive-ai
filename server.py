@@ -30,7 +30,7 @@ from service.protocol import (
     encode_response,
     recover_sequence,
 )
-from service.recognition import validate_session_id
+from service.recognition import validate_entry_id, validate_session_id
 
 LOGGER = logging.getLogger("innolive.demo")
 ROOT = Path(__file__).resolve().parent
@@ -254,7 +254,9 @@ class GrpcDemoGateway:
                 "session_id": response.session_id,
                 "entry_count": int(response.entry_count),
                 "whitelist_version": int(response.whitelist_version),
-            }
+                "entry_ids": list(response.entry_ids),
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     async def add_whitelist(self, request: Request) -> JSONResponse:
@@ -282,6 +284,22 @@ class GrpcDemoGateway:
             },
             status_code=201,
         )
+
+    async def delete_whitelist(self, request: Request) -> Response:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        session_id = self._api_session_id(request)
+        if isinstance(session_id, JSONResponse):
+            return session_id
+        try:
+            entry_id = validate_entry_id(request.query_params.get("entry_id"))
+            await client.delete_whitelist(entry_id, session_id=session_id)
+        except (TypeError, ValueError) as error:
+            return _api_error(400, "INVALID_ARGUMENT", str(error))
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        return Response(status_code=204)
 
     async def stream(self, websocket: WebSocket) -> None:
         serving, _ = await self._grpc_serving(websocket.app)
@@ -619,6 +637,7 @@ def create_app(
     app.add_api_route("/api/sessions/{session_id:path}", gateway.delete_session, methods=["DELETE"])
     app.add_api_route("/api/whitelist", gateway.whitelist_status, methods=["GET"])
     app.add_api_route("/api/whitelist", gateway.add_whitelist, methods=["POST"])
+    app.add_api_route("/api/whitelist", gateway.delete_whitelist, methods=["DELETE"])
     app.add_api_websocket_route("/ws", gateway.stream)
     app.state.gateway = gateway
     return app
