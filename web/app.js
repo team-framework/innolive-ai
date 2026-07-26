@@ -60,6 +60,10 @@ export function percentile(samples, quantile) {
   return ordered[index];
 }
 
+export function objectsToBlur(objects) {
+  return objects.filter((object) => object.whitelisted !== true);
+}
+
 export function captureDeadline(
   currentDeadline,
   now,
@@ -571,7 +575,19 @@ class App {
 
     const objects = metadata.objects;
     if (objects.length > 100) throw new Error("result exceeds the object limit");
-    if (objects.length) {
+    for (const object of objects) {
+      const polygon = object.mask_polygon;
+      if (!Array.isArray(polygon) || polygon.length < 3 || polygon.length > 64) {
+        throw new Error("tracked object has no bounded mask polygon");
+      }
+      for (const [x, y] of polygon) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          throw new Error("mask polygon contains a non-finite point");
+        }
+      }
+    }
+    const blurredObjects = objectsToBlur(objects);
+    if (blurredObjects.length) {
       this.blurContext.fillStyle = "#000";
       this.blurContext.fillRect(0, 0, width, height);
       this.blurContext.filter = "blur(24px)";
@@ -582,15 +598,9 @@ class App {
       this.blurContext.filter = "none";
       this.outputContext.save();
       this.outputContext.beginPath();
-      for (const object of objects) {
+      for (const object of blurredObjects) {
         const polygon = object.mask_polygon;
-        if (!Array.isArray(polygon) || polygon.length < 3 || polygon.length > 64) {
-          throw new Error("tracked object has no bounded mask polygon");
-        }
         polygon.forEach(([x, y], index) => {
-          if (!Number.isFinite(x) || !Number.isFinite(y)) {
-            throw new Error("mask polygon contains a non-finite point");
-          }
           if (index) this.outputContext.lineTo(x, y);
           else this.outputContext.moveTo(x, y);
         });
@@ -604,13 +614,15 @@ class App {
     for (const object of objects) {
       const [x1, y1, x2, y2] = object.bbox || [];
       if (![x1, y1, x2, y2].every(Number.isFinite)) continue;
-      this.outputContext.strokeStyle = object.source === "held" ? "#ffd166" : "#3ee6a8";
+      this.outputContext.strokeStyle = object.whitelisted
+        ? "#5ab0ff"
+        : object.source === "held" ? "#ffd166" : "#3ee6a8";
       this.outputContext.lineWidth = 2;
       this.outputContext.strokeRect(x1, y1, x2 - x1, y2 - y1);
       this.outputContext.fillStyle = this.outputContext.strokeStyle;
       this.outputContext.font = "13px ui-monospace, monospace";
       this.outputContext.fillText(
-        `#${object.track_id} ${object.source} ${(object.confidence * 100).toFixed(0)}%`,
+        `#${object.track_id} ${object.whitelisted ? "whitelist" : object.source} ${(object.confidence * 100).toFixed(0)}%`,
         x1,
         Math.max(14, y1 - 4),
       );

@@ -16,6 +16,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.grpc_config import channel_options
 from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.recognition import validate_session_id
 
 MAX_WINDOW = 5
 MAX_FRAME_ID = 2**32 - 1
@@ -27,6 +28,17 @@ class VideoClientError(RuntimeError):
 
 class VideoProtocolError(VideoClientError):
     """The peer violated the ProcessVideo wire contract."""
+
+
+class VideoRpcError(VideoClientError):
+    """A gRPC method ended with a non-OK status."""
+
+    def __init__(self, method: str, code: grpc.StatusCode, details: str | None):
+        detail = details or "no error details"
+        super().__init__(f"{method} RPC failed with {code.name}: {detail}")
+        self.method = method
+        self.code = code
+        self.details = detail
 
 
 class VideoFrameError(VideoClientError):
@@ -55,6 +67,64 @@ class VideoResult:
     response: ai_processor_pb2.ProcessedVideoChunk
 
 
+FrameSource = Iterable[VideoFrame] | AsyncIterable[VideoFrame]
+JpegSource = Iterable[bytes] | AsyncIterable[bytes]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class VideoSession:
+    """Session-bound view over an open VideoProcessorClient."""
+
+    _client: VideoProcessorClient
+    session_id: str
+
+    async def add_whitelist(
+        self,
+        image: bytes,
+        *,
+        timeout: float = 10.0,
+    ) -> ai_processor_pb2.WhitelistResponse:
+        return await self._client.add_whitelist(
+            image,
+            session_id=self.session_id,
+            timeout=timeout,
+        )
+
+    def process_video(
+        self,
+        frames: FrameSource,
+        *,
+        window: int = MAX_WINDOW,
+        timeout: float | None = None,
+        raise_frame_errors: bool = True,
+    ) -> AsyncIterator[VideoResult]:
+        return self._client.process_video(
+            frames,
+            session_id=self.session_id,
+            window=window,
+            timeout=timeout,
+            raise_frame_errors=raise_frame_errors,
+        )
+
+    def process_jpegs(
+        self,
+        jpegs: JpegSource,
+        *,
+        start_frame_id: int = 1,
+        window: int = MAX_WINDOW,
+        timeout: float | None = None,
+        raise_frame_errors: bool = True,
+    ) -> AsyncIterator[VideoResult]:
+        return self._client.process_jpegs(
+            jpegs,
+            session_id=self.session_id,
+            start_frame_id=start_frame_id,
+            window=window,
+            timeout=timeout,
+            raise_frame_errors=raise_frame_errors,
+        )
+
+
 @dataclass(slots=True)
 class _StreamState:
     pending: deque[VideoFrame]
@@ -64,12 +134,8 @@ class _StreamState:
     completed: bool = False
 
 
-FrameSource = Iterable[VideoFrame] | AsyncIterable[VideoFrame]
-JpegSource = Iterable[bytes] | AsyncIterable[bytes]
-
-
 class VideoProcessorClient:
-    """Async context manager exposing one bounded ProcessVideo operation."""
+    """Reusable channel for bounded ProcessVideo and AddWhitelist calls."""
 
     def __init__(
         self,
@@ -93,9 +159,14 @@ class VideoProcessorClient:
 
     @property
     def max_inflight_observed(self) -> int:
-        """Largest number of source JPEGs retained by the latest stream."""
+        """Largest number of source JPEGs retained by any stream."""
 
         return self._max_inflight_observed
+
+    def for_session(self, session_id: str) -> VideoSession:
+        """Bind one validated session ID to subsequent client operations."""
+
+        return VideoSession(self, validate_session_id(session_id))
 
     async def __aenter__(self) -> Self:
         if self._channel is not None:
@@ -152,10 +223,32 @@ class VideoProcessorClient:
         )
         return response.status == health_pb2.HealthCheckResponse.SERVING
 
+    async def add_whitelist(
+        self,
+        image: bytes,
+        *,
+        session_id: str,
+        timeout: float = 10.0,
+    ) -> ai_processor_pb2.WhitelistResponse:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        session_id = validate_session_id(session_id)
+        jpeg = _validate_jpeg(image)
+        try:
+            return await self._stub.AddWhitelist(
+                ai_processor_pb2.FaceData(data=jpeg, session_id=session_id),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError("AddWhitelist", error.code(), error.details()) from error
+
     async def process_video(
         self,
         frames: FrameSource,
         *,
+        session_id: str,
         window: int = MAX_WINDOW,
         timeout: float | None = None,
         raise_frame_errors: bool = True,
@@ -173,18 +266,15 @@ class VideoProcessorClient:
 
         if type(window) is not int or not 1 <= window <= MAX_WINDOW:
             raise ValueError(f"window must be an integer in 1..{MAX_WINDOW}")
+        session_id = validate_session_id(session_id)
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive when supplied")
         if type(raise_frame_errors) is not bool:
             raise TypeError("raise_frame_errors must be a boolean")
         if self._stub is None:
             raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if self._calls:
-            raise RuntimeError("one VideoProcessorClient supports one active stream")
-
         call = self._stub.ProcessVideo(timeout=timeout)
         self._calls.add(call)
-        self._max_inflight_observed = 0
         state = _StreamState(deque(), asyncio.Semaphore(window), asyncio.Event())
         writer = asyncio.create_task(
             self._write_frames(
@@ -193,6 +283,7 @@ class VideoProcessorClient:
                 state.pending,
                 state.slots,
                 state.source_exhausted,
+                session_id,
             ),
             name="innolive-grpc-writer",
         )
@@ -206,9 +297,7 @@ class VideoProcessorClient:
             ):
                 yield result
         except grpc.aio.AioRpcError as error:
-            raise VideoClientError(
-                f"ProcessVideo RPC failed with {error.code().name}: {error.details()}"
-            ) from error
+            raise VideoRpcError("ProcessVideo", error.code(), error.details()) from error
         finally:
             if not state.completed:
                 call.cancel()
@@ -283,6 +372,7 @@ class VideoProcessorClient:
         self,
         jpegs: JpegSource,
         *,
+        session_id: str,
         start_frame_id: int = 1,
         window: int = MAX_WINDOW,
         timeout: float | None = None,
@@ -308,6 +398,7 @@ class VideoProcessorClient:
         async with aclosing(
             self.process_video(
                 frames(),
+                session_id=session_id,
                 window=window,
                 timeout=timeout,
                 raise_frame_errors=raise_frame_errors,
@@ -323,6 +414,7 @@ class VideoProcessorClient:
         pending: deque[VideoFrame],
         slots: asyncio.Semaphore,
         source_exhausted: asyncio.Event,
+        session_id: str,
     ) -> None:
         last_frame_id = -1
         iterator = _iterate_frames(frames).__aiter__()
@@ -356,6 +448,7 @@ class VideoProcessorClient:
                         timestamp=normalized.timestamp,
                         frame_id=normalized.frame_id,
                         batch_size=1,
+                        session_id=session_id,
                     )
                 )
             await call.done_writing()
@@ -437,15 +530,7 @@ async def _iterate_jpegs(jpegs: JpegSource) -> AsyncIterator[bytes]:
 def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
     if not isinstance(frame, VideoFrame):
         raise TypeError("frames must yield VideoFrame instances")
-    if not isinstance(frame.data, (bytes, bytearray, memoryview)):
-        raise TypeError("VideoFrame.data must be bytes-like")
-    jpeg = frame.data if isinstance(frame.data, bytes) else bytes(frame.data)
-    if not jpeg:
-        raise ValueError("VideoFrame.data must not be empty")
-    if len(jpeg) > MAX_JPEG_BYTES:
-        raise ValueError(f"JPEG exceeds the {MAX_JPEG_BYTES} byte limit")
-    if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
-        raise ValueError("VideoFrame.data must contain one complete JPEG")
+    jpeg = _validate_jpeg(frame.data)
     if type(frame.timestamp) is not int or not -(2**63) <= frame.timestamp < 2**63:
         raise ValueError("VideoFrame.timestamp must be a signed int64")
     if type(frame.frame_id) is not int or not 0 <= frame.frame_id <= MAX_FRAME_ID:
@@ -453,6 +538,19 @@ def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
     if frame.frame_id <= last_frame_id:
         raise ValueError("VideoFrame.frame_id must be strictly increasing")
     return VideoFrame(jpeg, frame.timestamp, frame.frame_id)
+
+
+def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("JPEG must be bytes-like")
+    jpeg = value if isinstance(value, bytes) else bytes(value)
+    if not jpeg:
+        raise ValueError("JPEG must not be empty")
+    if len(jpeg) > MAX_JPEG_BYTES:
+        raise ValueError(f"JPEG exceeds the {MAX_JPEG_BYTES} byte limit")
+    if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+        raise ValueError("value must contain one complete JPEG")
+    return jpeg
 
 
 def _response_status(response: Any) -> tuple[str, str]:

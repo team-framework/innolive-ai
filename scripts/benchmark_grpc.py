@@ -46,6 +46,7 @@ async def run_stream(
     target: str,
     jpegs: list[bytes],
     timeout: float,
+    session_id: str,
 ) -> tuple[list[Sample], int]:
     sent_at: dict[int, float] = {}
 
@@ -66,6 +67,7 @@ async def run_stream(
     ) as client:
         async for result in client.process_video(
             frames(),
+            session_id=session_id,
             window=WINDOW,
             timeout=timeout,
         ):
@@ -173,6 +175,7 @@ def _server_total_ms(response: object) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", default="127.0.0.1:50051")
+    parser.add_argument("--session-id", required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=MIN_FRAMES)
     parser.add_argument("--timeout", type=float, default=60.0)
@@ -191,7 +194,9 @@ def main() -> None:
         raise SystemExit("--timeout must be positive")
 
     jpegs = load_jpegs(input_path, args.frames)
-    samples, max_inflight = asyncio.run(run_stream(args.target, jpegs, args.timeout))
+    samples, max_inflight = asyncio.run(
+        run_stream(args.target, jpegs, args.timeout, args.session_id)
+    )
     report = summarize(
         samples,
         max_inflight,
