@@ -117,6 +117,15 @@ export async function createSession(request = fetch) {
   return normalizeSessionInfo(await readApiResponse(response));
 }
 
+export async function deleteSession(sessionId, request = fetch) {
+  const validated = validateSessionId(sessionId);
+  const response = await request(
+    `/api/sessions/${encodeURIComponent(validated)}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) await readApiResponse(response);
+}
+
 export async function ensureTabSession(
   sessions,
   storage,
@@ -254,21 +263,29 @@ export async function addWhitelistFiles(
   sessionId,
   request = fetch,
   normalize = normalizeWhitelistImage,
+  onProgress = () => {},
 ) {
   const url = whitelistUrl(sessionId);
   const results = [];
   for (const [index, file] of Array.from(files).entries()) {
     const name = file.name || `face-${index + 1}.jpg`;
     try {
+      onProgress({ index, name, state: "preparing" });
       const jpeg = await normalize(file);
+      onProgress({ index, name, state: "uploading" });
       const response = await request(url, {
         method: "POST",
         headers: { "content-type": "image/jpeg" },
         body: jpeg,
       });
-      results.push({ name, ok: true, response: await readApiResponse(response) });
+      const payload = await readApiResponse(response);
+      const result = { name, ok: true, response: payload };
+      results.push(result);
+      onProgress({ index, name, state: "success", result });
     } catch (error) {
-      results.push({ name, ok: false, error: error.message });
+      const result = { name, ok: false, error: error.message };
+      results.push(result);
+      onProgress({ index, name, state: "error", result });
     }
   }
   return results;
@@ -279,6 +296,7 @@ function normalizeSessionInfo(value) {
   const entryCount = Number(value?.entry_count);
   const whitelistVersion = Number(value?.whitelist_version);
   const createdAt = Number(value?.created_at_unix_ms || 0);
+  const activeStreamCount = Number(value?.active_stream_count || 0);
   if (!Number.isSafeInteger(entryCount) || entryCount < 0) {
     throw new Error("session entry_count must be a non-negative integer");
   }
@@ -288,11 +306,15 @@ function normalizeSessionInfo(value) {
   if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
     throw new Error("session created_at_unix_ms must be a non-negative integer");
   }
+  if (!Number.isSafeInteger(activeStreamCount) || activeStreamCount < 0) {
+    throw new Error("session active_stream_count must be a non-negative integer");
+  }
   return {
     session_id: sessionId,
     entry_count: entryCount,
     whitelist_version: whitelistVersion,
     created_at_unix_ms: createdAt,
+    active_stream_count: activeStreamCount,
   };
 }
 
@@ -529,9 +551,9 @@ class App {
         "start", "stop", "status", "source", "output", "capture",
         "capture-fps", "sent-fps", "result-fps", "display-fps", "round-trip",
         "grpc-round-trip", "server-time", "queue", "dropped", "diagnostics",
-        "session-id", "comparison-session-id", "whitelist-files", "add-whitelist",
-        "new-session", "refresh-whitelist", "compare-sessions", "whitelist-status",
-        "session-list", "enrollment-results",
+        "session-id", "whitelist-files", "whitelist-dropzone", "add-whitelist",
+        "new-session", "refresh-whitelist", "whitelist-status", "session-list",
+        "selected-file-summary", "enrollment-results",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -545,21 +567,131 @@ class App {
     this.elements["refresh-whitelist"].addEventListener("click", () => {
       this.refreshSessions();
     });
-    this.elements["compare-sessions"].addEventListener("click", () => this.compareSessions());
     this.elements["session-id"].addEventListener("change", () => {
       this.selectActiveSession();
     });
-    this.elements["comparison-session-id"].addEventListener("change", () => {
-      this.renderSessions(
-        this.elements["session-id"].value,
-        this.elements["comparison-session-id"].value,
-      );
+    this.elements["whitelist-files"].addEventListener("change", (event) => {
+      this.setWhitelistFiles(event.target.files);
     });
+    this.bindWhitelistDropzone();
     this.sessionStatuses = [];
     this.sessionsReady = false;
+    this.selectedWhitelistFiles = [];
+    this.enrollmentFileStates = [];
+    this.enrolling = false;
+    this.deletingSessionId = null;
     this.resetState();
     this.blackout("보호 결과 대기 중");
     void this.initializeSessions();
+  }
+
+  bindWhitelistDropzone() {
+    const dropzone = this.elements["whitelist-dropzone"];
+    const picker = this.elements["whitelist-files"];
+    dropzone.addEventListener("click", () => picker.click());
+    dropzone.addEventListener("keydown", (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      picker.click();
+    });
+    for (const eventName of ["dragenter", "dragover"]) {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropzone.dataset.dragging = "true";
+      });
+    }
+    dropzone.addEventListener("dragleave", (event) => {
+      if (!dropzone.contains(event.relatedTarget)) delete dropzone.dataset.dragging;
+    });
+    dropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      delete dropzone.dataset.dragging;
+      this.setWhitelistFiles(event.dataTransfer?.files || []);
+    });
+  }
+
+  setWhitelistFiles(files) {
+    this.selectedWhitelistFiles = Array.from(files || []);
+    this.enrollmentFileStates = this.selectedWhitelistFiles.map((file) => ({
+      name: file.name || "이름 없는 이미지",
+      state: "ready",
+      detail: this.formatBytes(file.size || 0),
+    }));
+    const totalSize = this.selectedWhitelistFiles.reduce(
+      (sum, file) => sum + Number(file.size || 0),
+      0,
+    );
+    this.elements["selected-file-summary"].textContent = this.selectedWhitelistFiles.length
+      ? `${this.selectedWhitelistFiles.length}장 선택 · ${this.formatBytes(totalSize)}`
+      : "선택한 파일이 없습니다.";
+    this.renderEnrollmentResults();
+    this.updateEnrollmentButton();
+  }
+
+  updateEnrollmentButton() {
+    this.elements["add-whitelist"].disabled = (
+      this.enrolling
+      || !this.sessionsReady
+      || !this.elements["session-id"].value
+      || this.selectedWhitelistFiles.length === 0
+    );
+  }
+
+  updateEnrollmentProgress(progress) {
+    const current = this.enrollmentFileStates[progress.index];
+    if (!current) return;
+    current.state = progress.state;
+    if (progress.state === "success") {
+      current.detail = `등록 완료 · 이미지 ${progress.result.response.entry_count}장`;
+    } else if (progress.state === "error") {
+      current.detail = progress.result.error;
+    } else if (progress.state === "preparing") {
+      current.detail = "이미지 변환 중";
+    } else if (progress.state === "uploading") {
+      current.detail = "서버에 등록 중";
+    }
+    this.renderEnrollmentResults();
+  }
+
+  renderEnrollmentResults() {
+    const list = this.elements["enrollment-results"];
+    list.replaceChildren();
+    if (!this.enrollmentFileStates.length) {
+      const empty = document.createElement("li");
+      empty.className = "empty-result";
+      empty.textContent = "등록할 사진을 선택하면 파일별 진행 상태가 표시됩니다.";
+      list.append(empty);
+      return;
+    }
+    const stateLabels = {
+      ready: "대기",
+      preparing: "변환 중",
+      uploading: "등록 중",
+      success: "완료",
+      error: "실패",
+    };
+    for (const file of this.enrollmentFileStates) {
+      const item = document.createElement("li");
+      item.className = "file-result";
+      item.dataset.state = file.state;
+      const name = document.createElement("span");
+      name.className = "file-result-name";
+      name.textContent = file.name;
+      const detail = document.createElement("span");
+      detail.className = "file-result-detail";
+      detail.textContent = file.detail;
+      const state = document.createElement("span");
+      state.className = "file-result-state";
+      state.textContent = stateLabels[file.state] || file.state;
+      item.append(name, detail, state);
+      list.append(item);
+    }
+  }
+
+  formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   resetState() {
@@ -576,6 +708,7 @@ class App {
     this.nextCaptureDeadline = null;
     this.lastTerminalSequence = 0;
     this.streamSessionId = null;
+    this.localStreamCounted = false;
     this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
     this.measurementStartedAt = null;
@@ -624,9 +757,7 @@ class App {
     const generation = ++this.generation;
     try {
       this.streamSessionId = validateSessionId(this.elements["session-id"].value);
-      this.elements["session-id"].disabled = true;
-      this.elements["new-session"].disabled = true;
-      this.elements["refresh-whitelist"].disabled = true;
+      this.renderSessions(this.streamSessionId);
       const response = await fetch("/healthz", { cache: "no-store" });
       if (!response.ok) throw new Error(`server is not ready (${response.status})`);
       this.activeProfile = negotiateServerProfile(await response.json());
@@ -658,6 +789,12 @@ class App {
       socket.onopen = () => {
         if (generation !== this.generation || socket !== this.socket) return;
         this.running = true;
+        const activeSession = this.sessionStatuses.find(
+          (session) => session.session_id === this.streamSessionId,
+        );
+        if (activeSession) activeSession.active_stream_count += 1;
+        this.localStreamCounted = true;
+        this.renderSessions(this.streamSessionId);
         this.measurementStartedAt = performance.now();
         this.lastMetricSampleAt = this.measurementStartedAt;
         this.elements.stop.disabled = false;
@@ -681,24 +818,39 @@ class App {
   }
 
   async enrollWhitelist() {
-    const button = this.elements["add-whitelist"];
+    let attempted = false;
     try {
       const sessionId = validateSessionId(this.elements["session-id"].value);
-      const files = Array.from(this.elements["whitelist-files"].files || []);
+      const files = [...this.selectedWhitelistFiles];
       if (!files.length) throw new Error("등록할 이미지를 한 장 이상 선택하세요");
-      button.disabled = true;
-      this.elements["whitelist-status"].textContent = `${files.length}장 JPEG 변환·등록 중`;
-      const results = await addWhitelistFiles(files, sessionId);
-      this.elements["enrollment-results"].textContent = results.map((result) => (
-        result.ok
-          ? `✓ ${result.name} → ${result.response.entry_count} entries · v${result.response.whitelist_version}`
-          : `✗ ${result.name} → ${result.error}`
-      )).join("\n");
+      attempted = true;
+      this.enrolling = true;
+      this.renderSessions(sessionId);
+      this.elements["whitelist-status"].textContent = `${files.length}장 등록 중`;
+      const results = await addWhitelistFiles(
+        files,
+        sessionId,
+        fetch,
+        normalizeWhitelistImage,
+        (progress) => this.updateEnrollmentProgress(progress),
+      );
+      const succeeded = results.filter((result) => result.ok).length;
+      this.elements["whitelist-status"].textContent = (
+        `등록 완료 ${succeeded}장 · 실패 ${results.length - succeeded}장`
+      );
       await this.refreshWhitelistStatus();
     } catch (error) {
       this.elements["whitelist-status"].textContent = error.message;
     } finally {
-      button.disabled = false;
+      this.enrolling = false;
+      if (attempted) {
+        this.selectedWhitelistFiles = [];
+        this.elements["whitelist-files"].value = "";
+        this.elements["selected-file-summary"].textContent = (
+          `${this.enrollmentFileStates.length}장 처리 완료 · 다른 사진을 선택해 추가 등록할 수 있습니다.`
+        );
+      }
+      this.renderSessions(this.elements["session-id"].value);
     }
   }
 
@@ -707,7 +859,7 @@ class App {
       const sessionId = validateSessionId(this.elements["session-id"].value);
       const status = await getWhitelistStatus(sessionId);
       this.upsertSession(status);
-      this.renderSessions(sessionId, this.elements["comparison-session-id"].value);
+      this.renderSessions(sessionId);
       this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
       return status;
     } catch (error) {
@@ -716,30 +868,8 @@ class App {
     }
   }
 
-  async compareSessions() {
-    try {
-      const firstId = validateSessionId(this.elements["session-id"].value);
-      const secondId = validateSessionId(this.elements["comparison-session-id"].value);
-      if (firstId === secondId) throw new Error("서로 다른 session ID를 입력하세요");
-      const [first, second] = await Promise.all([
-        getWhitelistStatus(firstId),
-        getWhitelistStatus(secondId),
-      ]);
-      this.upsertSession(first);
-      this.upsertSession(second);
-      this.renderSessions(firstId, secondId);
-      this.elements["enrollment-results"].textContent = [
-        `A · ${this.formatWhitelistStatus(first)}`,
-        `B · ${this.formatWhitelistStatus(second)}`,
-        "각 session_id의 count/version을 서버에서 독립 조회했습니다.",
-      ].join("\n");
-    } catch (error) {
-      this.elements["enrollment-results"].textContent = error.message;
-    }
-  }
-
   formatWhitelistStatus(status) {
-    return `${status.session_id}: ${status.entry_count} entries · v${status.whitelist_version}`;
+    return `${status.entry_count}장 등록 · v${status.whitelist_version}`;
   }
 
   async initializeSessions() {
@@ -763,7 +893,7 @@ class App {
     } catch (error) {
       this.sessionsReady = false;
       this.elements["whitelist-status"].textContent = error.message;
-      this.elements["session-list"].textContent = "세션 목록을 불러오지 못했습니다.";
+      this.renderSessionListError("세션 목록을 불러오지 못했습니다.");
     } finally {
       this.elements["new-session"].disabled = false;
       this.elements["refresh-whitelist"].disabled = false;
@@ -779,10 +909,9 @@ class App {
         this.tabStorage(),
         () => createSession(),
       );
-      const comparisonId = this.elements["comparison-session-id"].value;
       this.sessionStatuses = resolved.sessions;
       this.sessionsReady = true;
-      this.renderSessions(resolved.active.session_id, comparisonId);
+      this.renderSessions(resolved.active.session_id);
       this.elements["whitelist-status"].textContent = resolved.created
         ? `저장된 탭 세션이 없어 새로 생성했습니다 · ${resolved.active.session_id}`
         : this.formatWhitelistStatus(resolved.active);
@@ -797,12 +926,11 @@ class App {
     const button = this.elements["new-session"];
     button.disabled = true;
     try {
-      const previousActive = this.elements["session-id"].value;
       const created = await createSession();
       this.upsertSession(created, true);
       this.storeTabSession(created.session_id);
       this.sessionsReady = true;
-      this.renderSessions(created.session_id, previousActive);
+      this.renderSessions(created.session_id);
       this.elements["whitelist-status"].textContent = `새 세션 생성됨 · ${created.session_id}`;
     } catch (error) {
       this.elements["whitelist-status"].textContent = error.message;
@@ -814,13 +942,7 @@ class App {
   selectActiveSession() {
     const sessionId = validateSessionId(this.elements["session-id"].value);
     this.storeTabSession(sessionId);
-    let comparisonId = this.elements["comparison-session-id"].value;
-    if (comparisonId === sessionId) {
-      comparisonId = this.sessionStatuses.find(
-        (session) => session.session_id !== sessionId,
-      )?.session_id || "";
-    }
-    this.renderSessions(sessionId, comparisonId);
+    this.renderSessions(sessionId);
     const status = this.sessionStatuses.find((session) => session.session_id === sessionId);
     if (status) this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
   }
@@ -833,6 +955,9 @@ class App {
     if (existing && normalized.created_at_unix_ms === 0) {
       normalized.created_at_unix_ms = existing.created_at_unix_ms;
     }
+    if (existing && status?.active_stream_count === undefined) {
+      normalized.active_stream_count = existing.active_stream_count;
+    }
     this.sessionStatuses = this.sessionStatuses.filter(
       (session) => session.session_id !== normalized.session_id,
     );
@@ -840,7 +965,53 @@ class App {
     else this.sessionStatuses.push(normalized);
   }
 
-  renderSessions(activeId = "", comparisonId = "") {
+  async deleteManagedSession(sessionId) {
+    const session = this.sessionStatuses.find((item) => item.session_id === sessionId);
+    if (!session) return;
+    if (
+      session.active_stream_count > 0
+      || (this.streamSessionId !== null && sessionId === this.streamSessionId)
+    ) {
+      this.elements["whitelist-status"].textContent = "사용 중인 세션은 스트림 종료 후 삭제할 수 있습니다.";
+      return;
+    }
+
+    this.deletingSessionId = sessionId;
+    this.renderSessions(this.elements["session-id"].value);
+    try {
+      await deleteSession(sessionId);
+      this.sessionStatuses = this.sessionStatuses.filter(
+        (item) => item.session_id !== sessionId,
+      );
+      let activeId = this.elements["session-id"].value;
+      if (activeId === sessionId) activeId = this.sessionStatuses[0]?.session_id || "";
+      if (!activeId) {
+        const created = await createSession();
+        this.upsertSession(created, true);
+        activeId = created.session_id;
+      }
+      this.storeTabSession(activeId);
+      this.renderSessions(activeId);
+      this.elements["whitelist-status"].textContent = "세션을 삭제했습니다.";
+    } catch (error) {
+      try {
+        this.sessionStatuses = await listSessions();
+      } catch {
+        // Keep the last known list when the refresh also fails.
+      }
+      this.renderSessions(this.elements["session-id"].value);
+      this.elements["whitelist-status"].textContent = (
+        /FAILED_PRECONDITION|HTTP_409/.test(error.message)
+          ? "현재 스트림이 사용 중인 세션은 삭제할 수 없습니다."
+          : error.message
+      );
+    } finally {
+      this.deletingSessionId = null;
+      this.renderSessions(this.elements["session-id"].value);
+    }
+  }
+
+  renderSessions(activeId = "") {
     const sessions = [...this.sessionStatuses].sort((left, right) => (
       right.created_at_unix_ms - left.created_at_unix_ms
       || left.session_id.localeCompare(right.session_id)
@@ -849,53 +1020,106 @@ class App {
     const active = sessions.some((session) => session.session_id === activeId)
       ? activeId
       : sessions[0]?.session_id || "";
-    let comparison = sessions.some((session) => session.session_id === comparisonId)
-      ? comparisonId
-      : "";
-    if (!comparison || comparison === active) {
-      comparison = sessions.find((session) => session.session_id !== active)?.session_id || "";
-    }
+    const streamLocked = this.running || this.streamSessionId !== null;
+    const managementLocked = this.enrolling || this.deletingSessionId !== null;
+    const controlsLocked = streamLocked || managementLocked;
 
-    this.replaceSessionOptions(this.elements["session-id"], sessions, active, false);
-    this.replaceSessionOptions(
-      this.elements["comparison-session-id"],
-      sessions,
-      comparison,
-      true,
-    );
-    this.elements["session-id"].disabled = this.running || !active;
-    this.elements["comparison-session-id"].disabled = sessions.length < 2;
-    this.elements.start.disabled = this.running || !this.sessionsReady || !active;
-    this.elements["add-whitelist"].disabled = !active;
-    this.elements["compare-sessions"].disabled = sessions.length < 2;
-    this.elements["new-session"].disabled = this.running;
-    this.elements["refresh-whitelist"].disabled = this.running;
-    this.elements["session-list"].textContent = sessions.length
-      ? sessions.map((session) => {
-        const roles = [
-          session.session_id === active ? "영상·등록" : null,
-          session.session_id === comparison ? "비교" : null,
-        ].filter(Boolean).join(" / ");
-        return `${roles ? `[${roles}] ` : ""}${this.formatWhitelistStatus(session)}`;
-      }).join("\n")
-      : "서버에 등록된 세션이 없습니다.";
+    this.replaceSessionOptions(this.elements["session-id"], sessions, active);
+    this.elements["session-id"].disabled = controlsLocked || !active;
+    this.elements.start.disabled = controlsLocked || !this.sessionsReady || !active;
+    this.elements["new-session"].disabled = controlsLocked;
+    this.elements["refresh-whitelist"].disabled = controlsLocked;
+    this.updateEnrollmentButton();
+    this.renderSessionRows(sessions, active, managementLocked);
   }
 
-  replaceSessionOptions(select, sessions, selectedId, allowEmpty) {
+  replaceSessionOptions(select, sessions, selectedId) {
     select.replaceChildren();
-    if (allowEmpty && sessions.length < 2) {
+    if (!sessions.length) {
       const empty = document.createElement("option");
       empty.value = "";
-      empty.textContent = "비교할 다른 세션 없음";
+      empty.textContent = "사용 가능한 세션 없음";
       select.append(empty);
     }
     for (const session of sessions) {
       const option = document.createElement("option");
       option.value = session.session_id;
-      option.textContent = this.formatWhitelistStatus(session);
+      option.textContent = `${session.session_id} · ${this.formatWhitelistStatus(session)}`;
       option.selected = session.session_id === selectedId;
       select.append(option);
     }
+  }
+
+  renderSessionRows(sessions, activeId, managementLocked) {
+    const list = this.elements["session-list"];
+    list.replaceChildren();
+    if (!sessions.length) {
+      this.renderSessionListError("서버에 등록된 세션이 없습니다.");
+      return;
+    }
+    for (const session of sessions) {
+      const row = document.createElement("article");
+      row.className = "session-row";
+      row.dataset.active = String(session.session_id === activeId);
+
+      const identity = document.createElement("div");
+      identity.className = "session-identity";
+      const name = document.createElement("div");
+      name.className = "session-name";
+      name.textContent = session.session_id;
+      const meta = document.createElement("div");
+      meta.className = "session-meta";
+      meta.textContent = `${this.formatWhitelistStatus(session)} · ${this.formatCreatedAt(session.created_at_unix_ms)}`;
+      identity.append(name, meta);
+
+      const badges = document.createElement("div");
+      badges.className = "session-badges";
+      if (session.session_id === activeId) badges.append(this.sessionBadge("활성 세션", "active"));
+      if (session.active_stream_count > 0) {
+        badges.append(this.sessionBadge(`스트리밍 ${session.active_stream_count}`, "streaming"));
+      }
+
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "danger-button";
+      deleteButton.textContent = this.deletingSessionId === session.session_id ? "삭제 중" : "삭제";
+      deleteButton.disabled = (
+        managementLocked
+        || session.active_stream_count > 0
+        || (this.streamSessionId !== null && session.session_id === this.streamSessionId)
+        || this.deletingSessionId !== null
+      );
+      deleteButton.title = session.active_stream_count > 0
+        ? "사용 중인 스트림을 먼저 종료하세요."
+        : "세션 삭제";
+      deleteButton.addEventListener("click", () => this.deleteManagedSession(session.session_id));
+      row.append(identity, badges, deleteButton);
+      list.append(row);
+    }
+  }
+
+  renderSessionListError(message) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = message;
+    this.elements["session-list"].replaceChildren(empty);
+  }
+
+  sessionBadge(label, modifier) {
+    const badge = document.createElement("span");
+    badge.className = `badge ${modifier}`;
+    badge.textContent = label;
+    return badge;
+  }
+
+  formatCreatedAt(timestamp) {
+    if (!timestamp) return "생성 시각 정보 없음";
+    return new Intl.DateTimeFormat("ko-KR", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(timestamp));
   }
 
   tabStorage() {
@@ -1352,11 +1576,17 @@ class App {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.elements.source.srcObject = null;
-    this.elements["session-id"].disabled = !this.sessionsReady;
-    this.elements["new-session"].disabled = false;
-    this.elements["refresh-whitelist"].disabled = false;
+    if (this.localStreamCounted) {
+      const activeSession = this.sessionStatuses.find(
+        (session) => session.session_id === this.streamSessionId,
+      );
+      if (activeSession) {
+        activeSession.active_stream_count = Math.max(0, activeSession.active_stream_count - 1);
+      }
+      this.localStreamCounted = false;
+    }
     this.streamSessionId = null;
-    this.elements.start.disabled = !this.sessionsReady;
+    this.renderSessions(this.elements["session-id"].value);
     this.elements.stop.disabled = true;
   }
 
