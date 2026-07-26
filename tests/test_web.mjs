@@ -4,13 +4,19 @@ import {
   BitmapLease,
   LatestRenderQueue,
   PROFILE,
+  addWhitelistFiles,
   captureDeadline,
   fitLongEdge,
   framePacket,
+  getWhitelistStatus,
   negotiateServerProfile,
   objectsToBlur,
   parseTerminal,
   percentile,
+  requireResultSession,
+  validateSessionId,
+  websocketUrl,
+  whitelistUrl,
 } from "../web/app.js";
 
 assert.deepEqual(PROFILE, {
@@ -26,6 +32,68 @@ assert.deepEqual(PROFILE, {
 assert.deepEqual(fitLongEdge(1920, 1080), [640, 360]);
 assert.deepEqual(fitLongEdge(1080, 1920), [360, 640]);
 assert.deepEqual(fitLongEdge(320, 240), [320, 240]);
+
+assert.equal(validateSessionId(" Session-A "), " Session-A ");
+assert.throws(() => validateSessionId("   "), /must not be empty/);
+assert.throws(() => validateSessionId("가".repeat(86)), /256 UTF-8 bytes/);
+assert.equal(
+  whitelistUrl(" Session-A "),
+  "/api/whitelist?session_id=%20Session-A%20",
+);
+assert.equal(
+  websocketUrl({ protocol: "https:", host: "demo.test" }, "session-b"),
+  "wss://demo.test/ws?session_id=session-b",
+);
+assert.equal(
+  requireResultSession({ session_id: "session-a" }, "session-a").session_id,
+  "session-a",
+);
+assert.throws(
+  () => requireResultSession({ session_id: "session-b" }, "session-a"),
+  /does not match/,
+);
+
+let enrollmentInFlight = 0;
+let maxEnrollmentInFlight = 0;
+const enrollmentCalls = [];
+const enrollmentRequest = async (url, options) => {
+  enrollmentInFlight += 1;
+  maxEnrollmentInFlight = Math.max(maxEnrollmentInFlight, enrollmentInFlight);
+  enrollmentCalls.push({ url, options });
+  await Promise.resolve();
+  enrollmentInFlight -= 1;
+  const count = enrollmentCalls.length;
+  return {
+    ok: count !== 2,
+    status: count === 2 ? 400 : 201,
+    json: async () => count === 2
+      ? { error: { code: "INVALID_ARGUMENT", message: "expected one face" } }
+      : { session_id: "session-a", entry_count: count, whitelist_version: count },
+  };
+};
+const enrollmentResults = await addWhitelistFiles(
+  [
+    { name: "first.jpg", type: "image/jpeg" },
+    { name: "invalid.jpg", type: "image/jpeg" },
+    { name: "third.jpg", type: "image/jpeg" },
+  ],
+  "session-a",
+  enrollmentRequest,
+);
+assert.equal(maxEnrollmentInFlight, 1, "enrollments must be submitted sequentially");
+assert.deepEqual(enrollmentResults.map((result) => result.ok), [true, false, true]);
+assert.equal(enrollmentCalls.length, 3, "one invalid face must not skip later files");
+
+const queriedStatus = await getWhitelistStatus("session-b", async (url) => ({
+  ok: true,
+  status: 200,
+  json: async () => ({ session_id: new URL(url, "http://local").searchParams.get("session_id"), entry_count: 0, whitelist_version: 0 }),
+}));
+assert.deepEqual(queriedStatus, {
+  session_id: "session-b",
+  entry_count: 0,
+  whitelist_version: 0,
+});
 
 const health = {
   status: "ok",

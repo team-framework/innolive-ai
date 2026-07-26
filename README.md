@@ -164,7 +164,14 @@ async def main() -> None:
     frames = [Path("frame-1.jpg").read_bytes(), Path("frame-2.jpg").read_bytes()]
     async with VideoProcessorClient("127.0.0.1:50051") as client:
         session = client.for_session("authenticated-session-id")
-        await session.add_whitelist(Path("enrollment-face.jpg").read_bytes())
+        await session.add_whitelist_many(
+            [
+                Path("enrollment-face-1.jpg").read_bytes(),
+                Path("enrollment-face-2.jpg").read_bytes(),
+            ]
+        )
+        status = await session.get_whitelist_status()
+        print(status.entry_count, status.whitelist_version)
         async for result in session.process_jpegs(frames):
             print(result.response.frame_id, result.response.faces)
             source_jpeg = result.source_jpeg
@@ -238,6 +245,12 @@ crop은 저장하지 않습니다. 응답은 `entry_id`, 현재 `entry_count`, `
 포함합니다. 빈 세션, decode 실패, 0개·복수 얼굴, 작은 얼굴, 정렬 실패는
 `INVALID_ARGUMENT`; 세션·entry·queue 제한은 `RESOURCE_EXHAUSTED`입니다.
 
+여러 장은 `AddWhitelist`를 이미지별로 호출하며 각 embedding이 독립 exemplar로 누적됩니다.
+Python client의 `add_whitelist_many()`는 queue overflow를 피하기 위해 순차 등록합니다. 기본
+한도는 세션당 32장입니다. Unary `/AiProcessor/GetWhitelistStatus`는 원본이나 embedding을
+노출하지 않고 해당 세션의 `entry_count`와 `whitelist_version`만 반환합니다. 존재하지 않는
+유효 세션은 registry slot을 생성하지 않고 0/0을 반환합니다.
+
 proto를 수정한 경우 생성물을 함께 갱신합니다.
 
 ```bash
@@ -260,8 +273,8 @@ protoc -I. \
 ```
 
 Go 호출부는 모든 `VideoChunk`에 같은 `session_id`를 넣고, 등록 시
-`AddWhitelist(FaceData{session_id, data})`를 호출해야 합니다. Python 서버는 인증을 하지
-않으므로 앞단에서 검증한 세션 값만 전달해야 합니다.
+`AddWhitelist(FaceData{session_id, data})`, 상태 확인 시 `GetWhitelistStatus`를 호출해야
+합니다. Python 서버는 인증을 하지 않으므로 앞단에서 검증한 세션 값만 전달해야 합니다.
 
 ## 브라우저 gRPC 시연
 
@@ -293,6 +306,12 @@ browser -> ILF1 WebSocket -> VideoProcessorClient -> gRPC ProcessVideo -> AI run
 브라우저에서 `http://127.0.0.1:8002`를 엽니다. gateway는 gRPC health service의
 `AiProcessor`가 `SERVING`일 때만 카메라 연결을 허용합니다. 모델과 tracker는
 `ai_processor_server.py` 프로세스에만 존재하므로 GPU memory도 중복되지 않습니다.
+
+상단 whitelist 패널에서 session ID와 얼굴 JPEG 여러 장을 선택해 등록할 수 있습니다.
+등록은 파일별로 계속 진행되므로 한 파일이 얼굴 수·정렬 검사에 실패해도 다음 파일을
+시도합니다. `두 세션 분리 확인`은 A/B의 count와 version을 서버에서 각각 조회합니다. A에만
+등록한 뒤 A session으로 카메라를 시작하면 일치 얼굴이 `whitelist`로 표시되고, 중지 후 B로
+바꿔 다시 시작하면 같은 얼굴도 blur되어 세션 분리를 확인할 수 있습니다.
 
 브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v1과
 `ProcessVideo` gRPC 경로를 확인한 뒤 서버가 광고한 해상도, JPEG 품질, FPS, request window가

@@ -6,11 +6,12 @@ from contextlib import ExitStack
 from typing import Any
 
 import cv2
+import grpc
 import numpy as np
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from grpc_client import VideoResult
+from grpc_client import VideoResult, VideoRpcError
 from protos import ai_processor_pb2
 from server import ServerSettings, create_app
 from service.protocol import decode_response, encode_request
@@ -32,6 +33,9 @@ class FakeGrpcClient:
         self.mode = mode
         self.closed = False
         self.received: list[Any] = []
+        self.stream_sessions: list[str] = []
+        self.whitelist_images: list[tuple[str, bytes]] = []
+        self.whitelist_counts: dict[str, int] = {}
 
     async def __aenter__(self):
         return self
@@ -52,12 +56,37 @@ class FakeGrpcClient:
         raise_frame_errors: bool,
     ) -> AsyncIterator[VideoResult]:
         self.stream_options = (session_id, window, raise_frame_errors)
+        self.stream_sessions.append(session_id)
         async for frame in frames:
             self.received.append(frame)
             response = self._response(frame)
             yield VideoResult(source_jpeg=frame.data, response=response)
             if response.error_code == "INFERENCE_FAILED":
                 return
+
+    async def add_whitelist(self, image: bytes, *, session_id: str):
+        if self.mode == "whitelist_error":
+            raise VideoRpcError(
+                "AddWhitelist",
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "whitelist full",
+            )
+        self.whitelist_images.append((session_id, image))
+        count = self.whitelist_counts.get(session_id, 0) + 1
+        self.whitelist_counts[session_id] = count
+        return ai_processor_pb2.WhitelistResponse(
+            entry_id=f"entry-{len(self.whitelist_images)}",
+            entry_count=count,
+            whitelist_version=count,
+        )
+
+    async def get_whitelist_status(self, session_id: str):
+        count = self.whitelist_counts.get(session_id, 0)
+        return ai_processor_pb2.GetWhitelistStatusResponse(
+            session_id=session_id,
+            entry_count=count,
+            whitelist_version=count,
+        )
 
     def _response(self, frame):
         if self.mode == "decode_then_success" and b"broken" in frame.data:
@@ -151,8 +180,72 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertNotIn("jpeg", result)
         self.assertNotIn("data", result)
         self.assertTrue(result["objects"][0]["whitelisted"])
+        self.assertEqual(result["session_id"], "demo-session")
         self.assertEqual(fake.stream_options, ("demo-session", 5, False))
         self.assertEqual(fake.received[0].frame_id, 7)
+
+    def test_multiple_enrollments_and_status_are_isolated_by_session(self):
+        application, fake = app()
+        face = jpeg()
+        with TestClient(application) as client:
+            first = client.post(
+                "/api/whitelist?session_id=session-a",
+                content=face,
+                headers={"content-type": "image/jpeg"},
+            )
+            second = client.post(
+                "/api/whitelist?session_id=session-a",
+                content=face,
+                headers={"content-type": "image/jpeg"},
+            )
+            status_a = client.get("/api/whitelist?session_id=session-a")
+            status_b = client.get("/api/whitelist?session_id=session-b")
+
+        self.assertEqual((first.status_code, second.status_code), (201, 201))
+        self.assertEqual(first.json()["entry_count"], 1)
+        self.assertEqual(second.json()["entry_count"], 2)
+        self.assertEqual(status_a.json()["entry_count"], 2)
+        self.assertEqual(status_b.json()["entry_count"], 0)
+        self.assertEqual(fake.whitelist_images, [("session-a", face), ("session-a", face)])
+
+    def test_whitelist_api_validates_session_and_body_limit(self):
+        application, _ = app()
+        with TestClient(application) as client:
+            missing = client.get("/api/whitelist")
+            oversized = client.post(
+                "/api/whitelist?session_id=session-a",
+                content=b"x" * 4097,
+            )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json()["error"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(oversized.status_code, 413)
+        self.assertEqual(oversized.json()["error"]["code"], "PAYLOAD_TOO_LARGE")
+
+    def test_whitelist_api_preserves_grpc_status(self):
+        application, _ = app(FakeGrpcClient(mode="whitelist_error"))
+        with TestClient(application) as client:
+            response = client.post(
+                "/api/whitelist?session_id=session-a",
+                content=jpeg(),
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "RESOURCE_EXHAUSTED")
+
+    def test_websocket_query_selects_an_independent_session(self):
+        application, fake = app()
+        with TestClient(application) as client, ExitStack() as stack:
+            first = stack.enter_context(client.websocket_connect("/ws?session_id=session-a"))
+            second = stack.enter_context(client.websocket_connect("/ws?session_id=session-b"))
+            first.send_bytes(encode_request(1, jpeg()))
+            second.send_bytes(encode_request(1, jpeg()))
+            first_result = decode_response(first.receive_text())
+            second_result = decode_response(second.receive_text())
+
+        self.assertEqual(first_result["session_id"], "session-a")
+        self.assertEqual(second_result["session_id"], "session-b")
+        self.assertCountEqual(fake.stream_sessions, ["session-a", "session-b"])
 
     def test_grpc_decode_error_is_forwarded_and_stream_can_continue(self):
         application, _ = app(FakeGrpcClient(mode="decode_then_success"))
