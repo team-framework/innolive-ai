@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import {
   BitmapLease,
@@ -8,6 +9,7 @@ import {
   addWhitelistFiles,
   captureDeadline,
   createSession,
+  deleteSession,
   enrollmentSize,
   ensureTabSession,
   fitLongEdge,
@@ -24,6 +26,11 @@ import {
   websocketUrl,
   whitelistUrl,
 } from "../web/app.js";
+
+const browserHtml = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+assert.doesNotMatch(browserHtml, /comparison-session|compare-sessions|비교할 서버 세션/);
+assert.match(browserHtml, /id="session-list"/);
+assert.match(browserHtml, /id="whitelist-dropzone"/);
 
 assert.deepEqual(PROFILE, {
   protocolVersion: 1,
@@ -65,6 +72,7 @@ const serverSessions = [
     entry_count: 2,
     whitelist_version: 3,
     created_at_unix_ms: 100,
+    active_stream_count: 2,
   },
 ];
 const listedSessions = await listSessions(async (url, options) => {
@@ -89,10 +97,31 @@ const createdSession = await createSession(async (url, options) => {
       entry_count: 0,
       whitelist_version: 0,
       created_at_unix_ms: 200,
+      active_stream_count: 0,
     }),
   };
 });
 assert.equal(createdSession.session_id, "session-created");
+
+let deletedSessionRequest = null;
+await deleteSession(" session/to-delete ", async (url, options) => {
+  deletedSessionRequest = { url, options };
+  return { ok: true, status: 204 };
+});
+assert.deepEqual(deletedSessionRequest, {
+  url: "/api/sessions/%20session%2Fto-delete%20",
+  options: { method: "DELETE" },
+});
+await assert.rejects(
+  deleteSession("session-streaming", async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({
+      error: { code: "FAILED_PRECONDITION", message: "session has active streams" },
+    }),
+  })),
+  /FAILED_PRECONDITION: session has active streams/,
+);
 
 function memoryStorage() {
   const values = new Map();
@@ -108,6 +137,7 @@ const createTabSession = async () => ({
   entry_count: 0,
   whitelist_version: 0,
   created_at_unix_ms: 200 + createdTabs,
+  active_stream_count: 0,
 });
 const firstTabStorage = memoryStorage();
 const secondTabStorage = memoryStorage();
@@ -191,6 +221,7 @@ let enrollmentInFlight = 0;
 let maxEnrollmentInFlight = 0;
 const enrollmentCalls = [];
 const normalizedTypes = [];
+const enrollmentProgress = [];
 const enrollmentRequest = async (url, options) => {
   enrollmentInFlight += 1;
   maxEnrollmentInFlight = Math.max(maxEnrollmentInFlight, enrollmentInFlight);
@@ -218,12 +249,18 @@ const enrollmentResults = await addWhitelistFiles(
     normalizedTypes.push(file.type);
     return new Blob([file.name], { type: "image/jpeg" });
   },
+  (progress) => enrollmentProgress.push(`${progress.index}:${progress.state}`),
 );
 assert.equal(maxEnrollmentInFlight, 1, "enrollments must be submitted sequentially");
 assert.deepEqual(enrollmentResults.map((result) => result.ok), [true, false, true]);
 assert.equal(enrollmentCalls.length, 3, "one invalid face must not skip later files");
 assert.deepEqual(normalizedTypes, ["image/jpeg", "image/png", "image/webp"]);
 assert.ok(enrollmentCalls.every((call) => call.options.body.type === "image/jpeg"));
+assert.deepEqual(enrollmentProgress, [
+  "0:preparing", "0:uploading", "0:success",
+  "1:preparing", "1:uploading", "1:error",
+  "2:preparing", "2:uploading", "2:success",
+]);
 
 let requestsAfterNormalizationFailure = 0;
 const isolatedResults = await addWhitelistFiles(

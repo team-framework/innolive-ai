@@ -9,42 +9,53 @@
   <body>
     <header>
       <div>
-        <p>INNOLIVE / WEBSOCKET → GRPC / LIVE DEMO</p>
-        <h1>gRPC ProcessVideo face anonymizer</h1>
+        <p class="eyebrow">INNOLIVE · GRPC LIVE DEMO</p>
+        <h1>실시간 얼굴 비식별화</h1>
+        <p class="header-description">세션별로 등록한 얼굴만 보호 영상에서 자동으로 제외합니다.</p>
       </div>
       <strong id="status" data-online="false">보호 결과 대기 중</strong>
     </header>
 
     <main>
       <section class="panel enrollment">
-        <h2>세션별 얼굴 whitelist 테스트</h2>
-        <div class="enrollment-grid">
-          <label>
-            <span>영상·등록 서버 세션</span>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">WHITELIST</p>
+            <h2>모자이크에서 제외할 얼굴 등록</h2>
+            <p>정면 얼굴이 하나만 보이는 사진을 선택하면 현재 세션에 순차적으로 등록합니다.</p>
+          </div>
+          <label class="active-session-control">
+            <span>현재 세션</span>
             <select id="session-id" disabled>
               <option value="">세션 목록 확인 중</option>
             </select>
           </label>
-          <label>
-            <span>비교할 서버 세션</span>
-            <select id="comparison-session-id" disabled>
-              <option value="">비교 세션 준비 중</option>
-            </select>
-          </label>
-          <label class="face-files">
-            <span>등록 얼굴 이미지 · JPEG 변환 후 순차 등록</span>
-            <input id="whitelist-files" type="file" accept="image/*" multiple />
-          </label>
         </div>
+
+        <input id="whitelist-files" class="visually-hidden" type="file" accept="image/*" multiple />
+        <div id="whitelist-dropzone" class="upload-zone" role="button" tabindex="0" aria-controls="whitelist-files">
+          <span class="upload-icon" aria-hidden="true">↑</span>
+          <div>
+            <strong>얼굴 사진을 여기에 놓으세요</strong>
+            <p>또는 클릭해 여러 장을 한 번에 선택하세요</p>
+          </div>
+          <span class="file-picker-label">파일 선택</span>
+        </div>
+        <div class="upload-help">
+          <span>JPEG · PNG · WebP 등 브라우저가 열 수 있는 이미지</span>
+          <span>·</span>
+          <span>장변 640px, JPEG Q90으로 자동 변환</span>
+        </div>
+        <div class="selection-summary">
+          <strong id="selected-file-summary">선택한 파일이 없습니다.</strong>
+          <span id="whitelist-status">서버 세션 준비 중</span>
+        </div>
+        <ul id="enrollment-results" class="file-results" aria-live="polite">
+          <li class="empty-result">등록할 사진을 선택하면 파일별 진행 상태가 표시됩니다.</li>
+        </ul>
         <div class="enrollment-actions">
-          <button id="add-whitelist" class="primary" disabled>선택 세션에 얼굴 등록</button>
-          <button id="new-session" disabled>새 세션 생성</button>
-          <button id="refresh-whitelist" disabled>세션 목록 새로고침</button>
-          <button id="compare-sessions" disabled>두 세션 분리 확인</button>
-          <strong id="whitelist-status">서버 세션 준비 중</strong>
+          <button id="add-whitelist" class="primary" disabled>현재 세션에 얼굴 등록</button>
         </div>
-        <pre id="session-list">서버 세션 목록을 불러오는 중입니다.</pre>
-        <pre id="enrollment-results">현재 탭은 서버가 생성한 고유 세션을 재사용합니다. 한 세션에만 얼굴을 등록한 뒤 다른 세션과 blur 결과를 비교하세요.</pre>
       </section>
 
       <section class="controls panel">
@@ -79,6 +90,23 @@
       <section class="panel diagnostics">
         <h2>현재 terminal metadata와 분리 metric</h2>
         <pre id="diagnostics">아직 유효한 보호 결과가 없습니다.</pre>
+      </section>
+
+      <section class="panel session-management">
+        <div class="section-heading session-heading">
+          <div>
+            <p class="eyebrow">SESSIONS</p>
+            <h2>세션 관리</h2>
+            <p>현재 사용할 세션을 확인하고, 스트림이 없는 세션을 삭제할 수 있습니다.</p>
+          </div>
+          <div class="session-actions">
+            <button id="refresh-whitelist" disabled>새로고침</button>
+            <button id="new-session" class="secondary" disabled>새 세션</button>
+          </div>
+        </div>
+        <div id="session-list" class="session-list" aria-live="polite">
+          <p class="empty-state">서버 세션 목록을 불러오는 중입니다.</p>
+        </div>
       </section>
     </main>
 
