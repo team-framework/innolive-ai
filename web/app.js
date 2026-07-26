@@ -12,6 +12,7 @@ export const PROFILE = Object.freeze({
 
 const MAGIC = [0x49, 0x4c, 0x46, 0x31]; // ILF1
 const MAX_SEQUENCE = 0xffffffff;
+const MAX_SESSION_ID_BYTES = 256;
 const FRAME_INTERVAL_MS = 1000 / PROFILE.targetFps;
 const CAPTURE_EARLY_TOLERANCE_MS = 2;
 
@@ -62,6 +63,76 @@ export function percentile(samples, quantile) {
 
 export function objectsToBlur(objects) {
   return objects.filter((object) => object.whitelisted !== true);
+}
+
+export function validateSessionId(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("session ID must not be empty");
+  }
+  if (new TextEncoder().encode(value).byteLength > MAX_SESSION_ID_BYTES) {
+    throw new Error(`session ID exceeds ${MAX_SESSION_ID_BYTES} UTF-8 bytes`);
+  }
+  return value;
+}
+
+export function whitelistUrl(sessionId) {
+  return `/api/whitelist?session_id=${encodeURIComponent(validateSessionId(sessionId))}`;
+}
+
+export function websocketUrl(locationValue, sessionId) {
+  const scheme = locationValue.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${locationValue.host}/ws?session_id=${encodeURIComponent(validateSessionId(sessionId))}`;
+}
+
+export function requireResultSession(metadata, sessionId) {
+  if (metadata?.session_id !== sessionId) {
+    throw new Error("result session does not match the active stream");
+  }
+  return metadata;
+}
+
+export async function getWhitelistStatus(sessionId, request = fetch) {
+  const response = await request(whitelistUrl(sessionId), {
+    cache: "no-store",
+  });
+  return readApiResponse(response);
+}
+
+export async function addWhitelistFiles(files, sessionId, request = fetch) {
+  const url = whitelistUrl(sessionId);
+  const results = [];
+  for (const [index, file] of Array.from(files).entries()) {
+    const name = file.name || `face-${index + 1}.jpg`;
+    try {
+      if (file.type && file.type !== "image/jpeg") {
+        throw new Error("JPEG images are required");
+      }
+      const response = await request(url, {
+        method: "POST",
+        headers: { "content-type": "image/jpeg" },
+        body: file,
+      });
+      results.push({ name, ok: true, response: await readApiResponse(response) });
+    } catch (error) {
+      results.push({ name, ok: false, error: error.message });
+    }
+  }
+  return results;
+}
+
+async function readApiResponse(response) {
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`gateway returned HTTP ${response.status} without JSON`);
+  }
+  if (!response.ok) {
+    const code = payload?.error?.code || `HTTP_${response.status}`;
+    const message = payload?.error?.message || "request failed";
+    throw new Error(`${code}: ${message}`);
+  }
+  return payload;
 }
 
 export function negotiateServerProfile(health, preferred = PROFILE) {
@@ -266,6 +337,8 @@ class App {
         "start", "stop", "status", "source", "output", "capture",
         "capture-fps", "sent-fps", "result-fps", "display-fps", "round-trip",
         "grpc-round-trip", "server-time", "queue", "dropped", "diagnostics",
+        "session-id", "comparison-session-id", "whitelist-files", "add-whitelist",
+        "refresh-whitelist", "compare-sessions", "whitelist-status", "enrollment-results",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -274,6 +347,11 @@ class App {
     this.blurContext = this.blurCanvas.getContext("2d", { alpha: false });
     this.elements.start.addEventListener("click", () => this.start());
     this.elements.stop.addEventListener("click", () => this.stop());
+    this.elements["add-whitelist"].addEventListener("click", () => this.enrollWhitelist());
+    this.elements["refresh-whitelist"].addEventListener("click", () => {
+      this.refreshWhitelistStatus();
+    });
+    this.elements["compare-sessions"].addEventListener("click", () => this.compareSessions());
     this.resetState();
     this.blackout("보호 결과 대기 중");
   }
@@ -291,6 +369,7 @@ class App {
     this.nextSequence = 1;
     this.nextCaptureDeadline = null;
     this.lastTerminalSequence = 0;
+    this.streamSessionId = null;
     this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
     this.measurementStartedAt = null;
@@ -338,6 +417,8 @@ class App {
     this.blackout("서버 readiness 확인 중");
     const generation = ++this.generation;
     try {
+      this.streamSessionId = validateSessionId(this.elements["session-id"].value);
+      this.elements["session-id"].disabled = true;
       const response = await fetch("/healthz", { cache: "no-store" });
       if (!response.ok) throw new Error(`server is not ready (${response.status})`);
       this.activeProfile = negotiateServerProfile(await response.json());
@@ -364,8 +445,7 @@ class App {
         throw new Error("requestVideoFrameCallback is required for real-frame capture");
       }
 
-      const scheme = location.protocol === "https:" ? "wss" : "ws";
-      const socket = new WebSocket(`${scheme}://${location.host}/ws`);
+      const socket = new WebSocket(websocketUrl(location, this.streamSessionId));
       this.socket = socket;
       socket.onopen = () => {
         if (generation !== this.generation || socket !== this.socket) return;
@@ -373,7 +453,7 @@ class App {
         this.measurementStartedAt = performance.now();
         this.lastMetricSampleAt = this.measurementStartedAt;
         this.elements.stop.disabled = false;
-        this.setStatus("연결됨 · WebSocket → gRPC ProcessVideo", true);
+        this.setStatus(`연결됨 · ${this.streamSessionId} · gRPC ProcessVideo`, true);
         this.blackout("첫 보호 결과 대기 중");
         this.scheduleCapture();
       };
@@ -390,6 +470,63 @@ class App {
     } catch (error) {
       this.failClosed(error.message);
     }
+  }
+
+  async enrollWhitelist() {
+    const button = this.elements["add-whitelist"];
+    try {
+      const sessionId = validateSessionId(this.elements["session-id"].value);
+      const files = Array.from(this.elements["whitelist-files"].files || []);
+      if (!files.length) throw new Error("등록할 JPEG를 한 장 이상 선택하세요");
+      button.disabled = true;
+      this.elements["whitelist-status"].textContent = `${files.length}장 등록 중`;
+      const results = await addWhitelistFiles(files, sessionId);
+      this.elements["enrollment-results"].textContent = results.map((result) => (
+        result.ok
+          ? `✓ ${result.name} → ${result.response.entry_count} entries · v${result.response.whitelist_version}`
+          : `✗ ${result.name} → ${result.error}`
+      )).join("\n");
+      await this.refreshWhitelistStatus();
+    } catch (error) {
+      this.elements["whitelist-status"].textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async refreshWhitelistStatus() {
+    try {
+      const sessionId = validateSessionId(this.elements["session-id"].value);
+      const status = await getWhitelistStatus(sessionId);
+      this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
+      return status;
+    } catch (error) {
+      this.elements["whitelist-status"].textContent = error.message;
+      return null;
+    }
+  }
+
+  async compareSessions() {
+    try {
+      const firstId = validateSessionId(this.elements["session-id"].value);
+      const secondId = validateSessionId(this.elements["comparison-session-id"].value);
+      if (firstId === secondId) throw new Error("서로 다른 session ID를 입력하세요");
+      const [first, second] = await Promise.all([
+        getWhitelistStatus(firstId),
+        getWhitelistStatus(secondId),
+      ]);
+      this.elements["enrollment-results"].textContent = [
+        `A · ${this.formatWhitelistStatus(first)}`,
+        `B · ${this.formatWhitelistStatus(second)}`,
+        "각 session_id의 count/version을 서버에서 독립 조회했습니다.",
+      ].join("\n");
+    } catch (error) {
+      this.elements["enrollment-results"].textContent = error.message;
+    }
+  }
+
+  formatWhitelistStatus(status) {
+    return `${status.session_id}: ${status.entry_count} entries · v${status.whitelist_version}`;
   }
 
   scheduleCapture() {
@@ -512,6 +649,7 @@ class App {
         this.counters.errors += 1;
         throw new Error(`${metadata.code}: ${metadata.message}`);
       }
+      requireResultSession(metadata, this.streamSessionId);
       if (
         metadata.width !== request.width
         || metadata.height !== request.height
@@ -705,6 +843,7 @@ class App {
     const elapsedSeconds = Math.max(elapsedMs / 1000, Number.EPSILON);
     const metrics = {
       profile: this.activeProfile,
+      session_id: this.streamSessionId,
       seq: item.sequence,
       capture_fps: this.rate(this.rates.capture, now),
       encoded_fps: this.rate(this.rates.encoded, now),
@@ -828,6 +967,8 @@ class App {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.elements.source.srcObject = null;
+    this.elements["session-id"].disabled = false;
+    this.streamSessionId = null;
     this.elements.start.disabled = false;
     this.elements.stop.disabled = true;
   }

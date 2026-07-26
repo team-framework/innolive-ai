@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from grpc_client import VideoClientError, VideoFrame, VideoProcessorClient
+from grpc_client import VideoClientError, VideoFrame, VideoProcessorClient, VideoRpcError
 from service.protocol import (
     HEADER,
     MAGIC,
@@ -56,6 +56,13 @@ STAT_FIELDS = (
     "whitelisted_tracks",
 )
 _END_OF_FRAMES = object()
+RPC_HTTP_STATUS = {
+    "INVALID_ARGUMENT": 400,
+    "FAILED_PRECONDITION": 412,
+    "RESOURCE_EXHAUSTED": 429,
+    "DEADLINE_EXCEEDED": 504,
+    "UNAVAILABLE": 503,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,11 +198,64 @@ class GrpcDemoGateway:
             payload["error"] = health_error
         return JSONResponse(payload, status_code=200 if serving else 503)
 
+    async def whitelist_status(self, request: Request) -> JSONResponse:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        session_id = self._api_session_id(request)
+        if isinstance(session_id, JSONResponse):
+            return session_id
+        try:
+            response = await client.get_whitelist_status(session_id)
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        return JSONResponse(
+            {
+                "session_id": response.session_id,
+                "entry_count": int(response.entry_count),
+                "whitelist_version": int(response.whitelist_version),
+            }
+        )
+
+    async def add_whitelist(self, request: Request) -> JSONResponse:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        session_id = self._api_session_id(request)
+        if isinstance(session_id, JSONResponse):
+            return session_id
+        try:
+            image = await _bounded_body(request, self.settings.max_jpeg_bytes)
+            response = await client.add_whitelist(image, session_id=session_id)
+        except PayloadTooLarge as error:
+            return _api_error(413, "PAYLOAD_TOO_LARGE", str(error))
+        except (TypeError, ValueError) as error:
+            return _api_error(400, "INVALID_ARGUMENT", str(error))
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "entry_id": response.entry_id,
+                "entry_count": int(response.entry_count),
+                "whitelist_version": int(response.whitelist_version),
+            },
+            status_code=201,
+        )
+
     async def stream(self, websocket: WebSocket) -> None:
         serving, _ = await self._grpc_serving(websocket.app)
         client = getattr(websocket.app.state, "grpc_client", None)
         if not serving or client is None:
             await self._reject(websocket, "gRPC backend is not serving")
+            return
+        requested_session = websocket.query_params.get("session_id")
+        try:
+            session_id = validate_session_id(
+                self.settings.session_id if requested_session is None else requested_session
+            )
+        except ValueError as error:
+            await self._reject(websocket, str(error), code=1008)
             return
         self.active_streams += 1
         try:
@@ -205,6 +265,7 @@ class GrpcDemoGateway:
                 client,
                 self.settings,
                 self.metrics,
+                session_id,
             ).run()
         except WebSocketDisconnect:
             return
@@ -227,6 +288,24 @@ class GrpcDemoGateway:
             return bool(serving), None
         except Exception as error:
             return False, f"{type(error).__name__}: {error}"
+
+    async def _api_client(self, request: Request) -> VideoProcessorClient | JSONResponse:
+        serving, health_error = await self._grpc_serving(request.app)
+        client = getattr(request.app.state, "grpc_client", None)
+        if serving and client is not None:
+            return client
+        return _api_error(
+            503,
+            "GRPC_UNAVAILABLE",
+            health_error or "gRPC backend is not serving",
+        )
+
+    @staticmethod
+    def _api_session_id(request: Request) -> str | JSONResponse:
+        try:
+            return validate_session_id(request.query_params.get("session_id"))
+        except ValueError as error:
+            return _api_error(400, "INVALID_ARGUMENT", str(error))
 
     def _health_payload(self, serving: bool) -> dict[str, Any]:
         return {
@@ -252,9 +331,9 @@ class GrpcDemoGateway:
         }
 
     @staticmethod
-    async def _reject(websocket: WebSocket, reason: str) -> None:
+    async def _reject(websocket: WebSocket, reason: str, *, code: int = 1013) -> None:
         await websocket.accept()
-        await websocket.close(code=1013, reason=reason)
+        await websocket.close(code=code, reason=reason)
 
 
 class GrpcWebSocketSession:
@@ -264,11 +343,13 @@ class GrpcWebSocketSession:
         client: VideoProcessorClient,
         settings: ServerSettings,
         metrics: ServerMetrics,
+        session_id: str,
     ) -> None:
         self.websocket = websocket
         self.client = client
         self.settings = settings
         self.metrics = metrics
+        self.session_id = session_id
         self.frames: asyncio.Queue[VideoFrame | object] = asyncio.Queue()
         self.slots = asyncio.Semaphore(REQUEST_WINDOW)
         self.outstanding: deque[int] = deque()
@@ -283,7 +364,7 @@ class GrpcWebSocketSession:
             async with aclosing(
                 self.client.process_video(
                     self._frame_source(),
-                    session_id=self.settings.session_id,
+                    session_id=self.session_id,
                     window=REQUEST_WINDOW,
                     raise_frame_errors=False,
                 )
@@ -393,8 +474,7 @@ class GrpcWebSocketSession:
         self.metrics.record_result(payload, len(encoded.encode("utf-8")))
         return True
 
-    @staticmethod
-    def _result_payload(response: Any, round_trip_ms: float) -> dict[str, Any]:
+    def _result_payload(self, response: Any, round_trip_ms: float) -> dict[str, Any]:
         timing = response.timing
         timing_ms = {
             "queue": round(float(timing.queue_ms), 2),
@@ -416,6 +496,7 @@ class GrpcWebSocketSession:
             "timing_ms": timing_ms,
             "stats": {field: int(getattr(stats, field)) for field in STAT_FIELDS},
             "transport": "grpc",
+            "session_id": self.session_id,
         }
 
     async def _sequence_error(self, sequence: int) -> None:
@@ -492,9 +573,39 @@ def create_app(
     app.add_api_route("/", gateway.index, methods=["GET"], include_in_schema=False)
     app.add_api_route("/healthz", gateway.health, methods=["GET"])
     app.add_api_route("/readyz", gateway.readiness, methods=["GET"])
+    app.add_api_route("/api/whitelist", gateway.whitelist_status, methods=["GET"])
+    app.add_api_route("/api/whitelist", gateway.add_whitelist, methods=["POST"])
     app.add_api_websocket_route("/ws", gateway.stream)
     app.state.gateway = gateway
     return app
+
+
+class PayloadTooLarge(ValueError):
+    pass
+
+
+async def _bounded_body(request: Request, limit: int) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise PayloadTooLarge(f"image exceeds the {limit} byte limit")
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _api_error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"code": code, "message": message}},
+        status_code=status_code,
+    )
+
+
+def _rpc_error_response(error: VideoRpcError) -> JSONResponse:
+    return _api_error(
+        RPC_HTTP_STATUS.get(error.code.name, 502),
+        error.code.name,
+        error.details,
+    )
 
 
 def _percentiles(values: deque[float]) -> dict[str, float | None]:

@@ -34,8 +34,17 @@ main { display: grid; gap: 15px; padding-bottom: 40px; }
 .controls { display: flex; align-items: center; gap: 9px; padding: 13px; }
 .controls span { margin-left: auto; color: var(--muted); font: .72rem ui-monospace, monospace; }
 button { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: #0b1118; color: var(--text); font-weight: 700; cursor: pointer; }
-button:first-child { border-color: var(--safe); background: var(--safe); color: #052117; }
+.controls #start, button.primary { border-color: var(--safe); background: var(--safe); color: #052117; }
 button:disabled { opacity: .4; cursor: default; }
+
+.enrollment { padding-bottom: 13px; }
+.enrollment-grid { display: grid; grid-template-columns: 1fr 1fr 1.4fr; gap: 12px; padding: 13px; }
+.enrollment label { display: grid; gap: 7px; color: var(--muted); font-size: .72rem; }
+.enrollment input { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #0b1118; color: var(--text); }
+.enrollment input:disabled { opacity: .6; }
+.enrollment-actions { display: flex; align-items: center; gap: 9px; padding: 0 13px; }
+.enrollment-actions strong { margin-left: auto; color: var(--safe); font: 700 .78rem ui-monospace, monospace; }
+.enrollment pre { min-height: 42px; margin: 13px 13px 0; padding: 11px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; color: #b8c7d5; background: #0b1118; font: .72rem/1.5 ui-monospace, monospace; white-space: pre-wrap; }
 
 .viewers { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
@@ -55,9 +64,15 @@ video, #output { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: 
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .metrics div { border-bottom: 1px solid var(--line); }
   .controls span { display: none; }
+  .enrollment-grid { grid-template-columns: 1fr 1fr; }
+  .face-files { grid-column: 1 / -1; }
+  .enrollment-actions { flex-wrap: wrap; }
+  .enrollment-actions strong { width: 100%; margin-left: 0; }
 }
 
 @media (max-width: 600px) {
   header { align-items: flex-start; }
   #status { max-width: 42%; border-radius: 10px; }
+  .enrollment-grid { grid-template-columns: 1fr; }
+  .face-files { grid-column: auto; }
 }
