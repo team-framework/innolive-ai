@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import asyncio
+import unittest
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from typing import Any
+
+import cv2
+import grpc
+import numpy as np
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
+
+from grpc_client import (
+    VideoFrame,
+    VideoFrameError,
+    VideoProcessorClient,
+    VideoProtocolError,
+)
+from protos import ai_processor_pb2, ai_processor_pb2_grpc
+from service.grpc_config import server_options
+
+
+def _jpeg(value: int) -> bytes:
+    encoded, payload = cv2.imencode(
+        ".jpg",
+        np.full((32, 48, 3), value, dtype=np.uint8),
+    )
+    if not encoded:
+        raise RuntimeError("test JPEG encoding failed")
+    return payload.tobytes()
+
+
+class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+        self.requests: list[Any] = []
+
+    async def ProcessVideo(self, request_iterator, context) -> AsyncIterator[Any]:
+        if self.mode == "early_eof":
+            return
+
+        batch: list[Any] = []
+        async for request in request_iterator:
+            self.requests.append(request)
+            if self.mode != "success":
+                yield self._special_response(request)
+                return
+            batch.append(request)
+            if len(batch) == 5:
+                for item in batch:
+                    yield self._success(item)
+                batch.clear()
+        for item in batch:
+            yield self._success(item)
+
+    async def AddWhitelist(self, request, context):
+        del request
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "not used")
+
+    @staticmethod
+    def _success(request):
+        return ai_processor_pb2.ProcessedVideoChunk(
+            timestamp=request.timestamp,
+            status_message="success",
+            width=48,
+            height=32,
+            frame_id=request.frame_id,
+            processing_ms=1.0,
+            timing=ai_processor_pb2.ProcessingTiming(
+                inference_batch_size=1,
+                server_total_ms=1.0,
+            ),
+        )
+
+    def _special_response(self, request):
+        response = self._success(request)
+        if self.mode == "pixel_echo":
+            response.data = request.data
+        elif self.mode == "reorder":
+            response.frame_id += 1
+        elif self.mode == "frame_error":
+            response.status_message = "failed"
+            response.error_code = "INFERENCE_FAILED"
+            response.error_message = "frame inference failed"
+        else:
+            raise AssertionError(f"unknown test mode: {self.mode}")
+        return response
+
+
+class ClientLoopback:
+    def __init__(self, mode: str = "success") -> None:
+        self.servicer = ClientContractServicer(mode)
+        self.server = grpc.aio.server(options=server_options())
+        self.health = health.aio.HealthServicer()
+        ai_processor_pb2_grpc.add_AiProcessorServicer_to_server(
+            self.servicer,
+            self.server,
+        )
+        health_pb2_grpc.add_HealthServicer_to_server(self.health, self.server)
+        self.port = self.server.add_insecure_port("127.0.0.1:0")
+
+    async def __aenter__(self) -> ClientLoopback:
+        await self.health.set(
+            "AiProcessor",
+            health_pb2.HealthCheckResponse.SERVING,
+        )
+        await self.server.start()
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.server.stop(0)
+
+
+class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standard_health_service_is_exposed_by_the_client(self):
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            self.assertTrue(await client.is_serving())
+
+    async def test_easy_jpeg_api_assigns_ids_and_keeps_exact_sources_at_w5(self):
+        jpegs = [_jpeg(value) for value in range(7)]
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            results = [
+                result
+                async for result in client.process_jpegs(
+                    jpegs,
+                    start_frame_id=10,
+                )
+            ]
+            max_inflight = client.max_inflight_observed
+
+        self.assertEqual(
+            [result.response.frame_id for result in results],
+            list(range(10, 17)),
+        )
+        self.assertEqual(
+            [result.source_jpeg for result in results],
+            jpegs,
+        )
+        self.assertTrue(all(result.response.timestamp > 0 for result in results))
+        self.assertEqual(max_inflight, 5)
+        self.assertTrue(all(result.response.data == b"" for result in results))
+
+    async def test_server_frame_error_is_typed_and_cancels_the_stream(self):
+        async with (
+            ClientLoopback("frame_error") as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            with self.assertRaises(VideoFrameError) as failed:
+                async for _ in client.process_jpegs([_jpeg(1), _jpeg(2)]):
+                    pass
+
+        self.assertEqual(failed.exception.frame_id, 1)
+        self.assertIn("INFERENCE_FAILED", failed.exception.detail)
+
+    async def test_demo_mode_can_yield_a_typed_frame_error_response(self):
+        async with (
+            ClientLoopback("frame_error") as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            results = [
+                result
+                async for result in client.process_jpegs(
+                    [_jpeg(1)],
+                    raise_frame_errors=False,
+                )
+            ]
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].response.error_code, "INFERENCE_FAILED")
+
+    async def test_pixel_echo_and_reordered_response_fail_closed(self):
+        for mode in ("pixel_echo", "reorder"):
+            with self.subTest(mode=mode):
+                async with ClientLoopback(mode) as loopback:
+                    async with VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client:
+                        with self.assertRaises(VideoProtocolError):
+                            async for _ in client.process_jpegs([_jpeg(3)]):
+                                pass
+
+    async def test_early_eof_is_not_treated_as_success(self):
+        async with (
+            ClientLoopback("early_eof") as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            with self.assertRaises(VideoProtocolError):
+                async for _ in client.process_jpegs([_jpeg(4)]):
+                    pass
+
+    async def test_explicit_consumer_close_releases_async_source(self):
+        source_closed = asyncio.Event()
+
+        async def frames() -> AsyncIterator[VideoFrame]:
+            try:
+                for frame_id in range(1, 20):
+                    yield VideoFrame(_jpeg(frame_id), frame_id, frame_id)
+            finally:
+                source_closed.set()
+
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+            aclosing(client.process_video(frames())) as results,
+        ):
+            await anext(results)
+
+        await asyncio.wait_for(source_closed.wait(), timeout=1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

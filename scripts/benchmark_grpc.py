@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the B1-640-Q90-W5 ILF1 transport and latency acceptance gate."""
+"""Run the B1-640-Q90-W5 gRPC ProcessVideo acceptance gate."""
 
 from __future__ import annotations
 
@@ -9,30 +9,18 @@ import json
 import platform
 import sys
 import time
-import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import cv2
-import websockets
+import grpc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.benchmark_utils import (
-    distribution,
-    load_jpegs,
-    percentile,
-    sha256_file,
-)
-from service.protocol import (
-    MAX_RESPONSE_BYTES,
-    decode_response,
-    encode_request,
-)
+from grpc_client import VideoFrame, VideoProcessorClient
+from scripts.benchmark_utils import distribution, load_jpegs, percentile, sha256_file
 
 WINDOW = 5
 MIN_FRAMES = 120
@@ -40,7 +28,7 @@ MIN_RESULT_FPS = 30.0
 MAX_SERVER_P95_MS = 33.3
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Sample:
     sequence: int
     sent_at: float
@@ -54,71 +42,68 @@ class Sample:
         return (self.received_at - self.sent_at) * 1000
 
 
-async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
-    next_index = 0
-    pending: dict[int, tuple[float, int]] = {}
-    samples: list[Sample] = []
-    last_terminal = 0
-    max_inflight = 0
+async def run_stream(
+    target: str,
+    jpegs: list[bytes],
+    timeout: float,
+) -> tuple[list[Sample], int]:
+    sent_at: dict[int, float] = {}
 
-    async with websockets.connect(
-        url,
-        max_size=MAX_RESPONSE_BYTES,
-        max_queue=WINDOW,
-        compression=None,
-    ) as websocket:
-        while len(samples) < len(jpegs):
-            while next_index < len(jpegs) and len(pending) < WINDOW:
-                sequence = next_index + 1
-                jpeg = jpegs[next_index]
-                sent_at = time.perf_counter()
-                await websocket.send(encode_request(sequence, jpeg))
-                pending[sequence] = (sent_at, len(jpeg))
-                next_index += 1
-                max_inflight = max(max_inflight, len(pending))
-
-            raw = await websocket.recv()
-            received_at = time.perf_counter()
-            if not isinstance(raw, str):
-                raise TypeError("server returned binary data; metadata JSON is required")
-            metadata = decode_response(raw)
-            sequence = metadata["seq"]
-            if sequence not in pending:
-                raise RuntimeError(f"unknown or duplicate terminal sequence: {sequence}")
-            if sequence <= last_terminal:
-                raise RuntimeError(f"terminal sequence regressed: {sequence}")
-            last_terminal = sequence
-            sent_at, jpeg_bytes = pending.pop(sequence)
-            if metadata["type"] == "error":
-                raise RuntimeError(
-                    f"server error seq={sequence} code={metadata.get('code')}: "
-                    f"{metadata.get('message')}"
-                )
-            if _contains_pixels(metadata):
-                raise RuntimeError("result contains forbidden JPEG/raw pixel fields")
-            server_total = float(metadata.get("timing_ms", {}).get("server_total", 0))
-            samples.append(
-                Sample(
-                    sequence,
-                    sent_at,
-                    received_at,
-                    jpeg_bytes,
-                    len(raw.encode("utf-8")),
-                    server_total,
-                )
+    async def frames():
+        for sequence, jpeg in enumerate(jpegs, start=1):
+            timestamp = time.perf_counter_ns()
+            sent_at[sequence] = timestamp / 1_000_000_000
+            yield VideoFrame(
+                data=jpeg,
+                timestamp=timestamp,
+                frame_id=sequence,
             )
 
-    if pending or len(samples) != len(jpegs):
-        raise RuntimeError("not every accepted sequence received one terminal result")
+    samples: list[Sample] = []
+    async with VideoProcessorClient(
+        target,
+        connect_timeout=min(timeout, 10.0),
+    ) as client:
+        async for result in client.process_video(
+            frames(),
+            window=WINDOW,
+            timeout=timeout,
+        ):
+            received_at = time.perf_counter()
+            response = result.response
+            sequence = int(response.frame_id)
+            expected = len(samples) + 1
+            if sequence != expected:
+                raise RuntimeError(
+                    f"terminal sequence mismatch: expected {expected}, got {sequence}"
+                )
+            if result.source_jpeg != jpegs[sequence - 1]:
+                raise RuntimeError(f"source JPEG mismatch for frame {sequence}")
+            if bytes(response.data):
+                raise RuntimeError("server returned forbidden JPEG/raw pixel data")
+            samples.append(
+                Sample(
+                    sequence=sequence,
+                    sent_at=sent_at[sequence],
+                    received_at=received_at,
+                    jpeg_bytes=len(result.source_jpeg),
+                    metadata_bytes=int(response.ByteSize()),
+                    server_total_ms=_server_total_ms(response),
+                )
+            )
+        max_inflight = client.max_inflight_observed
+
+    if len(samples) != len(jpegs):
+        raise RuntimeError(f"only {len(samples)}/{len(jpegs)} frames received a terminal result")
     return samples, max_inflight
 
 
 def summarize(
     samples: list[Sample],
     max_inflight: int,
-    health: dict[str, Any] | None,
     input_path: Path,
-) -> dict[str, Any]:
+    target: str,
+) -> dict[str, object]:
     receive_times = [sample.received_at for sample in samples]
     duration = receive_times[-1] - receive_times[0] if len(samples) > 1 else 0
     result_fps = (len(samples) - 1) / duration if duration > 0 else 0
@@ -129,17 +114,20 @@ def summarize(
     first_p50 = percentile(first_quarter, 50)
     last_p50 = percentile(last_quarter, 50)
     latency_growth_ms = last_p50 - first_p50
+    sequences = [sample.sequence for sample in samples]
     gates = {
         "frames_at_least_120": len(samples) >= MIN_FRAMES,
         "result_fps_at_least_30": result_fps >= MIN_RESULT_FPS,
+        "server_total_present": bool(server) and min(server) > 0,
         "server_total_p95_at_most_33_3_ms": percentile(server, 95) <= MAX_SERVER_P95_MS,
         "max_inflight_at_most_5": max_inflight <= WINDOW,
-        "terminal_sequence_complete": [sample.sequence for sample in samples]
-        == list(range(1, len(samples) + 1)),
+        "terminal_sequence_complete": sequences == list(range(1, len(samples) + 1)),
+        "metadata_only": True,
         "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
         "profile": "B1-640-Q90-W5",
+        "transport": "grpc.aio bidi ProcessVideo",
         "passed": all(gates.values()),
         "gates": gates,
         "metrics": {
@@ -155,9 +143,10 @@ def summarize(
         "provenance": {
             "input": str(input_path),
             "input_sha256": sha256_file(input_path),
+            "target": target,
             "python": platform.python_version(),
             "opencv": cv2.__version__,
-            "health": health,
+            "grpcio": grpc.__version__,
         },
         "samples": [
             {
@@ -169,36 +158,24 @@ def summarize(
     }
 
 
-def _contains_pixels(value: Any) -> bool:
-    forbidden = {"jpeg", "image", "pixels", "data", "frame"}
-    if isinstance(value, dict):
-        if any(str(key).lower() in forbidden for key in value):
-            return True
-        return any(_contains_pixels(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_pixels(item) for item in value)
-    return isinstance(value, (bytes, bytearray, memoryview))
-
-
-def health_url(websocket_url: str) -> str:
-    parsed = urlsplit(websocket_url)
-    scheme = "https" if parsed.scheme == "wss" else "http"
-    return urlunsplit((scheme, parsed.netloc, "/healthz", "", ""))
-
-
-def read_health(websocket_url: str) -> dict[str, Any] | None:
-    try:
-        with urllib.request.urlopen(health_url(websocket_url), timeout=5) as response:
-            return json.load(response)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
+def _server_total_ms(response: object) -> float:
+    timing = getattr(response, "timing", None)
+    if timing is not None:
+        for field in ("server_total_ms", "server_total"):
+            if hasattr(timing, field):
+                value = float(getattr(timing, field))
+                if value > 0:
+                    return value
+    value = float(getattr(response, "processing_ms", 0.0))
+    return value if value > 0 else 0.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="ws://127.0.0.1:8001/ws")
+    parser.add_argument("--target", default="127.0.0.1:50051")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=MIN_FRAMES)
+    parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -210,9 +187,17 @@ def main() -> None:
         raise SystemExit(f"input video not found: {input_path}")
     if args.frames < MIN_FRAMES:
         raise SystemExit(f"--frames must be at least {MIN_FRAMES}")
+    if args.timeout <= 0:
+        raise SystemExit("--timeout must be positive")
+
     jpegs = load_jpegs(input_path, args.frames)
-    samples, max_inflight = asyncio.run(run_stream(args.url, jpegs))
-    report = summarize(samples, max_inflight, read_health(args.url), input_path)
+    samples, max_inflight = asyncio.run(run_stream(args.target, jpegs, args.timeout))
+    report = summarize(
+        samples,
+        max_inflight,
+        input_path,
+        args.target,
+    )
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         output = args.output.expanduser().resolve()

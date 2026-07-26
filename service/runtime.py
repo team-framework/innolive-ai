@@ -1,10 +1,12 @@
-"""Singleton static-B1 TensorRT runtime with one serialized GPU lane."""
+"""Platform-aware YOLO runtime with one serialized inference lane."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
+import platform
 import threading
 import time
 from collections import defaultdict, deque
@@ -32,21 +34,49 @@ IMAGE_SIZE = 640
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
 EXPECTED_CLASS_NAMES = {0: "face"}
+BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
+DEFAULT_ENGINE = ROOT / "models" / "best_b1.engine"
 
 
 class InferenceFailure(RuntimeError):
-    pass
+    """The selected model backend could not process a frame."""
 
 
 class TrackingFailure(RuntimeError):
-    pass
+    """Tracking or temporal mask stabilization failed."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    engine: Path
-    device: str = "0"
+    checkpoint: Path = DEFAULT_CHECKPOINT
+    engine: Path = DEFAULT_ENGINE
+    backend: str = "auto"
+    device: str = "auto"
     warmup_runs: int = 3
+
+    def __post_init__(self) -> None:
+        backend = self.backend.strip().casefold()
+        device = self.device.strip().casefold()
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {sorted(BACKENDS)}")
+        if not device:
+            raise ValueError("device must not be empty")
+        if self.warmup_runs < 1:
+            raise ValueError("warmup_runs must be at least one")
+        object.__setattr__(self, "checkpoint", self.checkpoint.expanduser().resolve())
+        object.__setattr__(self, "engine", self.engine.expanduser().resolve())
+        object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "device", device)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSelection:
+    backend: str
+    artifact: Path
+    device: str
+    manifest: dict[str, Any] | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -58,7 +88,7 @@ def sha256_file(path: Path) -> str:
 
 
 def validate_engine(config: RuntimeConfig) -> dict[str, Any]:
-    engine = config.engine.expanduser().resolve()
+    engine = config.engine
     if engine.suffix.lower() != ".engine" or not engine.is_file():
         raise RuntimeError(f"static TensorRT engine not found: {engine}")
     manifest_path = engine.with_suffix(engine.suffix + ".json")
@@ -96,6 +126,82 @@ def validate_engine(config: RuntimeConfig) -> dict[str, Any]:
     return manifest
 
 
+def select_runtime(config: RuntimeConfig) -> RuntimeSelection:
+    """Resolve one explicit artifact and accelerator from the configured policy."""
+
+    if config.backend == "tensorrt":
+        return _select_tensorrt(config)
+    if config.backend == "pytorch":
+        return _select_pytorch(config)
+
+    if _tensorrt_supported() and config.engine.is_file():
+        return _select_tensorrt(config)
+    return _select_pytorch(config)
+
+
+def _select_tensorrt(config: RuntimeConfig) -> RuntimeSelection:
+    if not _tensorrt_supported():
+        raise RuntimeError(
+            "TensorRT requires Linux x86_64, an NVIDIA CUDA device, and the tensorrt package"
+        )
+    device = _resolve_device(config.device, backend="tensorrt")
+    return RuntimeSelection(
+        backend="tensorrt",
+        artifact=config.engine,
+        device=device,
+        manifest=validate_engine(config),
+    )
+
+
+def _select_pytorch(config: RuntimeConfig) -> RuntimeSelection:
+    if not config.checkpoint.is_file() or config.checkpoint.suffix.lower() != ".pt":
+        raise RuntimeError(f"PyTorch checkpoint not found: {config.checkpoint}")
+    return RuntimeSelection(
+        backend="pytorch",
+        artifact=config.checkpoint,
+        device=_resolve_device(config.device, backend="pytorch"),
+    )
+
+
+def _resolve_device(requested: str, *, backend: str) -> str:
+    import torch
+
+    if backend == "tensorrt":
+        device = "0" if requested == "auto" else requested.removeprefix("cuda:")
+        if not device.isdigit() or int(device) >= torch.cuda.device_count():
+            raise RuntimeError(f"CUDA device is unavailable: {requested}")
+        return device
+
+    if requested == "auto":
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "0"
+        return "cpu"
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is unavailable")
+    if requested.startswith("cuda:"):
+        requested = requested.removeprefix("cuda:")
+    if requested.isdigit() and int(requested) >= torch.cuda.device_count():
+        raise RuntimeError(f"CUDA device is unavailable: {requested}")
+    if requested not in {"cpu", "mps"} and not requested.isdigit():
+        raise ValueError("device must be auto, cpu, mps, or a CUDA device index")
+    return requested
+
+
+def _tensorrt_supported() -> bool:
+    if platform.system() != "Linux" or platform.machine() not in {"x86_64", "AMD64"}:
+        return False
+    if importlib.util.find_spec("tensorrt") is None:
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
 class RuntimeManager:
     """Own exactly one warmed model and one bounded execution thread."""
 
@@ -103,26 +209,29 @@ class RuntimeManager:
     _live_instances = 0
 
     def __init__(self, config: RuntimeConfig):
-        if config.warmup_runs < 1:
-            raise ValueError("warmup_runs must be at least one")
-        self.config = RuntimeConfig(config.engine.expanduser().resolve(), config.device, config.warmup_runs)
-        self.manifest = validate_engine(self.config)
-        import tensorrt
+        self.config = config
+        self.selection = select_runtime(config)
+        self.manifest = self.selection.manifest
+        if self.selection.backend == "tensorrt":
+            import tensorrt
 
-        if tensorrt.__version__ != self.manifest.get("tensorrt"):
-            raise RuntimeError(
-                "TensorRT runtime version does not match the engine manifest: "
-                f"{tensorrt.__version__} != {self.manifest.get('tensorrt')}"
-            )
+            expected_version = self.manifest.get("tensorrt") if self.manifest else None
+            if tensorrt.__version__ != expected_version:
+                raise RuntimeError(
+                    "TensorRT runtime version does not match the engine manifest: "
+                    f"{tensorrt.__version__} != {expected_version}"
+                )
         with self._guard:
             if type(self)._live_instances:
                 raise RuntimeError("only one RuntimeManager may exist in a process")
             type(self)._live_instances += 1
 
-        self.backend = "TensorRT"
+        self.backend = self.selection.backend
+        self.device = self.selection.device
+        self.artifact_sha256 = sha256_file(self.selection.artifact)
         self.ready = False
         self._closed = False
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-gpu")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
         self._lane: asyncio.Lock | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
@@ -131,11 +240,11 @@ class RuntimeManager:
             from ultralytics import YOLO
 
             started = time.perf_counter()
-            self._model = YOLO(str(self.config.engine), task="segment")
+            self._model = YOLO(str(self.selection.artifact), task="segment")
             self.names = {int(key): str(value) for key, value in self._model.names.items()}
             if self.names != EXPECTED_CLASS_NAMES:
                 raise RuntimeError(
-                    f"engine class names {self.names!r}; expected {EXPECTED_CLASS_NAMES!r}"
+                    f"model class names {self.names!r}; expected {EXPECTED_CLASS_NAMES!r}"
                 )
             dummy = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
             for _ in range(self.config.warmup_runs):
@@ -163,7 +272,7 @@ class RuntimeManager:
                 classes=[0],
                 max_det=MAX_DETECTIONS,
                 retina_masks=True,
-                device=self.config.device,
+                device=self.device,
                 verbose=False,
             )
         )
@@ -195,7 +304,7 @@ class RuntimeManager:
         try:
             prediction = self._predict(image)
         except Exception as error:
-            raise InferenceFailure("TensorRT inference failed") from error
+            raise InferenceFailure(f"{self.backend} inference failed") from error
         inferred_at = time.perf_counter()
         try:
             boxes = prediction.boxes.cpu().numpy()
@@ -225,14 +334,11 @@ class RuntimeManager:
             "raw_detections": len(boxes),
             "continuation_candidates": int(
                 (
-                    (confidences >= CONTINUATION_CONFIDENCE)
-                    & (confidences < ACTIVATION_CONFIDENCE)
+                    (confidences >= CONTINUATION_CONFIDENCE) & (confidences < ACTIVATION_CONFIDENCE)
                 ).sum()
             ),
             "detector_backed_tracks": temporal["detector_backed_tracks"],
-            "low_confidence_continuations": temporal[
-                "low_confidence_continuations"
-            ],
+            "low_confidence_continuations": temporal["low_confidence_continuations"],
             "held_tracks": temporal["held_tracks"],
             "tracks": len(objects),
             "tracker_frame": tracker.frame_id,
@@ -302,8 +408,12 @@ class RuntimeManager:
             "ready": self.ready and not self._closed,
             "runtime_instances": type(self)._live_instances,
             "backend": self.backend,
-            "engine": self.config.engine.name,
-            "engine_sha256": self.manifest["engine_sha256"],
+            "device": self.device,
+            "artifact": self.selection.artifact.name,
+            "artifact_sha256": self.artifact_sha256,
+            "engine_sha256": (
+                self.manifest["engine_sha256"] if self.manifest is not None else None
+            ),
             "image_size": IMAGE_SIZE,
             "batch_size": 1,
             "scheduler": "serialized_b1",
@@ -315,10 +425,9 @@ class RuntimeManager:
             "hold_confidence_decay": HOLD_CONFIDENCE_DECAY,
             "warmup_ms": round(self.warmup_ms, 2) if self.warmup_ms else None,
             "latency_ms": {
-                stage: _percentiles(list(values))
-                for stage, values in self._latency.items()
+                stage: _percentiles(list(values)) for stage, values in self._latency.items()
             },
-            "gpu": _gpu_health(self.config.device),
+            "accelerator": _accelerator_health(self.device),
         }
 
     def close(self) -> None:
@@ -342,24 +451,36 @@ def _percentiles(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def _gpu_health(device: str) -> dict[str, Any]:
+def _accelerator_health(device: str) -> dict[str, Any]:
+    if device == "mps":
+        return {"type": "mps", "name": "Apple Metal Performance Shaders"}
+    if device == "cpu":
+        return {"type": "cpu", "name": platform.processor() or platform.machine()}
     try:
         import pynvml
-
+    except ImportError:
+        return _unavailable_cuda_health()
+    try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(int(device))
         memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
         utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
         return {
+            "type": "cuda",
             "name": str(pynvml.nvmlDeviceGetName(handle)),
             "memory_used_bytes": int(memory.used),
             "memory_total_bytes": int(memory.total),
             "utilization_percent": int(utilization.gpu),
         }
-    except Exception:
-        return {
-            "name": None,
-            "memory_used_bytes": None,
-            "memory_total_bytes": None,
-            "utilization_percent": None,
-        }
+    except (pynvml.NVMLError, ValueError):
+        return _unavailable_cuda_health()
+
+
+def _unavailable_cuda_health() -> dict[str, Any]:
+    return {
+        "type": "cuda",
+        "name": None,
+        "memory_used_bytes": None,
+        "memory_total_bytes": None,
+        "utilization_percent": None,
+    }

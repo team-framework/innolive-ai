@@ -1,9 +1,12 @@
 fastapi>=0.116,<1
+grpcio>=1.81.1,<1.82
+grpcio-health-checking>=1.81.1,<1.82
 lap>=0.5.12,<1
 numpy>=2.0,<3
-nvidia-ml-py>=13,<14
 opencv-python!=4.13.0.90,>=4.11,<6
+protobuf>=6.33.5,<7
+torch==2.13.0
+torchvision==0.28.0
 ultralytics==8.4.104
 uvicorn[standard]>=0.35,<1
 websockets>=15,<17
-tensorrt-cu12==11.1.0.106; platform_system == "Linux" and platform_machine == "x86_64"

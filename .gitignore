@@ -28,9 +28,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-__generated__/*
-!__generated__/.gitkeep
-
 # ==========================================
 # Environment Variables & Secrets (CRITICAL)
 # ==========================================

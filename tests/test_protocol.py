@@ -16,7 +16,6 @@ from service.protocol import (
     recover_sequence,
 )
 
-
 JPEG = b"\xff\xd8test\xff\xd9"
 
 
@@ -59,9 +58,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_response_size_is_bounded(self):
         with self.assertRaisesRegex(ValueError, "byte limit"):
-            encode_response(
-                {"type": "result", "seq": 1, "value": "x" * MAX_RESPONSE_BYTES}
-            )
+            encode_response({"type": "result", "seq": 1, "value": "x" * MAX_RESPONSE_BYTES})
 
     def test_public_limits_are_fixed(self):
         self.assertEqual(MAX_JPEG_BYTES, 4 * 1024 * 1024)

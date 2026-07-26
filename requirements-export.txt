@@ -1,4 +1,4 @@
--r requirements.txt
+-r requirements-tensorrt.txt
 onnx>=1.21,<2
 onnxruntime-gpu>=1.24,<2
 onnxslim>=0.1.94,<1
