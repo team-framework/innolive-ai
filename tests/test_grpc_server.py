@@ -17,6 +17,8 @@ from ai_processor_server import (
     build_grpc_server,
 )
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
+from service.adaface_model import FaceAlignmentError, FaceCountError, FaceTooSmallError
+from service.recognition import SessionRegistry
 from service.runtime import InferenceFailure, RuntimeConfig
 
 
@@ -36,12 +38,14 @@ def _request(
     timestamp: int = 1,
     frame_id: int = 0,
     batch_size: int = 1,
+    session_id: str = "session-a",
 ):
     return ai_processor_pb2.VideoChunk(
         data=_jpeg() if data is None else data,
         timestamp=timestamp,
         frame_id=frame_id,
         batch_size=batch_size,
+        session_id=session_id,
     )
 
 
@@ -140,15 +144,41 @@ class BlockingRuntime(FakeRuntime):
             self.inference_settled.set()
 
 
+class FakeAdaFace:
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = ready
+        self.embedding = np.asarray([1.0, 0.0], dtype=np.float32)
+        self.error: Exception | None = None
+        self.overflow = False
+        self.calls = 0
+
+    def submit(self, _image: np.ndarray, *, owner: str):
+        del owner
+        self.calls += 1
+        if self.overflow:
+            return None
+        future = asyncio.get_running_loop().create_future()
+        if self.error is None:
+            future.set_result(self.embedding.copy())
+        else:
+            future.set_exception(self.error)
+        return future
+
+
 class LoopbackServer:
     def __init__(
         self,
         runtime: FakeRuntime,
         *,
         inference_timeout_seconds: float = 1.5,
+        max_streams: int = 1,
+        adaface: FakeAdaFace | None = None,
     ):
         self.runtime = runtime
         self.inference_timeout_seconds = inference_timeout_seconds
+        self.max_streams = max_streams
+        self.adaface = adaface
+        self.sessions = SessionRegistry()
         self.trackers: list[FakeTracker] = []
         self.bundle = None
         self.channel = None
@@ -166,13 +196,15 @@ class LoopbackServer:
             tracker_config=Path("unused-botsort.yaml"),
             host="127.0.0.1",
             port=0,
-            max_streams=1,
+            max_streams=self.max_streams,
             inference_timeout_seconds=self.inference_timeout_seconds,
             shutdown_grace_seconds=0,
         )
         self.bundle = build_grpc_server(
             settings,
             self.runtime,
+            sessions=self.sessions,
+            adaface=self.adaface,
             tracker_factory=self.tracker_factory,
         )
         await self.bundle.set_serving(True)
@@ -232,6 +264,29 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.stats.tracker_frame for item in responses], [1, 2])
         self.assertEqual(len(runtime.calls), 2)
         self.assertIs(runtime.calls[0][1], runtime.calls[1][1])
+
+    async def test_session_id_cannot_change_within_a_stream(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime) as server:
+            call = server.stub.ProcessVideo()
+            await call.write(_request(frame_id=1, session_id="session-a"))
+            self.assertEqual((await call.read()).status_message, "success")
+            await call.write(_request(frame_id=2, session_id="session-b"))
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await call.read()
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(len(runtime.calls), 1)
+
+    async def test_blank_session_id_is_rejected_before_inference(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime) as server:
+            call = server.stub.ProcessVideo(_requests(_request(frame_id=1, session_id="  ")))
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await call.read()
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(runtime.calls, [])
 
     async def test_invalid_jpeg_returns_error_and_stream_continues(self):
         runtime = FakeRuntime()
@@ -331,16 +386,99 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await first.read(), grpc.aio.EOF)
             await _wait_until(lambda: server.bundle.servicer.admission.active == 0)
 
-    async def test_add_whitelist_is_unimplemented(self):
+    async def test_add_whitelist_requires_an_available_adaface_model(self):
         runtime = FakeRuntime()
         async with LoopbackServer(runtime) as server:
             with self.assertRaises(grpc.aio.AioRpcError) as rejected:
-                await server.stub.AddWhitelist(ai_processor_pb2.FaceData())
+                await server.stub.AddWhitelist(
+                    ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+                )
 
         self.assertEqual(
             rejected.exception.code(),
-            grpc.StatusCode.UNIMPLEMENTED,
+            grpc.StatusCode.FAILED_PRECONDITION,
         )
+
+    async def test_add_whitelist_appends_independent_session_entries(self):
+        adaface = FakeAdaFace()
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime, adaface=adaface) as server:
+            first, second = await asyncio.gather(
+                server.stub.AddWhitelist(
+                    ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+                ),
+                server.stub.AddWhitelist(
+                    ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+                ),
+            )
+            other = await server.stub.AddWhitelist(
+                ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-b")
+            )
+            session_a = server.sessions.get_or_create("session-a").snapshot()
+            session_b = server.sessions.get_or_create("session-b").snapshot()
+
+        self.assertEqual({first.entry_count, second.entry_count}, {1, 2})
+        self.assertEqual(len({first.entry_id, second.entry_id, other.entry_id}), 3)
+        self.assertEqual((len(session_a.entries), session_a.version), (2, 2))
+        self.assertEqual((len(session_b.entries), session_b.version), (1, 1))
+        self.assertEqual(adaface.calls, 3)
+
+    async def test_add_whitelist_rejects_decode_and_face_validation_failures(self):
+        adaface = FakeAdaFace()
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime, adaface=adaface) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as invalid_image:
+                await server.stub.AddWhitelist(
+                    ai_processor_pb2.FaceData(data=b"broken", session_id="session-a")
+                )
+            self.assertEqual(invalid_image.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+
+            for error in (
+                FaceCountError("expected exactly one face, found 0"),
+                FaceTooSmallError("face is too small"),
+                FaceAlignmentError("alignment failed"),
+            ):
+                with self.subTest(error=type(error).__name__):
+                    adaface.error = error
+                    with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                        await server.stub.AddWhitelist(
+                            ai_processor_pb2.FaceData(
+                                data=_jpeg(),
+                                session_id="session-a",
+                            )
+                        )
+                    self.assertEqual(
+                        rejected.exception.code(),
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                    )
+
+    async def test_add_whitelist_queue_overflow_is_bounded(self):
+        adaface = FakeAdaFace()
+        adaface.overflow = True
+        async with LoopbackServer(FakeRuntime(), adaface=adaface) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await server.stub.AddWhitelist(
+                    ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+                )
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+
+    async def test_same_session_concurrent_streams_use_distinct_trackers(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime, max_streams=2) as server:
+            first = server.stub.ProcessVideo()
+            second = server.stub.ProcessVideo()
+            await asyncio.gather(
+                first.write(_request(frame_id=1, session_id="shared")),
+                second.write(_request(frame_id=1, session_id="shared")),
+            )
+            responses = await asyncio.gather(first.read(), second.read())
+            await asyncio.gather(first.done_writing(), second.done_writing())
+            await asyncio.gather(first.read(), second.read())
+
+        self.assertTrue(all(response.status_message == "success" for response in responses))
+        self.assertEqual(len(server.trackers), 2)
+        self.assertIsNot(server.trackers[0], server.trackers[1])
 
     async def test_cancellation_settles_inference_before_reset_and_release(self):
         runtime = BlockingRuntime()

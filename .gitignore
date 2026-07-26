@@ -73,3 +73,5 @@ Thumbs.db
 # The standard B1 engine is compiled for one NVIDIA GPU/TensorRT stack. Build it
 # on the deployment machine; its tracked manifest validates the local artifact.
 /models/*.engine
+/models/*.ckpt
+/models/*.onnx

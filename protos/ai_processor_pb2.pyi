@@ -7,16 +7,18 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class VideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "frame_id", "batch_size")
+    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     FRAME_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     frame_id: int
     batch_size: int
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ...) -> None: ...
+    session_id: str
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ...) -> None: ...
 
 class ProcessedVideoChunk(_message.Message):
     __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats")
@@ -89,7 +91,7 @@ class BoundingBox(_message.Message):
     def __init__(self, x1: _Optional[float] = ..., y1: _Optional[float] = ..., x2: _Optional[float] = ..., y2: _Optional[float] = ...) -> None: ...
 
 class FaceMetadata(_message.Message):
-    __slots__ = ("bbox", "confidence", "polygon", "track_id", "source", "held", "hold_frames", "class_name", "mask_area_px")
+    __slots__ = ("bbox", "confidence", "polygon", "track_id", "source", "held", "hold_frames", "class_name", "mask_area_px", "whitelisted")
     BBOX_FIELD_NUMBER: _ClassVar[int]
     CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
     POLYGON_FIELD_NUMBER: _ClassVar[int]
@@ -99,6 +101,7 @@ class FaceMetadata(_message.Message):
     HOLD_FRAMES_FIELD_NUMBER: _ClassVar[int]
     CLASS_NAME_FIELD_NUMBER: _ClassVar[int]
     MASK_AREA_PX_FIELD_NUMBER: _ClassVar[int]
+    WHITELISTED_FIELD_NUMBER: _ClassVar[int]
     bbox: BoundingBox
     confidence: float
     polygon: _containers.RepeatedCompositeFieldContainer[Point]
@@ -108,10 +111,11 @@ class FaceMetadata(_message.Message):
     hold_frames: int
     class_name: str
     mask_area_px: float
-    def __init__(self, bbox: _Optional[_Union[BoundingBox, _Mapping]] = ..., confidence: _Optional[float] = ..., polygon: _Optional[_Iterable[_Union[Point, _Mapping]]] = ..., track_id: _Optional[int] = ..., source: _Optional[str] = ..., held: _Optional[bool] = ..., hold_frames: _Optional[int] = ..., class_name: _Optional[str] = ..., mask_area_px: _Optional[float] = ...) -> None: ...
+    whitelisted: bool
+    def __init__(self, bbox: _Optional[_Union[BoundingBox, _Mapping]] = ..., confidence: _Optional[float] = ..., polygon: _Optional[_Iterable[_Union[Point, _Mapping]]] = ..., track_id: _Optional[int] = ..., source: _Optional[str] = ..., held: _Optional[bool] = ..., hold_frames: _Optional[int] = ..., class_name: _Optional[str] = ..., mask_area_px: _Optional[float] = ..., whitelisted: _Optional[bool] = ...) -> None: ...
 
 class FrameStats(_message.Message):
-    __slots__ = ("detections", "raw_detections", "continuation_candidates", "detector_backed_tracks", "low_confidence_continuations", "held_tracks", "tracks", "tracker_frame")
+    __slots__ = ("detections", "raw_detections", "continuation_candidates", "detector_backed_tracks", "low_confidence_continuations", "held_tracks", "tracks", "tracker_frame", "adaface_calls", "adaface_queue_overflow", "whitelisted_tracks")
     DETECTIONS_FIELD_NUMBER: _ClassVar[int]
     RAW_DETECTIONS_FIELD_NUMBER: _ClassVar[int]
     CONTINUATION_CANDIDATES_FIELD_NUMBER: _ClassVar[int]
@@ -120,6 +124,9 @@ class FrameStats(_message.Message):
     HELD_TRACKS_FIELD_NUMBER: _ClassVar[int]
     TRACKS_FIELD_NUMBER: _ClassVar[int]
     TRACKER_FRAME_FIELD_NUMBER: _ClassVar[int]
+    ADAFACE_CALLS_FIELD_NUMBER: _ClassVar[int]
+    ADAFACE_QUEUE_OVERFLOW_FIELD_NUMBER: _ClassVar[int]
+    WHITELISTED_TRACKS_FIELD_NUMBER: _ClassVar[int]
     detections: int
     raw_detections: int
     continuation_candidates: int
@@ -128,18 +135,29 @@ class FrameStats(_message.Message):
     held_tracks: int
     tracks: int
     tracker_frame: int
-    def __init__(self, detections: _Optional[int] = ..., raw_detections: _Optional[int] = ..., continuation_candidates: _Optional[int] = ..., detector_backed_tracks: _Optional[int] = ..., low_confidence_continuations: _Optional[int] = ..., held_tracks: _Optional[int] = ..., tracks: _Optional[int] = ..., tracker_frame: _Optional[int] = ...) -> None: ...
+    adaface_calls: int
+    adaface_queue_overflow: int
+    whitelisted_tracks: int
+    def __init__(self, detections: _Optional[int] = ..., raw_detections: _Optional[int] = ..., continuation_candidates: _Optional[int] = ..., detector_backed_tracks: _Optional[int] = ..., low_confidence_continuations: _Optional[int] = ..., held_tracks: _Optional[int] = ..., tracks: _Optional[int] = ..., tracker_frame: _Optional[int] = ..., adaface_calls: _Optional[int] = ..., adaface_queue_overflow: _Optional[int] = ..., whitelisted_tracks: _Optional[int] = ...) -> None: ...
 
 class FaceData(_message.Message):
-    __slots__ = ("data",)
+    __slots__ = ("data", "session_id")
     DATA_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     data: bytes
-    def __init__(self, data: _Optional[bytes] = ...) -> None: ...
+    session_id: str
+    def __init__(self, data: _Optional[bytes] = ..., session_id: _Optional[str] = ...) -> None: ...
 
 class WhitelistResponse(_message.Message):
-    __slots__ = ("status_message", "timestamp")
+    __slots__ = ("status_message", "timestamp", "entry_id", "entry_count", "whitelist_version")
     STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
     status_message: str
     timestamp: int
-    def __init__(self, status_message: _Optional[str] = ..., timestamp: _Optional[int] = ...) -> None: ...
+    entry_id: str
+    entry_count: int
+    whitelist_version: int
+    def __init__(self, status_message: _Optional[str] = ..., timestamp: _Optional[int] = ..., entry_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ...) -> None: ...
