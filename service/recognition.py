@@ -7,12 +7,14 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 MAX_SESSION_ID_BYTES = 256
+MAX_ENTRY_ID_BYTES = 256
 
 
 class SessionLimitError(RuntimeError):
@@ -31,11 +33,23 @@ class WhitelistLimitError(RuntimeError):
     """A session reached its configured whitelist entry limit."""
 
 
+class WhitelistEntryNotFoundError(LookupError):
+    """The requested whitelist entry does not exist."""
+
+
 def validate_session_id(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("session_id must not be empty or whitespace-only")
     if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
         raise ValueError(f"session_id exceeds {MAX_SESSION_ID_BYTES} UTF-8 bytes")
+    return value
+
+
+def validate_entry_id(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("entry_id must not be empty or whitespace-only")
+    if len(value.encode("utf-8")) > MAX_ENTRY_ID_BYTES:
+        raise ValueError(f"entry_id exceeds {MAX_ENTRY_ID_BYTES} UTF-8 bytes")
     return value
 
 
@@ -84,6 +98,15 @@ class SessionState:
             self._entries = (*self._entries, entry)
             self._version += 1
             return entry, len(self._entries), self._version
+
+    def delete_entry(self, entry_id: str) -> tuple[str, int, int]:
+        with self._lock:
+            remaining = tuple(entry for entry in self._entries if entry.entry_id != entry_id)
+            if len(remaining) == len(self._entries):
+                raise WhitelistEntryNotFoundError(f"whitelist entry {entry_id!r} does not exist")
+            self._entries = remaining
+            self._version += 1
+            return entry_id, len(remaining), self._version
 
     def summary(self, *, active_stream_count: int = 0) -> SessionSummary:
         with self._lock:
@@ -163,6 +186,19 @@ class SessionRegistry:
             session = self._get_or_create_locked(validated)
             return session.append(embedding)
 
+    def delete_whitelist_entry(
+        self,
+        session_id: str,
+        entry_id: str,
+    ) -> tuple[str, int, int]:
+        validated_session_id = validate_session_id(session_id)
+        validated_entry_id = validate_entry_id(entry_id)
+        with self._lock:
+            session = self._sessions.get(validated_session_id)
+            if session is None:
+                raise SessionNotFoundError(f"session {validated_session_id!r} does not exist")
+            return session.delete_entry(validated_entry_id)
+
     def acquire_stream(self, session_id: str) -> SessionState:
         validated = validate_session_id(session_id)
         with self._lock:
@@ -217,6 +253,7 @@ class RecognitionConfig:
     quick_retry_limit: int = 2
     missing_track_frames: int = 3
     max_pending_per_stream: int = 4
+    pending_timeout_seconds: float = 1.0
     min_face_size: int = 40
     query_min_face_size: int = 24
     crop_margin: float = 0.25
@@ -236,6 +273,8 @@ class RecognitionConfig:
             raise ValueError("missing_track_frames must be at least one")
         if self.max_pending_per_stream < 1:
             raise ValueError("max_pending_per_stream must be at least one")
+        if not math.isfinite(self.pending_timeout_seconds) or self.pending_timeout_seconds <= 0:
+            raise ValueError("pending_timeout_seconds must be positive")
         if self.min_face_size < 16:
             raise ValueError("min_face_size must be at least 16")
         if self.query_min_face_size < 16:
@@ -260,23 +299,32 @@ class TrackDecision:
     last_checked_frame: int = -1
     whitelist_version: int = 0
     pending_token: RecognitionToken | None = None
-    status_before_pending: str = "unknown"
     quick_retry_count: int = 0
+    matched_entry_id: str | None = None
 
 
 @dataclass(slots=True)
 class PendingRecognition:
     future: asyncio.Future[np.ndarray]
     entries: tuple[WhitelistEntry, ...]
+    submitted_at: float
 
 
 class StreamRecognition:
     """Track decisions owned by exactly one ProcessVideo RPC."""
 
-    def __init__(self, runtime: Any, config: RecognitionConfig, *, owner: str):
+    def __init__(
+        self,
+        runtime: Any,
+        config: RecognitionConfig,
+        *,
+        owner: str,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.runtime = runtime
         self.config = config
         self.owner = owner
+        self._clock = clock
         self._states: dict[int, TrackDecision] = {}
         self._generations: dict[int, int] = {}
         self._pending: dict[RecognitionToken, PendingRecognition] = {}
@@ -289,7 +337,10 @@ class StreamRecognition:
         snapshot: WhitelistSnapshot,
         frame_sequence: int,
     ) -> dict[str, int]:
-        self._apply_completed(snapshot.version)
+        current_entry_ids = frozenset(entry.entry_id for entry in snapshot.entries)
+        self._expire_pending(self._clock())
+        self._apply_completed(snapshot.version, current_entry_ids)
+        self._invalidate_removed_matches(current_entry_ids)
         current_ids = {
             int(item["track_id"]) for item in objects if item.get("track_id") is not None
         }
@@ -305,9 +356,18 @@ class StreamRecognition:
 
         scheduled = 0
         overflow = 0
-        if snapshot.entries and getattr(self.runtime, "ready", False):
+        runtime_ready = bool(getattr(self.runtime, "ready", False))
+        if not runtime_ready:
+            self._protect_all_tracks()
+        if snapshot.entries and runtime_ready:
             for item in objects:
-                outcome = self._schedule(item, image, snapshot, frame_sequence)
+                outcome = self._schedule(
+                    item,
+                    image,
+                    snapshot,
+                    current_entry_ids,
+                    frame_sequence,
+                )
                 scheduled += outcome == "scheduled"
                 overflow += outcome == "overflow"
 
@@ -315,7 +375,14 @@ class StreamRecognition:
         for item in objects:
             track_id = item.get("track_id")
             state = self._states.get(int(track_id)) if track_id is not None else None
-            allowed = state is not None and state.status == "whitelisted"
+            allowed = (
+                runtime_ready
+                and state is not None
+                and self._is_whitelisted_for_entries(
+                    state,
+                    current_entry_ids,
+                )
+            )
             item["whitelisted"] = allowed
             whitelisted += allowed
 
@@ -330,22 +397,29 @@ class StreamRecognition:
         item: dict[str, Any],
         image: np.ndarray,
         snapshot: WhitelistSnapshot,
+        current_entry_ids: frozenset[str],
         frame_sequence: int,
     ) -> str:
         track_id_value = item.get("track_id")
-        if track_id_value is None or item.get("held", False):
+        if track_id_value is None:
             return "skipped"
         track_id = int(track_id_value)
         state = self._states[track_id]
         if not self._eligible(state, snapshot.version, frame_sequence):
             return "skipped"
+        if item.get("held", False):
+            self._require_fresh_match(state)
+            return "skipped"
         if len(self._pending) >= self.config.max_pending_per_stream:
+            self._require_fresh_match(state)
             return "overflow"
         crop = _face_crop(image, item.get("bbox"), self.config)
         if crop is None:
+            self._require_fresh_match(state)
             return "skipped"
         future = self.runtime.submit(crop, owner=self.owner)
         if future is None:
+            self._require_fresh_match(state)
             return "overflow"
 
         if state.whitelist_version != snapshot.version:
@@ -363,10 +437,14 @@ class StreamRecognition:
             frame_sequence=frame_sequence,
             whitelist_version=snapshot.version,
         )
-        state.status_before_pending = state.status
-        state.status = "pending"
+        if not self._is_whitelisted_for_entries(state, current_entry_ids):
+            state.status = "pending"
         state.pending_token = token
-        self._pending[token] = PendingRecognition(future, snapshot.entries)
+        self._pending[token] = PendingRecognition(
+            future,
+            snapshot.entries,
+            self._clock(),
+        )
         return "scheduled"
 
     def _eligible(
@@ -379,10 +457,7 @@ class StreamRecognition:
             return False
         if state.last_checked_frame < 0:
             return True
-        if (
-            state.status in {"unknown", "non_whitelisted"}
-            and state.whitelist_version != whitelist_version
-        ):
+        if state.whitelist_version != whitelist_version:
             return True
         interval = self.config.revalidate_frames
         if (
@@ -392,7 +467,11 @@ class StreamRecognition:
             interval = self.config.quick_retry_frames
         return frame_sequence - state.last_checked_frame >= interval
 
-    def _apply_completed(self, current_whitelist_version: int) -> None:
+    def _apply_completed(
+        self,
+        current_whitelist_version: int,
+        current_entry_ids: frozenset[str],
+    ) -> None:
         for token, pending in tuple(self._pending.items()):
             if not pending.future.done():
                 continue
@@ -405,25 +484,85 @@ class StreamRecognition:
                     and state.pending_token == token
                 ):
                     state.pending_token = None
-                    state.status = (
-                        "whitelisted" if state.status_before_pending == "whitelisted" else "unknown"
-                    )
+                    state.last_checked_frame = token.frame_sequence
+                    state.whitelist_version = token.whitelist_version
+                    self._apply_result(state, pending, current_entry_ids)
                 self.stale_results += 1
                 continue
             state.pending_token = None
             state.last_checked_frame = token.frame_sequence
             state.whitelist_version = token.whitelist_version
-            try:
-                embedding = _normalized_embedding(pending.future.result())
-                similarity = max(
-                    float(np.dot(embedding, entry.embedding)) for entry in pending.entries
-                )
-                if similarity >= self.config.cosine_threshold:
-                    state.status = "whitelisted"
-                    state.quick_retry_count = 0
-                else:
-                    state.status = "non_whitelisted"
-            except Exception:
+            self._apply_result(state, pending, current_entry_ids)
+
+    def _apply_result(
+        self,
+        state: TrackDecision,
+        pending: PendingRecognition,
+        current_entry_ids: frozenset[str],
+    ) -> None:
+        try:
+            embedding = _normalized_embedding(pending.future.result())
+            candidates = tuple(
+                entry for entry in pending.entries if entry.entry_id in current_entry_ids
+            )
+            if not candidates:
+                state.status = "non_whitelisted"
+                state.matched_entry_id = None
+                return
+            matched_entry, similarity = max(
+                ((entry, float(np.dot(embedding, entry.embedding))) for entry in candidates),
+                key=lambda result: result[1],
+            )
+            if similarity >= self.config.cosine_threshold:
+                state.status = "whitelisted"
+                state.quick_retry_count = 0
+                state.matched_entry_id = matched_entry.entry_id
+            else:
+                state.status = "non_whitelisted"
+                state.matched_entry_id = None
+        except Exception:
+            state.status = "unknown"
+            state.matched_entry_id = None
+
+    def _expire_pending(self, now: float) -> None:
+        for token, pending in tuple(self._pending.items()):
+            if now - pending.submitted_at < self.config.pending_timeout_seconds:
+                continue
+            del self._pending[token]
+            pending.future.cancel()
+            state = self._states.get(token.track_id)
+            if (
+                state is not None
+                and state.generation == token.generation
+                and state.pending_token == token
+            ):
+                state.pending_token = None
+                self._require_fresh_match(state)
+            self.stale_results += 1
+
+    @staticmethod
+    def _require_fresh_match(state: TrackDecision) -> None:
+        state.status = "unknown"
+        state.matched_entry_id = None
+        state.last_checked_frame = -1
+
+    def _protect_all_tracks(self) -> None:
+        for state in self._states.values():
+            self._require_fresh_match(state)
+
+    @staticmethod
+    def _is_whitelisted_for_entries(
+        state: TrackDecision,
+        current_entry_ids: frozenset[str],
+    ) -> bool:
+        return state.status == "whitelisted" and state.matched_entry_id in current_entry_ids
+
+    def _invalidate_removed_matches(self, current_entry_ids: frozenset[str]) -> None:
+        for state in self._states.values():
+            if state.matched_entry_id is None or state.matched_entry_id in current_entry_ids:
+                continue
+            state.matched_entry_id = None
+            if state.status == "whitelisted":
                 state.status = "unknown"
 
     @staticmethod

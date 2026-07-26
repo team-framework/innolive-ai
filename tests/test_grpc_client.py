@@ -49,6 +49,8 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.requests: list[Any] = []
         self.whitelist_requests: list[Any] = []
         self.whitelist_counts: dict[str, int] = {}
+        self.whitelist_versions: dict[str, int] = {}
+        self.whitelist_entries: dict[str, list[str]] = {}
         self.sessions: list[str] = []
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator[Any]:
@@ -73,22 +75,45 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         if self.mode == "whitelist_error":
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "whitelist full")
         self.whitelist_requests.append(request)
-        count = self.whitelist_counts.get(request.session_id, 0) + 1
+        entry_id = f"entry-{len(self.whitelist_requests)}"
+        entries = self.whitelist_entries.setdefault(request.session_id, [])
+        entries.append(entry_id)
+        count = len(entries)
+        version = self.whitelist_versions.get(request.session_id, 0) + 1
         self.whitelist_counts[request.session_id] = count
+        self.whitelist_versions[request.session_id] = version
         return ai_processor_pb2.WhitelistResponse(
             status_message="success",
-            entry_id=f"entry-{len(self.whitelist_requests)}",
+            entry_id=entry_id,
             entry_count=count,
-            whitelist_version=count,
+            whitelist_version=version,
+        )
+
+    async def DeleteWhitelist(self, request, context):
+        entries = self.whitelist_entries.get(request.session_id)
+        if entries is None or request.entry_id not in entries:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "whitelist entry does not exist")
+        entries.remove(request.entry_id)
+        version = self.whitelist_versions[request.session_id] + 1
+        self.whitelist_counts[request.session_id] = len(entries)
+        self.whitelist_versions[request.session_id] = version
+        return ai_processor_pb2.WhitelistResponse(
+            status_message="success",
+            entry_id=("different-entry" if self.mode == "delete_mismatch" else request.entry_id),
+            entry_count=len(entries),
+            whitelist_version=version,
         )
 
     async def GetWhitelistStatus(self, request, context):
         del context
         count = self.whitelist_counts.get(request.session_id, 0)
         return ai_processor_pb2.GetWhitelistStatusResponse(
-            session_id=request.session_id,
-            entry_count=count,
-            whitelist_version=count,
+            session_id=(
+                "different-session" if self.mode == "status_mismatch" else request.session_id
+            ),
+            entry_count=count + (self.mode == "status_count_mismatch"),
+            whitelist_version=self.whitelist_versions.get(request.session_id, 0),
+            entry_ids=self.whitelist_entries.get(request.session_id, ()),
         )
 
     async def CreateSession(self, request, context):
@@ -109,7 +134,7 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 ai_processor_pb2.SessionInfo(
                     session_id=session_id,
                     entry_count=self.whitelist_counts.get(session_id, 0),
-                    whitelist_version=self.whitelist_counts.get(session_id, 0),
+                    whitelist_version=self.whitelist_versions.get(session_id, 0),
                     created_at_unix_ms=index,
                 )
                 for index, session_id in enumerate(self.sessions, start=1)
@@ -121,6 +146,8 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             await context.abort(grpc.StatusCode.NOT_FOUND, "session does not exist")
         self.sessions.remove(request.session_id)
         self.whitelist_counts.pop(request.session_id, None)
+        self.whitelist_versions.pop(request.session_id, None)
+        self.whitelist_entries.pop(request.session_id, None)
         return empty_pb2.Empty()
 
     @staticmethod
@@ -281,7 +308,55 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([response.entry_count for response in added], [1, 2])
         self.assertEqual((status_a.session_id, status_a.entry_count), ("session-a", 2))
+        self.assertEqual(list(status_a.entry_ids), [item.entry_id for item in added])
         self.assertEqual((status_b.session_id, status_b.entry_count), ("session-b", 0))
+
+    async def test_session_bound_client_deletes_one_whitelist_entry(self):
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            session = client.for_session("session-a")
+            first, second = await session.add_whitelist_many([_jpeg(10), _jpeg(20)])
+            deleted = await session.delete_whitelist(first.entry_id)
+            status = await session.get_whitelist_status()
+            with self.assertRaises(VideoRpcError) as missing:
+                await client.delete_whitelist(
+                    first.entry_id,
+                    session_id="session-a",
+                )
+
+        self.assertEqual(
+            (deleted.entry_id, deleted.entry_count, deleted.whitelist_version),
+            (first.entry_id, 1, 3),
+        )
+        self.assertEqual(
+            (status.entry_count, status.whitelist_version, list(status.entry_ids)),
+            (1, 3, [second.entry_id]),
+        )
+        self.assertEqual(missing.exception.method, "DeleteWhitelist")
+        self.assertEqual(missing.exception.code, grpc.StatusCode.NOT_FOUND)
+
+    async def test_whitelist_helpers_reject_mismatched_server_responses(self):
+        async with (
+            ClientLoopback("delete_mismatch") as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            added = await client.add_whitelist(_jpeg(10), session_id="session-a")
+            with self.assertRaises(VideoProtocolError):
+                await client.delete_whitelist(
+                    added.entry_id,
+                    session_id="session-a",
+                )
+
+        for mode in ("status_mismatch", "status_count_mismatch"):
+            with self.subTest(mode=mode):
+                async with (
+                    ClientLoopback(mode) as loopback,
+                    VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+                ):
+                    with self.assertRaises(VideoProtocolError):
+                        await client.get_whitelist_status("session-a")
 
     async def test_rpc_error_preserves_method_status_and_details(self):
         async with (

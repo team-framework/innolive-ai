@@ -15,7 +15,9 @@ from service.recognition import (
     SessionNotFoundError,
     SessionRegistry,
     StreamRecognition,
+    WhitelistEntryNotFoundError,
     WhitelistLimitError,
+    validate_entry_id,
     validate_session_id,
 )
 
@@ -87,6 +89,10 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             validate_session_id("   ")
 
+        self.assertEqual(validate_entry_id(" Entry-A "), " Entry-A ")
+        with self.assertRaises(ValueError):
+            validate_entry_id("   ")
+
     async def test_session_and_whitelist_limits_are_enforced(self):
         sessions = SessionRegistry(max_sessions=1, max_entries_per_session=1)
         session = sessions.get_or_create("session-a")
@@ -130,6 +136,67 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SessionLimitError):
             sessions.create()
+
+    async def test_whitelist_entry_deletion_is_atomic_and_allowed_during_a_stream(self):
+        sessions = SessionRegistry()
+        session = sessions.get_or_create("session")
+        first, _, _ = session.append(np.asarray([1.0, 0.0]))
+        second, _, _ = session.append(np.asarray([0.0, 1.0]))
+        lease = sessions.acquire_stream("session")
+
+        deleted_id, entry_count, version = sessions.delete_whitelist_entry(
+            "session",
+            first.entry_id,
+        )
+        snapshot = session.snapshot()
+
+        self.assertEqual((deleted_id, entry_count, version), (first.entry_id, 1, 3))
+        self.assertEqual([entry.entry_id for entry in snapshot.entries], [second.entry_id])
+        self.assertEqual(snapshot.version, 3)
+        self.assertEqual(sessions.list_summaries()[0].active_stream_count, 1)
+        with self.assertRaises(WhitelistEntryNotFoundError):
+            sessions.delete_whitelist_entry("session", first.entry_id)
+        with self.assertRaises(SessionNotFoundError):
+            sessions.delete_whitelist_entry("missing", second.entry_id)
+
+        sessions.release_stream(lease)
+
+    async def test_concurrent_whitelist_mutations_are_linearizable(self):
+        sessions = SessionRegistry()
+        first, _, _ = sessions.append("session", np.asarray([1.0, 0.0]))
+
+        def delete_once():
+            try:
+                return sessions.delete_whitelist_entry("session", first.entry_id)
+            except WhitelistEntryNotFoundError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            deleted = list(executor.map(lambda _: delete_once(), range(2)))
+
+        self.assertEqual(sum(result is not None for result in deleted), 1)
+        self.assertEqual(sessions.snapshot("session").version, 2)
+
+        second, _, _ = sessions.append("session", np.asarray([1.0, 0.0]))
+        barrier = threading.Barrier(2)
+
+        def append_entry():
+            barrier.wait()
+            return sessions.append("session", np.asarray([0.0, 1.0]))
+
+        def delete_entry():
+            barrier.wait()
+            return sessions.delete_whitelist_entry("session", second.entry_id)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            added_future = executor.submit(append_entry)
+            deleted_future = executor.submit(delete_entry)
+            added_entry, _, _ = added_future.result()
+            deleted_future.result()
+
+        snapshot = sessions.snapshot("session")
+        self.assertEqual([entry.entry_id for entry in snapshot.entries], [added_entry.entry_id])
+        self.assertEqual(snapshot.version, 5)
 
     async def test_active_stream_lease_blocks_deletion_and_is_listed(self):
         sessions = SessionRegistry()
@@ -327,7 +394,197 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         recognition.process(self.image, [face], session.snapshot(), 3)
 
         self.assertTrue(face["whitelisted"])
-        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(runtime.calls, 2)
+
+    async def test_periodic_revalidation_keeps_a_valid_match_until_negative_result(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(revalidate_frames=3)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        recognition.process(self.image, [face], session.snapshot(), 3)
+        recognition.process(self.image, [face], session.snapshot(), 4)
+
+        self.assertTrue(face["whitelisted"])
+        self.assertIsNotNone(recognition._states[1].pending_token)
+        runtime.futures[1].set_result(np.asarray([0.0, 1.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 5)
+
+        self.assertFalse(face["whitelisted"])
+        self.assertIsNone(recognition._states[1].matched_entry_id)
+
+    async def test_periodic_revalidation_error_immediately_removes_the_match(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(revalidate_frames=3)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        recognition.process(self.image, [face], session.snapshot(), 3)
+        recognition.process(self.image, [face], session.snapshot(), 4)
+        self.assertTrue(face["whitelisted"])
+
+        runtime.futures[1].set_exception(RuntimeError("alignment failed"))
+        recognition.process(self.image, [face], session.snapshot(), 5)
+
+        self.assertFalse(face["whitelisted"])
+        self.assertIsNone(recognition._states[1].matched_entry_id)
+
+    async def test_stale_revalidation_negative_or_error_remains_fail_closed(self):
+        for outcome in ("negative", "error"):
+            with self.subTest(outcome=outcome):
+                session = SessionRegistry().get_or_create("session")
+                session.append(np.asarray([1.0, 0.0]))
+                runtime = FakeRecognitionRuntime(deferred=True)
+                config = RecognitionConfig(revalidate_frames=3)
+                recognition = StreamRecognition(runtime, config, owner="session")
+                face = _object(1)
+
+                recognition.process(self.image, [face], session.snapshot(), 1)
+                runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+                recognition.process(self.image, [face], session.snapshot(), 2)
+                recognition.process(self.image, [face], session.snapshot(), 3)
+                recognition.process(self.image, [face], session.snapshot(), 4)
+                session.append(np.asarray([0.0, 1.0]))
+                if outcome == "negative":
+                    runtime.futures[1].set_result(np.asarray([0.0, 1.0], dtype=np.float32))
+                else:
+                    runtime.futures[1].set_exception(RuntimeError("alignment failed"))
+
+                recognition.process(self.image, [face], session.snapshot(), 5)
+
+                self.assertFalse(face["whitelisted"])
+                self.assertIsNone(recognition._states[1].matched_entry_id)
+                self.assertEqual(recognition.stale_results, 1)
+                recognition.close()
+
+    async def test_revalidation_admission_failure_immediately_protects_the_face(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(revalidate_frames=3)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        recognition.process(self.image, [face], session.snapshot(), 3)
+        runtime.overflow = True
+        metrics = recognition.process(self.image, [face], session.snapshot(), 4)
+
+        self.assertFalse(face["whitelisted"])
+        self.assertEqual(metrics["adaface_queue_overflow"], 1)
+        self.assertIsNone(recognition._states[1].matched_entry_id)
+
+    async def test_revalidation_timeout_revokes_the_match_and_discards_the_result(self):
+        now = 0.0
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(
+            revalidate_frames=3,
+            pending_timeout_seconds=0.5,
+        )
+        recognition = StreamRecognition(
+            runtime,
+            config,
+            owner="session",
+            clock=lambda: now,
+        )
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        recognition.process(self.image, [face], session.snapshot(), 3)
+        recognition.process(self.image, [face], session.snapshot(), 4)
+        self.assertTrue(face["whitelisted"])
+
+        now = 0.6
+        recognition.process(self.image, [face], session.snapshot(), 5)
+
+        self.assertTrue(runtime.futures[1].cancelled())
+        self.assertFalse(face["whitelisted"])
+        self.assertEqual(recognition.stale_results, 1)
+        recognition.close()
+
+    async def test_runtime_unavailable_revokes_existing_matches(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        recognition = StreamRecognition(runtime, self.config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        self.assertTrue(face["whitelisted"])
+
+        runtime.ready = False
+        recognition.process(self.image, [face], session.snapshot(), 3)
+
+        self.assertFalse(face["whitelisted"])
+        self.assertIsNone(recognition._states[1].matched_entry_id)
+
+    async def test_removing_the_matched_entry_revokes_access_during_pending_work(self):
+        session = SessionRegistry().get_or_create("session")
+        matched, _, _ = session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(revalidate_frames=3)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        original = session.snapshot()
+        recognition.process(self.image, [face], original, 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], original, 2)
+        self.assertEqual(recognition._states[1].matched_entry_id, matched.entry_id)
+        recognition.process(self.image, [face], original, 3)
+        recognition.process(self.image, [face], original, 4)
+        self.assertTrue(face["whitelisted"])
+
+        session.delete_entry(matched.entry_id)
+        empty = session.snapshot()
+        recognition.process(self.image, [face], empty, 5)
+        self.assertFalse(face["whitelisted"])
+        self.assertIsNone(recognition._states[1].matched_entry_id)
+
+        runtime.futures[1].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], empty, 6)
+
+        self.assertFalse(face["whitelisted"])
+        self.assertEqual(recognition.stale_results, 1)
+
+    async def test_removing_an_unmatched_exemplar_preserves_the_current_match(self):
+        session = SessionRegistry().get_or_create("session")
+        matched, _, _ = session.append(np.asarray([1.0, 0.0]))
+        unmatched, _, _ = session.append(np.asarray([0.0, 1.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        recognition = StreamRecognition(runtime, self.config, owner="session")
+        face = _object(1)
+
+        original = session.snapshot()
+        recognition.process(self.image, [face], original, 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], original, 2)
+        session.delete_entry(unmatched.entry_id)
+        remaining = session.snapshot()
+        recognition.process(self.image, [face], remaining, 3)
+
+        self.assertTrue(face["whitelisted"])
+        self.assertEqual(recognition._states[1].matched_entry_id, matched.entry_id)
+        self.assertEqual(runtime.calls, 2)
+        recognition.close()
 
     async def test_recognition_failure_keeps_the_face_protected(self):
         session = SessionRegistry().get_or_create("session")
@@ -362,6 +619,34 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         runtime.futures[1].set_result(np.asarray([0.0, 1.0], dtype=np.float32))
         recognition.process(self.image, [reused], session.snapshot(), 6)
 
+        self.assertFalse(reused["whitelisted"])
+        self.assertEqual(recognition.stale_results, 1)
+
+    async def test_periodic_result_cannot_apply_to_a_reused_whitelisted_track_id(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        config = RecognitionConfig(revalidate_frames=3, missing_track_frames=1)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        recognition.process(self.image, [face], session.snapshot(), 3)
+        recognition.process(self.image, [face], session.snapshot(), 4)
+        self.assertTrue(face["whitelisted"])
+
+        recognition.process(self.image, [], session.snapshot(), 5)
+        recognition.process(self.image, [], session.snapshot(), 6)
+        reused = _object(1)
+        recognition.process(self.image, [reused], session.snapshot(), 7)
+        runtime.futures[1].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [reused], session.snapshot(), 8)
+
+        self.assertFalse(reused["whitelisted"])
+        runtime.futures[2].set_result(np.asarray([0.0, 1.0], dtype=np.float32))
+        recognition.process(self.image, [reused], session.snapshot(), 9)
         self.assertFalse(reused["whitelisted"])
         self.assertEqual(recognition.stale_results, 1)
 
