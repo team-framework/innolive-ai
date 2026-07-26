@@ -13,6 +13,7 @@ export const PROFILE = Object.freeze({
 const MAGIC = [0x49, 0x4c, 0x46, 0x31]; // ILF1
 const MAX_SEQUENCE = 0xffffffff;
 const MAX_SESSION_ID_BYTES = 256;
+export const TAB_SESSION_STORAGE_KEY = "innolive.demo.session-id";
 const FRAME_INTERVAL_MS = 1000 / PROFILE.targetFps;
 const CAPTURE_EARLY_TOLERANCE_MS = 2;
 
@@ -98,19 +99,172 @@ export async function getWhitelistStatus(sessionId, request = fetch) {
   return readApiResponse(response);
 }
 
-export async function addWhitelistFiles(files, sessionId, request = fetch) {
+export async function listSessions(request = fetch) {
+  const response = await request("/api/sessions", { cache: "no-store" });
+  const payload = await readApiResponse(response);
+  if (!Array.isArray(payload?.sessions)) {
+    throw new Error("gateway returned an invalid session list");
+  }
+  const sessions = payload.sessions.map(normalizeSessionInfo);
+  if (new Set(sessions.map((session) => session.session_id)).size !== sessions.length) {
+    throw new Error("gateway returned duplicate session IDs");
+  }
+  return sessions;
+}
+
+export async function createSession(request = fetch) {
+  const response = await request("/api/sessions", { method: "POST" });
+  return normalizeSessionInfo(await readApiResponse(response));
+}
+
+export async function ensureTabSession(
+  sessions,
+  storage,
+  create = () => createSession(),
+) {
+  const knownSessions = Array.from(sessions, normalizeSessionInfo);
+  let storedSessionId = null;
+  try {
+    storedSessionId = storage?.getItem(TAB_SESSION_STORAGE_KEY) || null;
+  } catch {
+    storedSessionId = null;
+  }
+  const reused = knownSessions.find((session) => session.session_id === storedSessionId);
+  if (reused) return { active: reused, sessions: knownSessions, created: false };
+
+  const active = normalizeSessionInfo(await create());
+  if (knownSessions.some((session) => session.session_id === active.session_id)) {
+    throw new Error("server returned an existing session ID for CreateSession");
+  }
+  try {
+    storage?.setItem(TAB_SESSION_STORAGE_KEY, active.session_id);
+  } catch {
+    // Session creation still works when browser storage is unavailable.
+  }
+  return { active, sessions: [active, ...knownSessions], created: true };
+}
+
+export function enrollmentSize(width, height, maxLongEdge = PROFILE.longEdge) {
+  const sourceWidth = Number(width);
+  const sourceHeight = Number(height);
+  if (
+    !Number.isFinite(sourceWidth)
+    || !Number.isFinite(sourceHeight)
+    || sourceWidth <= 0
+    || sourceHeight <= 0
+    || !Number.isFinite(maxLongEdge)
+    || maxLongEdge <= 0
+  ) {
+    throw new Error("image has invalid dimensions");
+  }
+  const scale = Math.min(1, maxLongEdge / Math.max(sourceWidth, sourceHeight));
+  return [
+    Math.max(1, Math.round(sourceWidth * scale)),
+    Math.max(1, Math.round(sourceHeight * scale)),
+  ];
+}
+
+export async function normalizeWhitelistImage(
+  file,
+  {
+    maxLongEdge = PROFILE.longEdge,
+    jpegQuality = PROFILE.jpegQuality,
+    decode = decodeEnrollmentImage,
+    createCanvas = () => document.createElement("canvas"),
+  } = {},
+) {
+  if (
+    !file
+    || (file.type && !file.type.startsWith("image/"))
+    || file.type === "image/svg+xml"
+  ) {
+    throw new Error("a browser-decodable image is required");
+  }
+  if (!Number.isFinite(jpegQuality) || jpegQuality <= 0 || jpegQuality > 1) {
+    throw new Error("JPEG quality must be in 0..1");
+  }
+
+  let bitmap;
+  try {
+    bitmap = await decode(file);
+    const [width, height] = enrollmentSize(bitmap.width, bitmap.height, maxLongEdge);
+    const canvas = createCanvas();
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("browser could not create an image canvas");
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(bitmap.drawable || bitmap, 0, 0, width, height);
+    const jpeg = await encodeCanvasJpeg(canvas, jpegQuality);
+    if (!(jpeg instanceof Blob) || jpeg.type !== "image/jpeg" || jpeg.size === 0) {
+      throw new Error("browser could not encode the image as JPEG");
+    }
+    return jpeg;
+  } finally {
+    bitmap?.close?.();
+  }
+}
+
+export async function decodeEnrollmentImage(source) {
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(source, { imageOrientation: "from-image" });
+    } catch {
+      return createImageBitmap(source);
+    }
+  }
+  if (
+    typeof Image !== "function"
+    || typeof URL === "undefined"
+    || typeof URL.createObjectURL !== "function"
+    || typeof URL.revokeObjectURL !== "function"
+  ) {
+    throw new Error("this browser cannot decode local images");
+  }
+
+  const objectUrl = URL.createObjectURL(source);
+  try {
+    const image = new Image();
+    image.decoding = "async";
+    if (typeof image.decode === "function") {
+      image.src = objectUrl;
+      await image.decode();
+    } else {
+      await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error("browser could not decode the image"));
+        image.src = objectUrl;
+      });
+    }
+    return {
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      drawable: image,
+      close: () => URL.revokeObjectURL(objectUrl),
+    };
+  } catch (error) {
+    URL.revokeObjectURL(objectUrl);
+    throw error;
+  }
+}
+
+export async function addWhitelistFiles(
+  files,
+  sessionId,
+  request = fetch,
+  normalize = normalizeWhitelistImage,
+) {
   const url = whitelistUrl(sessionId);
   const results = [];
   for (const [index, file] of Array.from(files).entries()) {
     const name = file.name || `face-${index + 1}.jpg`;
     try {
-      if (file.type && file.type !== "image/jpeg") {
-        throw new Error("JPEG images are required");
-      }
+      const jpeg = await normalize(file);
       const response = await request(url, {
         method: "POST",
         headers: { "content-type": "image/jpeg" },
-        body: file,
+        body: jpeg,
       });
       results.push({ name, ok: true, response: await readApiResponse(response) });
     } catch (error) {
@@ -118,6 +272,44 @@ export async function addWhitelistFiles(files, sessionId, request = fetch) {
     }
   }
   return results;
+}
+
+function normalizeSessionInfo(value) {
+  const sessionId = validateSessionId(value?.session_id);
+  const entryCount = Number(value?.entry_count);
+  const whitelistVersion = Number(value?.whitelist_version);
+  const createdAt = Number(value?.created_at_unix_ms || 0);
+  if (!Number.isSafeInteger(entryCount) || entryCount < 0) {
+    throw new Error("session entry_count must be a non-negative integer");
+  }
+  if (!Number.isSafeInteger(whitelistVersion) || whitelistVersion < 0) {
+    throw new Error("session whitelist_version must be a non-negative integer");
+  }
+  if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
+    throw new Error("session created_at_unix_ms must be a non-negative integer");
+  }
+  return {
+    session_id: sessionId,
+    entry_count: entryCount,
+    whitelist_version: whitelistVersion,
+    created_at_unix_ms: createdAt,
+  };
+}
+
+function encodeCanvasJpeg(canvas, quality) {
+  if (typeof canvas.convertToBlob === "function") {
+    return canvas.convertToBlob({ type: "image/jpeg", quality });
+  }
+  return new Promise((resolve, reject) => {
+    if (typeof canvas.toBlob !== "function") {
+      reject(new Error("browser cannot encode canvas images"));
+      return;
+    }
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("browser could not encode the image as JPEG"));
+    }, "image/jpeg", quality);
+  });
 }
 
 async function readApiResponse(response) {
@@ -338,7 +530,8 @@ class App {
         "capture-fps", "sent-fps", "result-fps", "display-fps", "round-trip",
         "grpc-round-trip", "server-time", "queue", "dropped", "diagnostics",
         "session-id", "comparison-session-id", "whitelist-files", "add-whitelist",
-        "refresh-whitelist", "compare-sessions", "whitelist-status", "enrollment-results",
+        "new-session", "refresh-whitelist", "compare-sessions", "whitelist-status",
+        "session-list", "enrollment-results",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -348,12 +541,25 @@ class App {
     this.elements.start.addEventListener("click", () => this.start());
     this.elements.stop.addEventListener("click", () => this.stop());
     this.elements["add-whitelist"].addEventListener("click", () => this.enrollWhitelist());
+    this.elements["new-session"].addEventListener("click", () => this.createNewSession());
     this.elements["refresh-whitelist"].addEventListener("click", () => {
-      this.refreshWhitelistStatus();
+      this.refreshSessions();
     });
     this.elements["compare-sessions"].addEventListener("click", () => this.compareSessions());
+    this.elements["session-id"].addEventListener("change", () => {
+      this.selectActiveSession();
+    });
+    this.elements["comparison-session-id"].addEventListener("change", () => {
+      this.renderSessions(
+        this.elements["session-id"].value,
+        this.elements["comparison-session-id"].value,
+      );
+    });
+    this.sessionStatuses = [];
+    this.sessionsReady = false;
     this.resetState();
     this.blackout("보호 결과 대기 중");
+    void this.initializeSessions();
   }
 
   resetState() {
@@ -419,6 +625,8 @@ class App {
     try {
       this.streamSessionId = validateSessionId(this.elements["session-id"].value);
       this.elements["session-id"].disabled = true;
+      this.elements["new-session"].disabled = true;
+      this.elements["refresh-whitelist"].disabled = true;
       const response = await fetch("/healthz", { cache: "no-store" });
       if (!response.ok) throw new Error(`server is not ready (${response.status})`);
       this.activeProfile = negotiateServerProfile(await response.json());
@@ -477,9 +685,9 @@ class App {
     try {
       const sessionId = validateSessionId(this.elements["session-id"].value);
       const files = Array.from(this.elements["whitelist-files"].files || []);
-      if (!files.length) throw new Error("등록할 JPEG를 한 장 이상 선택하세요");
+      if (!files.length) throw new Error("등록할 이미지를 한 장 이상 선택하세요");
       button.disabled = true;
-      this.elements["whitelist-status"].textContent = `${files.length}장 등록 중`;
+      this.elements["whitelist-status"].textContent = `${files.length}장 JPEG 변환·등록 중`;
       const results = await addWhitelistFiles(files, sessionId);
       this.elements["enrollment-results"].textContent = results.map((result) => (
         result.ok
@@ -498,6 +706,8 @@ class App {
     try {
       const sessionId = validateSessionId(this.elements["session-id"].value);
       const status = await getWhitelistStatus(sessionId);
+      this.upsertSession(status);
+      this.renderSessions(sessionId, this.elements["comparison-session-id"].value);
       this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
       return status;
     } catch (error) {
@@ -515,6 +725,9 @@ class App {
         getWhitelistStatus(firstId),
         getWhitelistStatus(secondId),
       ]);
+      this.upsertSession(first);
+      this.upsertSession(second);
+      this.renderSessions(firstId, secondId);
       this.elements["enrollment-results"].textContent = [
         `A · ${this.formatWhitelistStatus(first)}`,
         `B · ${this.formatWhitelistStatus(second)}`,
@@ -527,6 +740,178 @@ class App {
 
   formatWhitelistStatus(status) {
     return `${status.session_id}: ${status.entry_count} entries · v${status.whitelist_version}`;
+  }
+
+  async initializeSessions() {
+    this.elements.start.disabled = true;
+    this.elements["new-session"].disabled = true;
+    this.elements["refresh-whitelist"].disabled = true;
+    this.elements["whitelist-status"].textContent = "서버 세션 목록 확인 중";
+    try {
+      const listed = await listSessions();
+      const resolved = await ensureTabSession(
+        listed,
+        this.tabStorage(),
+        () => createSession(),
+      );
+      this.sessionStatuses = resolved.sessions;
+      this.sessionsReady = true;
+      this.renderSessions(resolved.active.session_id);
+      this.elements["whitelist-status"].textContent = resolved.created
+        ? `새 탭 전용 세션 생성됨 · ${resolved.active.session_id}`
+        : `탭 세션 재사용 · ${this.formatWhitelistStatus(resolved.active)}`;
+    } catch (error) {
+      this.sessionsReady = false;
+      this.elements["whitelist-status"].textContent = error.message;
+      this.elements["session-list"].textContent = "세션 목록을 불러오지 못했습니다.";
+    } finally {
+      this.elements["new-session"].disabled = false;
+      this.elements["refresh-whitelist"].disabled = false;
+    }
+  }
+
+  async refreshSessions() {
+    const button = this.elements["refresh-whitelist"];
+    button.disabled = true;
+    try {
+      const resolved = await ensureTabSession(
+        await listSessions(),
+        this.tabStorage(),
+        () => createSession(),
+      );
+      const comparisonId = this.elements["comparison-session-id"].value;
+      this.sessionStatuses = resolved.sessions;
+      this.sessionsReady = true;
+      this.renderSessions(resolved.active.session_id, comparisonId);
+      this.elements["whitelist-status"].textContent = resolved.created
+        ? `저장된 탭 세션이 없어 새로 생성했습니다 · ${resolved.active.session_id}`
+        : this.formatWhitelistStatus(resolved.active);
+    } catch (error) {
+      this.elements["whitelist-status"].textContent = error.message;
+    } finally {
+      button.disabled = this.running;
+    }
+  }
+
+  async createNewSession() {
+    const button = this.elements["new-session"];
+    button.disabled = true;
+    try {
+      const previousActive = this.elements["session-id"].value;
+      const created = await createSession();
+      this.upsertSession(created, true);
+      this.storeTabSession(created.session_id);
+      this.sessionsReady = true;
+      this.renderSessions(created.session_id, previousActive);
+      this.elements["whitelist-status"].textContent = `새 세션 생성됨 · ${created.session_id}`;
+    } catch (error) {
+      this.elements["whitelist-status"].textContent = error.message;
+    } finally {
+      button.disabled = this.running;
+    }
+  }
+
+  selectActiveSession() {
+    const sessionId = validateSessionId(this.elements["session-id"].value);
+    this.storeTabSession(sessionId);
+    let comparisonId = this.elements["comparison-session-id"].value;
+    if (comparisonId === sessionId) {
+      comparisonId = this.sessionStatuses.find(
+        (session) => session.session_id !== sessionId,
+      )?.session_id || "";
+    }
+    this.renderSessions(sessionId, comparisonId);
+    const status = this.sessionStatuses.find((session) => session.session_id === sessionId);
+    if (status) this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
+  }
+
+  upsertSession(status, newest = false) {
+    const normalized = normalizeSessionInfo(status);
+    const existing = this.sessionStatuses.find(
+      (session) => session.session_id === normalized.session_id,
+    );
+    if (existing && normalized.created_at_unix_ms === 0) {
+      normalized.created_at_unix_ms = existing.created_at_unix_ms;
+    }
+    this.sessionStatuses = this.sessionStatuses.filter(
+      (session) => session.session_id !== normalized.session_id,
+    );
+    if (newest) this.sessionStatuses.unshift(normalized);
+    else this.sessionStatuses.push(normalized);
+  }
+
+  renderSessions(activeId = "", comparisonId = "") {
+    const sessions = [...this.sessionStatuses].sort((left, right) => (
+      right.created_at_unix_ms - left.created_at_unix_ms
+      || left.session_id.localeCompare(right.session_id)
+    ));
+    this.sessionStatuses = sessions;
+    const active = sessions.some((session) => session.session_id === activeId)
+      ? activeId
+      : sessions[0]?.session_id || "";
+    let comparison = sessions.some((session) => session.session_id === comparisonId)
+      ? comparisonId
+      : "";
+    if (!comparison || comparison === active) {
+      comparison = sessions.find((session) => session.session_id !== active)?.session_id || "";
+    }
+
+    this.replaceSessionOptions(this.elements["session-id"], sessions, active, false);
+    this.replaceSessionOptions(
+      this.elements["comparison-session-id"],
+      sessions,
+      comparison,
+      true,
+    );
+    this.elements["session-id"].disabled = this.running || !active;
+    this.elements["comparison-session-id"].disabled = sessions.length < 2;
+    this.elements.start.disabled = this.running || !this.sessionsReady || !active;
+    this.elements["add-whitelist"].disabled = !active;
+    this.elements["compare-sessions"].disabled = sessions.length < 2;
+    this.elements["new-session"].disabled = this.running;
+    this.elements["refresh-whitelist"].disabled = this.running;
+    this.elements["session-list"].textContent = sessions.length
+      ? sessions.map((session) => {
+        const roles = [
+          session.session_id === active ? "영상·등록" : null,
+          session.session_id === comparison ? "비교" : null,
+        ].filter(Boolean).join(" / ");
+        return `${roles ? `[${roles}] ` : ""}${this.formatWhitelistStatus(session)}`;
+      }).join("\n")
+      : "서버에 등록된 세션이 없습니다.";
+  }
+
+  replaceSessionOptions(select, sessions, selectedId, allowEmpty) {
+    select.replaceChildren();
+    if (allowEmpty && sessions.length < 2) {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "비교할 다른 세션 없음";
+      select.append(empty);
+    }
+    for (const session of sessions) {
+      const option = document.createElement("option");
+      option.value = session.session_id;
+      option.textContent = this.formatWhitelistStatus(session);
+      option.selected = session.session_id === selectedId;
+      select.append(option);
+    }
+  }
+
+  tabStorage() {
+    try {
+      return window.sessionStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  storeTabSession(sessionId) {
+    try {
+      this.tabStorage()?.setItem(TAB_SESSION_STORAGE_KEY, sessionId);
+    } catch {
+      // The selected session remains valid for this page without storage.
+    }
   }
 
   scheduleCapture() {
@@ -967,9 +1352,11 @@ class App {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.elements.source.srcObject = null;
-    this.elements["session-id"].disabled = false;
+    this.elements["session-id"].disabled = !this.sessionsReady;
+    this.elements["new-session"].disabled = false;
+    this.elements["refresh-whitelist"].disabled = false;
     this.streamSessionId = null;
-    this.elements.start.disabled = false;
+    this.elements.start.disabled = !this.sessionsReady;
     this.elements.stop.disabled = true;
   }
 

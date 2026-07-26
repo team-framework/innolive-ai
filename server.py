@@ -67,7 +67,7 @@ RPC_HTTP_STATUS = {
 
 @dataclass(frozen=True, slots=True)
 class ServerSettings:
-    session_id: str
+    session_id: str = "demo-session"
     grpc_target: str = "127.0.0.1:50051"
     grpc_connect_timeout_seconds: float = 10.0
     grpc_health_timeout_seconds: float = 2.0
@@ -198,6 +198,29 @@ class GrpcDemoGateway:
             payload["error"] = health_error
         return JSONResponse(payload, status_code=200 if serving else 503)
 
+    async def create_session(self, request: Request) -> JSONResponse:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        try:
+            session = await client.create_session()
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        return JSONResponse(_session_info_payload(session), status_code=201)
+
+    async def list_sessions(self, request: Request) -> JSONResponse:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        try:
+            sessions = await client.list_sessions()
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        return JSONResponse(
+            {"sessions": [_session_info_payload(session) for session in sessions]},
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def whitelist_status(self, request: Request) -> JSONResponse:
         client = await self._api_client(request)
         if isinstance(client, JSONResponse):
@@ -326,6 +349,7 @@ class GrpcDemoGateway:
                 "client_window": REQUEST_WINDOW,
                 "target_fps": TARGET_FPS,
             },
+            "enrollment_content_types": ["image/jpeg", "image/png", "image/webp"],
             "active_streams": self.active_streams,
             "metrics": self.metrics.snapshot(),
         }
@@ -573,6 +597,8 @@ def create_app(
     app.add_api_route("/", gateway.index, methods=["GET"], include_in_schema=False)
     app.add_api_route("/healthz", gateway.health, methods=["GET"])
     app.add_api_route("/readyz", gateway.readiness, methods=["GET"])
+    app.add_api_route("/api/sessions", gateway.create_session, methods=["POST"])
+    app.add_api_route("/api/sessions", gateway.list_sessions, methods=["GET"])
     app.add_api_route("/api/whitelist", gateway.whitelist_status, methods=["GET"])
     app.add_api_route("/api/whitelist", gateway.add_whitelist, methods=["POST"])
     app.add_api_websocket_route("/ws", gateway.stream)
@@ -600,6 +626,15 @@ def _api_error(status_code: int, code: str, message: str) -> JSONResponse:
     )
 
 
+def _session_info_payload(session: Any) -> dict[str, int | str]:
+    return {
+        "session_id": str(session.session_id),
+        "entry_count": int(session.entry_count),
+        "whitelist_version": int(session.whitelist_version),
+        "created_at_unix_ms": int(session.created_at_unix_ms),
+    }
+
+
 def _rpc_error_response(error: VideoRpcError) -> JSONResponse:
     return _api_error(
         RPC_HTTP_STATUS.get(error.code.name, 502),
@@ -623,7 +658,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--grpc-target", default="127.0.0.1:50051")
-    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--session-id", default="demo-session")
     parser.add_argument("--grpc-connect-timeout", type=float, default=10.0)
     parser.add_argument("--grpc-health-timeout", type=float, default=2.0)
     parser.add_argument("--ssl-certfile", type=Path)

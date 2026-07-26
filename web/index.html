@@ -20,29 +20,35 @@
         <h2>세션별 얼굴 whitelist 테스트</h2>
         <div class="enrollment-grid">
           <label>
-            <span>영상·등록 session ID</span>
-            <input id="session-id" value="demo-session-a" autocomplete="off" />
+            <span>영상·등록 서버 세션</span>
+            <select id="session-id" disabled>
+              <option value="">세션 목록 확인 중</option>
+            </select>
           </label>
           <label>
-            <span>비교할 session ID</span>
-            <input id="comparison-session-id" value="demo-session-b" autocomplete="off" />
+            <span>비교할 서버 세션</span>
+            <select id="comparison-session-id" disabled>
+              <option value="">비교 세션 준비 중</option>
+            </select>
           </label>
           <label class="face-files">
-            <span>등록 얼굴 JPEG · 여러 장 선택 가능</span>
-            <input id="whitelist-files" type="file" accept="image/jpeg,.jpg,.jpeg" multiple />
+            <span>등록 얼굴 이미지 · JPEG 변환 후 순차 등록</span>
+            <input id="whitelist-files" type="file" accept="image/*" multiple />
           </label>
         </div>
         <div class="enrollment-actions">
-          <button id="add-whitelist" class="primary">선택 세션에 얼굴 등록</button>
-          <button id="refresh-whitelist">현재 세션 상태</button>
-          <button id="compare-sessions">두 세션 분리 확인</button>
-          <strong id="whitelist-status">아직 조회하지 않음</strong>
+          <button id="add-whitelist" class="primary" disabled>선택 세션에 얼굴 등록</button>
+          <button id="new-session" disabled>새 세션 생성</button>
+          <button id="refresh-whitelist" disabled>세션 목록 새로고침</button>
+          <button id="compare-sessions" disabled>두 세션 분리 확인</button>
+          <strong id="whitelist-status">서버 세션 준비 중</strong>
         </div>
-        <pre id="enrollment-results">A에만 등록한 뒤 A/B 상태를 비교하고, 각 세션으로 카메라를 다시 시작해 blur 차이를 확인하세요.</pre>
+        <pre id="session-list">서버 세션 목록을 불러오는 중입니다.</pre>
+        <pre id="enrollment-results">현재 탭은 서버가 생성한 고유 세션을 재사용합니다. 한 세션에만 얼굴을 등록한 뒤 다른 세션과 blur 결과를 비교하세요.</pre>
       </section>
 
       <section class="controls panel">
-        <button id="start">카메라 시작</button>
+        <button id="start" disabled>카메라 시작</button>
         <button id="stop" disabled>중지</button>
         <span>세션 변경은 stream 중지 후 · gRPC bidi · long edge 640 · JPEG Q90 · window 5</span>
       </section>

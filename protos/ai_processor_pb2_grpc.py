@@ -95,7 +95,7 @@ class AiProcessorServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ListSessions(self, request, context):
-        """Lists in-memory sessions for the authenticated management client.
+        """Lists bounded in-memory sessions for a trusted management client.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
