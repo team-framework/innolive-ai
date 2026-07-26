@@ -52,16 +52,6 @@ export function parseTerminal(text) {
   return metadata;
 }
 
-export function percentile(samples, quantile) {
-  if (!samples.length) return null;
-  const ordered = [...samples].sort((left, right) => left - right);
-  const index = Math.min(
-    ordered.length - 1,
-    Math.max(0, Math.ceil(ordered.length * quantile) - 1),
-  );
-  return ordered[index];
-}
-
 export function objectsToBlur(objects) {
   return objects.filter((object) => object.whitelisted !== true);
 }
@@ -93,10 +83,25 @@ export function requireResultSession(metadata, sessionId) {
 }
 
 export async function getWhitelistStatus(sessionId, request = fetch) {
-  const response = await request(whitelistUrl(sessionId), {
+  const validatedSessionId = validateSessionId(sessionId);
+  const response = await request(whitelistUrl(validatedSessionId), {
     cache: "no-store",
   });
-  return readApiResponse(response);
+  const status = normalizeWhitelistStatus(await readApiResponse(response));
+  if (status.session_id !== validatedSessionId) {
+    throw new Error("whitelist status does not match the requested session");
+  }
+  return status;
+}
+
+export async function deleteWhitelistEntry(sessionId, entryId, request = fetch) {
+  const validatedSessionId = validateSessionId(sessionId);
+  const validatedEntryId = validateEntryId(entryId);
+  const response = await request(
+    `/api/whitelist?session_id=${encodeURIComponent(validatedSessionId)}&entry_id=${encodeURIComponent(validatedEntryId)}`,
+    { method: "DELETE" },
+  );
+  if (!response.ok) await readApiResponse(response);
 }
 
 export async function listSessions(request = fetch) {
@@ -318,6 +323,36 @@ function normalizeSessionInfo(value) {
   };
 }
 
+function normalizeWhitelistStatus(value) {
+  const info = normalizeSessionInfo(value);
+  if (!Array.isArray(value?.entry_ids)) {
+    throw new Error("gateway returned an invalid whitelist entry list");
+  }
+  const entryIds = value.entry_ids.map(validateEntryId);
+  if (new Set(entryIds).size !== entryIds.length) {
+    throw new Error("gateway returned duplicate whitelist entry IDs");
+  }
+  if (entryIds.length !== info.entry_count) {
+    throw new Error("gateway returned an inconsistent whitelist entry count");
+  }
+  return {
+    session_id: info.session_id,
+    entry_count: info.entry_count,
+    whitelist_version: info.whitelist_version,
+    entry_ids: entryIds,
+  };
+}
+
+function validateEntryId(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("whitelist entry ID must not be empty");
+  }
+  if (new TextEncoder().encode(value).byteLength > MAX_SESSION_ID_BYTES) {
+    throw new Error(`whitelist entry ID exceeds ${MAX_SESSION_ID_BYTES} UTF-8 bytes`);
+  }
+  return value;
+}
+
 function encodeCanvasJpeg(canvas, quality) {
   if (typeof canvas.convertToBlob === "function") {
     return canvas.convertToBlob({ type: "image/jpeg", quality });
@@ -454,12 +489,10 @@ export function captureDeadline(
 }
 
 export class BitmapLease {
-  constructor(jpeg, decode, clock, onRelease = () => {}) {
+  constructor(jpeg, decode, onRelease = () => {}) {
     this.bitmap = null;
-    this.decodeMs = null;
     this.released = false;
     this.onRelease = onRelease;
-    const startedAt = clock();
     let decoding;
     try {
       decoding = Promise.resolve(decode(jpeg));
@@ -468,7 +501,6 @@ export class BitmapLease {
     }
     this.promise = decoding.then(
       (bitmap) => {
-        this.decodeMs = clock() - startedAt;
         if (this.released) {
           bitmap.close();
           return null;
@@ -477,7 +509,6 @@ export class BitmapLease {
         return bitmap;
       },
       (error) => {
-        this.decodeMs = clock() - startedAt;
         if (this.released) return null;
         throw error;
       },
@@ -549,11 +580,10 @@ class App {
     this.elements = Object.fromEntries(
       [
         "start", "stop", "status", "source", "output", "capture",
-        "capture-fps", "sent-fps", "result-fps", "display-fps", "round-trip",
-        "grpc-round-trip", "server-time", "queue", "dropped", "diagnostics",
+        "capture-fps", "result-fps", "display-fps",
         "session-id", "whitelist-files", "whitelist-dropzone", "add-whitelist",
         "new-session", "refresh-whitelist", "whitelist-status", "session-list",
-        "selected-file-summary", "enrollment-results",
+        "selected-file-summary", "enrollment-results", "whitelist-entries",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -578,7 +608,9 @@ class App {
     this.sessionsReady = false;
     this.selectedWhitelistFiles = [];
     this.enrollmentFileStates = [];
+    this.whitelistEntryIds = [];
     this.enrolling = false;
+    this.deletingWhitelistEntryId = null;
     this.deletingSessionId = null;
     this.resetState();
     this.blackout("보호 결과 대기 중");
@@ -623,7 +655,7 @@ class App {
     );
     this.elements["selected-file-summary"].textContent = this.selectedWhitelistFiles.length
       ? `${this.selectedWhitelistFiles.length}장 선택 · ${this.formatBytes(totalSize)}`
-      : "선택한 파일이 없습니다.";
+      : "선택 파일 없음";
     this.renderEnrollmentResults();
     this.updateEnrollmentButton();
   }
@@ -631,6 +663,7 @@ class App {
   updateEnrollmentButton() {
     this.elements["add-whitelist"].disabled = (
       this.enrolling
+      || this.deletingWhitelistEntryId !== null
       || !this.sessionsReady
       || !this.elements["session-id"].value
       || this.selectedWhitelistFiles.length === 0
@@ -657,12 +690,10 @@ class App {
     const list = this.elements["enrollment-results"];
     list.replaceChildren();
     if (!this.enrollmentFileStates.length) {
-      const empty = document.createElement("li");
-      empty.className = "empty-result";
-      empty.textContent = "등록할 사진을 선택하면 파일별 진행 상태가 표시됩니다.";
-      list.append(empty);
+      list.hidden = true;
       return;
     }
+    list.hidden = false;
     const stateLabels = {
       ready: "대기",
       preparing: "변환 중",
@@ -711,35 +742,12 @@ class App {
     this.localStreamCounted = false;
     this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
-    this.measurementStartedAt = null;
-    this.lastMetricSampleAt = null;
-    this.metricHistory = [];
-    this.frameCounts = { capture: 0, encoded: 0, sent: 0, result: 0, display: 0 };
-    this.counters = {
-      captureDropped: 0,
-      encodeBusyDropped: 0,
-      pendingReplaced: 0,
-      staleResults: 0,
-      renderDropped: 0,
-      bitmapOwners: 0,
-      bitmapOwnerPeak: 0,
-      errors: 0,
-    };
+    this.bitmapOwners = 0;
     this.rates = {
       capture: [],
-      encoded: [],
-      sent: [],
       result: [],
       display: [],
     };
-    this.samples = {
-      rtt: [],
-      localJpegDecode: [],
-      resultToDisplay: [],
-      captureToDisplay: [],
-    };
-    window.__INNOLIVE_BITMAP_OWNERS__ = 0;
-    window.__INNOLIVE_METRIC_HISTORY__ = this.metricHistory;
   }
 
   async start() {
@@ -795,10 +803,8 @@ class App {
         if (activeSession) activeSession.active_stream_count += 1;
         this.localStreamCounted = true;
         this.renderSessions(this.streamSessionId);
-        this.measurementStartedAt = performance.now();
-        this.lastMetricSampleAt = this.measurementStartedAt;
         this.elements.stop.disabled = false;
-        this.setStatus(`연결됨 · ${this.streamSessionId} · gRPC ProcessVideo`, true);
+        this.setStatus("연결됨", true);
         this.blackout("첫 보호 결과 대기 중");
         this.scheduleCapture();
       };
@@ -847,7 +853,7 @@ class App {
         this.selectedWhitelistFiles = [];
         this.elements["whitelist-files"].value = "";
         this.elements["selected-file-summary"].textContent = (
-          `${this.enrollmentFileStates.length}장 처리 완료 · 다른 사진을 선택해 추가 등록할 수 있습니다.`
+          `${this.enrollmentFileStates.length}장 처리 완료`
         );
       }
       this.renderSessions(this.elements["session-id"].value);
@@ -855,21 +861,84 @@ class App {
   }
 
   async refreshWhitelistStatus() {
+    const sessionId = validateSessionId(this.elements["session-id"].value);
     try {
-      const sessionId = validateSessionId(this.elements["session-id"].value);
       const status = await getWhitelistStatus(sessionId);
       this.upsertSession(status);
+      if (this.elements["session-id"].value !== sessionId) return status;
+      this.whitelistEntryIds = status.entry_ids;
       this.renderSessions(sessionId);
       this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
       return status;
     } catch (error) {
-      this.elements["whitelist-status"].textContent = error.message;
+      if (this.elements["session-id"].value === sessionId) {
+        this.elements["whitelist-status"].textContent = error.message;
+      }
       return null;
     }
   }
 
+  async removeWhitelistEntry(entryId) {
+    if (this.enrolling || this.deletingSessionId || this.deletingWhitelistEntryId) return;
+    const sessionId = validateSessionId(this.elements["session-id"].value);
+    this.deletingWhitelistEntryId = entryId;
+    this.renderWhitelistEntries();
+    this.renderSessions(sessionId);
+    try {
+      await deleteWhitelistEntry(sessionId, entryId);
+      this.whitelistEntryIds = this.whitelistEntryIds.filter((id) => id !== entryId);
+      const session = this.sessionStatuses.find((item) => item.session_id === sessionId);
+      if (session) {
+        session.entry_count = Math.max(0, session.entry_count - 1);
+        session.whitelist_version += 1;
+      }
+      this.renderWhitelistEntries();
+      await this.refreshWhitelistStatus();
+    } catch (error) {
+      this.elements["whitelist-status"].textContent = error.message;
+    } finally {
+      this.deletingWhitelistEntryId = null;
+      this.renderWhitelistEntries();
+      this.renderSessions(this.elements["session-id"].value);
+    }
+  }
+
+  renderWhitelistEntries() {
+    const container = this.elements["whitelist-entries"];
+    container.replaceChildren();
+    if (!this.whitelistEntryIds.length) {
+      const empty = document.createElement("span");
+      empty.className = "empty-entry";
+      empty.textContent = "없음";
+      container.append(empty);
+      return;
+    }
+    const locked = (
+      this.enrolling
+      || this.deletingSessionId !== null
+      || this.deletingWhitelistEntryId !== null
+    );
+    for (const entryId of this.whitelistEntryIds) {
+      const chip = document.createElement("span");
+      chip.className = "whitelist-entry";
+      chip.title = entryId;
+      const label = document.createElement("span");
+      label.textContent = entryId.length > 20
+        ? `${entryId.slice(0, 10)}…${entryId.slice(-6)}`
+        : entryId;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = this.deletingWhitelistEntryId === entryId ? "…" : "삭제";
+      remove.disabled = locked;
+      remove.setAttribute("aria-label", `${entryId} 삭제`);
+      remove.addEventListener("click", () => this.removeWhitelistEntry(entryId));
+      chip.append(label, remove);
+      container.append(chip);
+    }
+  }
+
   formatWhitelistStatus(status) {
-    return `${status.entry_count}장 등록 · v${status.whitelist_version}`;
+    return `${status.entry_count}장 등록`;
   }
 
   async initializeSessions() {
@@ -887,9 +956,7 @@ class App {
       this.sessionStatuses = resolved.sessions;
       this.sessionsReady = true;
       this.renderSessions(resolved.active.session_id);
-      this.elements["whitelist-status"].textContent = resolved.created
-        ? `새 탭 전용 세션 생성됨 · ${resolved.active.session_id}`
-        : `탭 세션 재사용 · ${this.formatWhitelistStatus(resolved.active)}`;
+      await this.refreshWhitelistStatus();
     } catch (error) {
       this.sessionsReady = false;
       this.elements["whitelist-status"].textContent = error.message;
@@ -912,9 +979,7 @@ class App {
       this.sessionStatuses = resolved.sessions;
       this.sessionsReady = true;
       this.renderSessions(resolved.active.session_id);
-      this.elements["whitelist-status"].textContent = resolved.created
-        ? `저장된 탭 세션이 없어 새로 생성했습니다 · ${resolved.active.session_id}`
-        : this.formatWhitelistStatus(resolved.active);
+      await this.refreshWhitelistStatus();
     } catch (error) {
       this.elements["whitelist-status"].textContent = error.message;
     } finally {
@@ -931,7 +996,7 @@ class App {
       this.storeTabSession(created.session_id);
       this.sessionsReady = true;
       this.renderSessions(created.session_id);
-      this.elements["whitelist-status"].textContent = `새 세션 생성됨 · ${created.session_id}`;
+      await this.refreshWhitelistStatus();
     } catch (error) {
       this.elements["whitelist-status"].textContent = error.message;
     } finally {
@@ -939,12 +1004,13 @@ class App {
     }
   }
 
-  selectActiveSession() {
+  async selectActiveSession() {
     const sessionId = validateSessionId(this.elements["session-id"].value);
     this.storeTabSession(sessionId);
+    this.whitelistEntryIds = [];
+    this.renderWhitelistEntries();
     this.renderSessions(sessionId);
-    const status = this.sessionStatuses.find((session) => session.session_id === sessionId);
-    if (status) this.elements["whitelist-status"].textContent = this.formatWhitelistStatus(status);
+    await this.refreshWhitelistStatus();
   }
 
   upsertSession(status, newest = false) {
@@ -992,7 +1058,7 @@ class App {
       }
       this.storeTabSession(activeId);
       this.renderSessions(activeId);
-      this.elements["whitelist-status"].textContent = "세션을 삭제했습니다.";
+      await this.refreshWhitelistStatus();
     } catch (error) {
       try {
         this.sessionStatuses = await listSessions();
@@ -1021,7 +1087,11 @@ class App {
       ? activeId
       : sessions[0]?.session_id || "";
     const streamLocked = this.running || this.streamSessionId !== null;
-    const managementLocked = this.enrolling || this.deletingSessionId !== null;
+    const managementLocked = (
+      this.enrolling
+      || this.deletingSessionId !== null
+      || this.deletingWhitelistEntryId !== null
+    );
     const controlsLocked = streamLocked || managementLocked;
 
     this.replaceSessionOptions(this.elements["session-id"], sessions, active);
@@ -1030,6 +1100,7 @@ class App {
     this.elements["new-session"].disabled = controlsLocked;
     this.elements["refresh-whitelist"].disabled = controlsLocked;
     this.updateEnrollmentButton();
+    this.renderWhitelistEntries();
     this.renderSessionRows(sessions, active, managementLocked);
   }
 
@@ -1069,7 +1140,7 @@ class App {
       name.textContent = session.session_id;
       const meta = document.createElement("div");
       meta.className = "session-meta";
-      meta.textContent = `${this.formatWhitelistStatus(session)} · ${this.formatCreatedAt(session.created_at_unix_ms)}`;
+      meta.textContent = this.formatWhitelistStatus(session);
       identity.append(name, meta);
 
       const badges = document.createElement("div");
@@ -1110,16 +1181,6 @@ class App {
     badge.className = `badge ${modifier}`;
     badge.textContent = label;
     return badge;
-  }
-
-  formatCreatedAt(timestamp) {
-    if (!timestamp) return "생성 시각 정보 없음";
-    return new Intl.DateTimeFormat("ko-KR", {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date(timestamp));
   }
 
   tabStorage() {
@@ -1168,12 +1229,7 @@ class App {
     this.nextCaptureDeadline = deadline.nextDeadline;
     if (!deadline.due) return;
     this.mark(this.rates.capture, now);
-    this.frameCounts.capture += 1;
-    if (this.encoding || !this.elements.source.videoWidth) {
-      this.counters.captureDropped += 1;
-      this.counters.encodeBusyDropped += 1;
-      return;
-    }
+    if (this.encoding || !this.elements.source.videoWidth) return;
 
     const [width, height] = fitLongEdge(
       this.elements.source.videoWidth,
@@ -1184,19 +1240,12 @@ class App {
     this.elements.capture.height = height;
     this.captureContext.drawImage(this.elements.source, 0, 0, width, height);
     const generation = this.generation;
-    const capturedAt = performance.now();
     this.encoding = true;
     this.elements.capture.toBlob((jpeg) => {
       this.encoding = false;
       if (!this.running || generation !== this.generation) return;
       if (!jpeg) return this.failClosed("JPEG encoding failed");
-      this.mark(this.rates.encoded, performance.now());
-      this.frameCounts.encoded += 1;
-      if (this.pendingLatest) {
-        this.counters.captureDropped += 1;
-        this.counters.pendingReplaced += 1;
-      }
-      this.pendingLatest = { jpeg, capturedAt, width, height };
+      this.pendingLatest = { jpeg, width, height };
       this.pump();
     }, "image/jpeg", this.activeProfile.jpegQuality);
   }
@@ -1216,14 +1265,12 @@ class App {
     const sequence = this.nextSequence++;
     const frame = this.pendingLatest;
     this.pendingLatest = null;
-    const sentAt = performance.now();
     const timeout = setTimeout(
       () => this.failClosed(`response timeout for seq ${sequence}`),
       this.activeProfile.timeoutMs,
     );
     const request = {
       ...frame,
-      sentAt,
       timeout,
       generation: this.generation,
       bitmapLease: null,
@@ -1232,8 +1279,6 @@ class App {
     try {
       this.socket.send(framePacket(sequence, frame.jpeg));
       request.bitmapLease = this.createBitmapLease(frame.jpeg);
-      this.mark(this.rates.sent, sentAt);
-      this.frameCounts.sent += 1;
     } catch (error) {
       this.failClosed(error.message);
     }
@@ -1255,7 +1300,6 @@ class App {
       this.inFlight.delete(sequence);
 
       if (metadata.type === "error") {
-        this.counters.errors += 1;
         throw new Error(`${metadata.code}: ${metadata.message}`);
       }
       requireResultSession(metadata, this.streamSessionId);
@@ -1268,30 +1312,21 @@ class App {
       }
       this.pump();
       const receivedAt = performance.now();
-      const rtt = receivedAt - request.sentAt;
       this.mark(this.rates.result, receivedAt);
-      this.frameCounts.result += 1;
-      this.addSample(this.samples.rtt, rtt);
       const item = {
         sequence,
         generation: request.generation,
         metadata,
         request,
-        receivedAt,
-        rtt,
-        metadataBytes: new TextEncoder().encode(event.data).byteLength,
       };
       const queued = this.renderQueue.enqueue(item);
       if (!queued.accepted) {
         request.bitmapLease?.release();
         request = null;
-        this.counters.staleResults += 1;
         return;
       }
       if (queued.dropped) {
         queued.dropped.request.bitmapLease?.release();
-        this.counters.renderDropped += 1;
-        this.counters.staleResults += 1;
       }
       request = null; // Ownership moved from in-flight to the render queue.
       this.scheduleRender();
@@ -1302,23 +1337,16 @@ class App {
   }
 
   createBitmapLease(jpeg) {
-    this.counters.bitmapOwners += 1;
-    this.counters.bitmapOwnerPeak = Math.max(
-      this.counters.bitmapOwnerPeak,
-      this.counters.bitmapOwners,
-    );
-    if (this.counters.bitmapOwners > this.activeProfile.requestWindow + 2) {
-      this.counters.bitmapOwners -= 1;
+    this.bitmapOwners += 1;
+    if (this.bitmapOwners > this.activeProfile.requestWindow + 2) {
+      this.bitmapOwners -= 1;
       throw new Error("bitmap ownership exceeded the negotiated window bound");
     }
-    window.__INNOLIVE_BITMAP_OWNERS__ = this.counters.bitmapOwners;
     return new BitmapLease(
       jpeg,
       (blob) => createImageBitmap(blob),
-      () => performance.now(),
       () => {
-        this.counters.bitmapOwners -= 1;
-        window.__INNOLIVE_BITMAP_OWNERS__ = this.counters.bitmapOwners;
+        this.bitmapOwners -= 1;
       },
     );
   }
@@ -1348,29 +1376,16 @@ class App {
         || item.generation !== this.generation
         || !this.renderQueue.canCommit(item)
       ) {
-        this.counters.staleResults += 1;
         return;
       }
       this.drawProtected(bitmap, item.metadata);
       if (!this.renderQueue.commit(item)) throw new Error("render commit regressed");
       const displayedAt = performance.now();
-      const localJpegDecode = item.request.bitmapLease.decodeMs;
-      const resultToDisplay = displayedAt - item.receivedAt;
-      const captureToDisplay = displayedAt - item.request.capturedAt;
       this.mark(this.rates.display, displayedAt);
-      this.frameCounts.display += 1;
-      this.addSample(this.samples.localJpegDecode, localJpegDecode);
-      this.addSample(this.samples.resultToDisplay, resultToDisplay);
-      this.addSample(this.samples.captureToDisplay, captureToDisplay);
-      this.updateMetrics(
-        item,
-        { localJpegDecode, resultToDisplay, captureToDisplay },
-        displayedAt,
-      );
-      this.setStatus(`보호 결과 seq ${item.sequence}`, true);
+      this.updateFps(displayedAt);
+      this.setStatus("보호 출력 중", true);
     } catch (error) {
       if (item.generation === this.generation) {
-        this.counters.renderDropped += 1;
         this.failClosed(`render failed: ${error.message}`);
       }
     } finally {
@@ -1428,98 +1443,12 @@ class App {
       this.outputContext.restore();
     }
 
-    for (const object of objects) {
-      const [x1, y1, x2, y2] = object.bbox || [];
-      if (![x1, y1, x2, y2].every(Number.isFinite)) continue;
-      this.outputContext.strokeStyle = object.whitelisted
-        ? "#5ab0ff"
-        : object.source === "held" ? "#ffd166" : "#3ee6a8";
-      this.outputContext.lineWidth = 2;
-      this.outputContext.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      this.outputContext.fillStyle = this.outputContext.strokeStyle;
-      this.outputContext.font = "13px ui-monospace, monospace";
-      this.outputContext.fillText(
-        `#${object.track_id} ${object.whitelisted ? "whitelist" : object.source} ${(object.confidence * 100).toFixed(0)}%`,
-        x1,
-        Math.max(14, y1 - 4),
-      );
-    }
   }
 
-  updateMetrics(item, latency, now) {
-    const timing = item.metadata.timing_ms || {};
-    const elapsedMs = Math.max(0, now - this.measurementStartedAt);
-    const elapsedSeconds = Math.max(elapsedMs / 1000, Number.EPSILON);
-    const metrics = {
-      profile: this.activeProfile,
-      session_id: this.streamSessionId,
-      seq: item.sequence,
-      capture_fps: this.rate(this.rates.capture, now),
-      encoded_fps: this.rate(this.rates.encoded, now),
-      sent_fps: this.rate(this.rates.sent, now),
-      result_fps: this.rate(this.rates.result, now),
-      display_fps: this.rate(this.rates.display, now),
-      capture_frames: this.frameCounts.capture,
-      encoded_frames: this.frameCounts.encoded,
-      sent_frames: this.frameCounts.sent,
-      result_frames: this.frameCounts.result,
-      display_frames: this.frameCounts.display,
-      run_elapsed_ms: Number(elapsedMs.toFixed(3)),
-      exact_capture_fps: Number((this.frameCounts.capture / elapsedSeconds).toFixed(6)),
-      exact_result_fps: Number((this.frameCounts.result / elapsedSeconds).toFixed(6)),
-      exact_display_fps: Number((this.frameCounts.display / elapsedSeconds).toFixed(6)),
-      exact_display_capture_ratio: this.frameCounts.capture
-        ? Number((this.frameCounts.display / this.frameCounts.capture).toFixed(6))
-        : 0,
-      pending_frames: this.pendingLatest ? 1 : 0,
-      inflight_requests: this.inFlight.size,
-      websocket_buffered_bytes: this.socket?.bufferedAmount || 0,
-      capture_dropped: this.counters.captureDropped,
-      encode_busy_dropped: this.counters.encodeBusyDropped,
-      pending_replaced: this.counters.pendingReplaced,
-      stale_results: this.counters.staleResults,
-      render_dropped: this.counters.renderDropped,
-      bitmap_owners: this.counters.bitmapOwners,
-      bitmap_owner_peak: this.counters.bitmapOwnerPeak,
-      jpeg_bytes: item.request.jpeg.size,
-      metadata_bytes: item.metadataBytes,
-      round_trip_ms: Number(item.rtt.toFixed(2)),
-      round_trip_p50_ms: this.roundedPercentile(this.samples.rtt, 0.50),
-      round_trip_p95_ms: this.roundedPercentile(this.samples.rtt, 0.95),
-      local_jpeg_decode_ms: Number(latency.localJpegDecode.toFixed(2)),
-      local_jpeg_decode_p95_ms: this.roundedPercentile(this.samples.localJpegDecode, 0.95),
-      result_to_display_ms: Number(latency.resultToDisplay.toFixed(2)),
-      result_to_display_p95_ms: this.roundedPercentile(this.samples.resultToDisplay, 0.95),
-      capture_to_display_ms: Number(latency.captureToDisplay.toFixed(2)),
-      capture_to_display_p50_ms: this.roundedPercentile(this.samples.captureToDisplay, 0.50),
-      capture_to_display_p95_ms: this.roundedPercentile(this.samples.captureToDisplay, 0.95),
-      upscale_small_inputs: this.activeProfile.upscaleSmallInputs,
-      server: item.metadata,
-    };
-    this.elements["capture-fps"].textContent = `${metrics.capture_fps} / ${metrics.encoded_fps}`;
-    this.elements["sent-fps"].textContent = String(metrics.sent_fps);
-    this.elements["result-fps"].textContent = String(metrics.result_fps);
-    this.elements["display-fps"].textContent = String(metrics.display_fps);
-    this.elements["round-trip"].textContent = `${item.rtt.toFixed(1)} / ${metrics.round_trip_p95_ms} ms`;
-    this.elements["grpc-round-trip"].textContent = `${Number(timing.grpc_round_trip || 0).toFixed(1)} ms`;
-    this.elements["server-time"].textContent = `${Number(timing.server_total || 0).toFixed(1)} ms`;
-    this.elements.queue.textContent = `${metrics.pending_frames} / ${metrics.inflight_requests}`;
-    this.elements.dropped.textContent = `${metrics.capture_dropped} / ${metrics.stale_results + metrics.render_dropped}`;
-    this.elements.diagnostics.textContent = JSON.stringify(metrics, null, 2);
-    window.__INNOLIVE_METRICS__ = metrics;
-    if (now - this.lastMetricSampleAt >= 1000) {
-      this.lastMetricSampleAt = now;
-      const browserSample = { ...metrics };
-      delete browserSample.server;
-      this.metricHistory.push(browserSample);
-      if (this.metricHistory.length > 300) this.metricHistory.shift();
-    }
-    window.dispatchEvent(new CustomEvent("innolive:metrics", { detail: metrics }));
-  }
-
-  roundedPercentile(samples, quantile) {
-    const value = percentile(samples, quantile);
-    return value === null ? null : Number(value.toFixed(2));
+  updateFps(now) {
+    this.elements["capture-fps"].textContent = String(this.rate(this.rates.capture, now));
+    this.elements["result-fps"].textContent = String(this.rate(this.rates.result, now));
+    this.elements["display-fps"].textContent = String(this.rate(this.rates.display, now));
   }
 
   mark(series, now) {
@@ -1530,11 +1459,6 @@ class App {
   rate(series, now) {
     while (series.length && now - series[0] > 1000) series.shift();
     return series.length;
-  }
-
-  addSample(series, value) {
-    series.push(value);
-    if (series.length > 300) series.shift();
   }
 
   setStatus(message, online = false) {

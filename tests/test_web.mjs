@@ -10,6 +10,7 @@ import {
   captureDeadline,
   createSession,
   deleteSession,
+  deleteWhitelistEntry,
   enrollmentSize,
   ensureTabSession,
   fitLongEdge,
@@ -20,7 +21,6 @@ import {
   normalizeWhitelistImage,
   objectsToBlur,
   parseTerminal,
-  percentile,
   requireResultSession,
   validateSessionId,
   websocketUrl,
@@ -28,9 +28,21 @@ import {
 } from "../web/app.js";
 
 const browserHtml = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+const browserScript = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
 assert.doesNotMatch(browserHtml, /comparison-session|compare-sessions|비교할 서버 세션/);
 assert.match(browserHtml, /id="session-list"/);
 assert.match(browserHtml, /id="whitelist-dropzone"/);
+assert.match(browserHtml, /id="whitelist-entries"/);
+assert.doesNotMatch(browserHtml, /id="diagnostics"|sent-fps|round-trip|server-time/);
+assert.doesNotMatch(
+  browserHtml,
+  /현재 terminal metadata|WHITELIST|SESSIONS|클릭해 여러 장|JPEG · PNG · WebP/,
+);
+assert.equal([...browserHtml.matchAll(/id="[^"]*-fps"/g)].length, 3);
+assert.doesNotMatch(
+  browserScript,
+  /__INNOLIVE_METRICS__|__INNOLIVE_METRIC_HISTORY__|__INNOLIVE_BITMAP_OWNERS__|보호 결과 seq|fillText\(/,
+);
 
 assert.deepEqual(PROFILE, {
   protocolVersion: 1,
@@ -292,13 +304,68 @@ assert.equal(requestsAfterNormalizationFailure, 1);
 const queriedStatus = await getWhitelistStatus("session-b", async (url) => ({
   ok: true,
   status: 200,
-  json: async () => ({ session_id: new URL(url, "http://local").searchParams.get("session_id"), entry_count: 0, whitelist_version: 0 }),
+  json: async () => ({
+    session_id: new URL(url, "http://local").searchParams.get("session_id"),
+    entry_count: 2,
+    whitelist_version: 3,
+    entry_ids: ["entry-a", "entry/b"],
+  }),
 }));
 assert.deepEqual(queriedStatus, {
   session_id: "session-b",
-  entry_count: 0,
-  whitelist_version: 0,
+  entry_count: 2,
+  whitelist_version: 3,
+  entry_ids: ["entry-a", "entry/b"],
 });
+
+let deletedWhitelistRequest = null;
+await deleteWhitelistEntry("session b", "entry/b", async (url, options) => {
+  deletedWhitelistRequest = { url, options };
+  return { ok: true, status: 204 };
+});
+assert.deepEqual(deletedWhitelistRequest, {
+  url: "/api/whitelist?session_id=session%20b&entry_id=entry%2Fb",
+  options: { method: "DELETE" },
+});
+await assert.rejects(
+  getWhitelistStatus("session-b", async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      session_id: "session-b",
+      entry_count: 2,
+      whitelist_version: 3,
+      entry_ids: ["duplicate", "duplicate"],
+    }),
+  })),
+  /duplicate whitelist entry IDs/,
+);
+await assert.rejects(
+  getWhitelistStatus("session-b", async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      session_id: "different-session",
+      entry_count: 0,
+      whitelist_version: 0,
+      entry_ids: [],
+    }),
+  })),
+  /does not match the requested session/,
+);
+await assert.rejects(
+  getWhitelistStatus("session-b", async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      session_id: "session-b",
+      entry_count: 1,
+      whitelist_version: 1,
+      entry_ids: [],
+    }),
+  })),
+  /inconsistent whitelist entry count/,
+);
 
 const health = {
   status: "ok",
@@ -367,10 +434,6 @@ assert.deepEqual(
 assert.throws(() => parseTerminal('{"v":1,"type":"frame","seq":7}'));
 assert.throws(() => parseTerminal('{"v":1,"type":"result"}'));
 
-assert.equal(percentile([1, 2, 3, 4], 0.50), 2);
-assert.equal(percentile([1, 2, 3, 4], 0.95), 4);
-assert.equal(percentile([], 0.95), null);
-
 const whitelistedFace = {
   whitelisted: true,
   mask_polygon: [[10, 10], [50, 10], [50, 50], [10, 50]],
@@ -398,18 +461,14 @@ const delayed = captureDeadline(100, 240);
 assert.equal(delayed.due, true);
 assert.ok(delayed.nextDeadline > 242, "missed deadlines must not create a catch-up burst");
 
-let clock = 10;
 let normalCloses = 0;
 let normalReleases = 0;
 const normalLease = new BitmapLease(
   jpeg,
   () => Promise.resolve({ close: () => { normalCloses += 1; } }),
-  () => clock,
   () => { normalReleases += 1; },
 );
-clock = 14;
 assert.ok(await normalLease.promise);
-assert.equal(normalLease.decodeMs, 4);
 assert.equal(normalLease.release(), true);
 assert.equal(normalLease.release(), false);
 assert.equal(normalCloses, 1, "a rendered bitmap must close exactly once");
@@ -420,7 +479,6 @@ let lateCloses = 0;
 const lateLease = new BitmapLease(
   jpeg,
   () => new Promise((resolve) => { resolveLateBitmap = resolve; }),
-  () => 0,
 );
 assert.equal(lateLease.release(), true);
 resolveLateBitmap({ close: () => { lateCloses += 1; } });
