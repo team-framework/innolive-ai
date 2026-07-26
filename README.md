@@ -294,6 +294,11 @@ browser -> ILF1 WebSocket -> VideoProcessorClient -> gRPC ProcessVideo -> AI run
 `AiProcessor`가 `SERVING`일 때만 카메라 연결을 허용합니다. 모델과 tracker는
 `ai_processor_server.py` 프로세스에만 존재하므로 GPU memory도 중복되지 않습니다.
 
+브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v1과
+`ProcessVideo` gRPC 경로를 확인한 뒤 서버가 광고한 해상도, JPEG 품질, FPS, request window가
+더 작은 경우 해당 한도에 맞춥니다. `--max-streams`는 gateway 전체 동시 접속 한도이며
+`B1` inference batch나 `W5` stream별 request window와 별개입니다.
+
 ## 검사
 
 ```bash
