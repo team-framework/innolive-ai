@@ -132,10 +132,17 @@ class GrpcSchemaContractTests(unittest.TestCase):
             },
             {"session_id": 1, "entry_count": 2, "whitelist_version": 3},
         )
-        for method_name in ("CreateSession", "ListSessions"):
+        for method_name in ("CreateSession", "ListSessions", "DeleteSession"):
             method = service.methods_by_name[method_name]
             self.assertFalse(method.client_streaming)
             self.assertFalse(method.server_streaming)
+        delete_session = service.methods_by_name["DeleteSession"]
+        self.assertEqual(delete_session.input_type.full_name, "DeleteSessionRequest")
+        self.assertEqual(delete_session.output_type.full_name, "google.protobuf.Empty")
+        self.assertEqual(
+            ai_processor_pb2.DeleteSessionRequest.DESCRIPTOR.fields_by_name["session_id"].number,
+            1,
+        )
         self.assertEqual(
             {field.name: field.number for field in ai_processor_pb2.SessionInfo.DESCRIPTOR.fields},
             {
@@ -143,6 +150,7 @@ class GrpcSchemaContractTests(unittest.TestCase):
                 "entry_count": 2,
                 "whitelist_version": 3,
                 "created_at_unix_ms": 4,
+                "active_stream_count": 5,
             },
         )
         self.assertEqual(

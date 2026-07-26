@@ -19,6 +19,14 @@ class SessionLimitError(RuntimeError):
     """The in-memory session registry reached its configured limit."""
 
 
+class SessionNotFoundError(LookupError):
+    """The requested session does not exist."""
+
+
+class SessionInUseError(RuntimeError):
+    """An active video stream currently owns the session."""
+
+
 class WhitelistLimitError(RuntimeError):
     """A session reached its configured whitelist entry limit."""
 
@@ -49,6 +57,7 @@ class SessionSummary:
     entry_count: int
     whitelist_version: int
     created_at_unix_ms: int
+    active_stream_count: int
 
 
 class SessionState:
@@ -76,13 +85,14 @@ class SessionState:
             self._version += 1
             return entry, len(self._entries), self._version
 
-    def summary(self) -> SessionSummary:
+    def summary(self, *, active_stream_count: int = 0) -> SessionSummary:
         with self._lock:
             return SessionSummary(
                 session_id=self.session_id,
                 entry_count=len(self._entries),
                 whitelist_version=self._version,
                 created_at_unix_ms=self.created_at_unix_ms,
+                active_stream_count=active_stream_count,
             )
 
 
@@ -95,18 +105,13 @@ class SessionRegistry:
         self.max_sessions = max_sessions
         self.max_entries_per_session = max_entries_per_session
         self._sessions: dict[str, SessionState] = {}
+        self._active_stream_counts: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def get_or_create(self, session_id: str) -> SessionState:
         validated = validate_session_id(session_id)
         with self._lock:
-            existing = self._sessions.get(validated)
-            if existing is not None:
-                return existing
-            self._ensure_capacity_locked()
-            created = SessionState(validated, self.max_entries_per_session)
-            self._sessions[validated] = created
-            return created
+            return self._get_or_create_locked(validated)
 
     def create(self) -> SessionSummary:
         with self._lock:
@@ -117,17 +122,21 @@ class SessionRegistry:
                     break
             session = SessionState(session_id, self.max_entries_per_session)
             self._sessions[session_id] = session
+            self._active_stream_counts[session_id] = 0
             return SessionSummary(
                 session_id=session_id,
                 entry_count=0,
                 whitelist_version=0,
                 created_at_unix_ms=session.created_at_unix_ms,
+                active_stream_count=0,
             )
 
     def list_summaries(self) -> tuple[SessionSummary, ...]:
         with self._lock:
-            sessions = tuple(self._sessions.values())
-        summaries = (session.summary() for session in sessions)
+            summaries = tuple(
+                session.summary(active_stream_count=self._active_stream_counts[session_id])
+                for session_id, session in self._sessions.items()
+            )
         return tuple(
             sorted(
                 summaries,
@@ -140,9 +149,60 @@ class SessionRegistry:
         validated = validate_session_id(session_id)
         with self._lock:
             session = self._sessions.get(validated)
-        if session is None:
-            return WhitelistSnapshot((), 0)
-        return session.snapshot()
+            if session is None:
+                return WhitelistSnapshot((), 0)
+            return session.snapshot()
+
+    def append(
+        self,
+        session_id: str,
+        embedding: np.ndarray,
+    ) -> tuple[WhitelistEntry, int, int]:
+        validated = validate_session_id(session_id)
+        with self._lock:
+            session = self._get_or_create_locked(validated)
+            return session.append(embedding)
+
+    def acquire_stream(self, session_id: str) -> SessionState:
+        validated = validate_session_id(session_id)
+        with self._lock:
+            session = self._get_or_create_locked(validated)
+            self._active_stream_counts[validated] += 1
+            return session
+
+    def release_stream(self, session: SessionState) -> None:
+        with self._lock:
+            current = self._sessions.get(session.session_id)
+            if current is not session:
+                raise RuntimeError("cannot release a stale session stream lease")
+            active_stream_count = self._active_stream_counts[session.session_id]
+            if active_stream_count < 1:
+                raise RuntimeError("session stream lease count is already zero")
+            self._active_stream_counts[session.session_id] = active_stream_count - 1
+
+    def delete(self, session_id: str) -> SessionSummary:
+        validated = validate_session_id(session_id)
+        with self._lock:
+            session = self._sessions.get(validated)
+            if session is None:
+                raise SessionNotFoundError(f"session {validated!r} does not exist")
+            active_stream_count = self._active_stream_counts[validated]
+            if active_stream_count:
+                raise SessionInUseError(f"session has {active_stream_count} active video stream(s)")
+            summary = session.summary(active_stream_count=0)
+            del self._sessions[validated]
+            del self._active_stream_counts[validated]
+            return summary
+
+    def _get_or_create_locked(self, session_id: str) -> SessionState:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        self._ensure_capacity_locked()
+        session = SessionState(session_id, self.max_entries_per_session)
+        self._sessions[session_id] = session
+        self._active_stream_counts[session_id] = 0
+        return session
 
     def _ensure_capacity_locked(self) -> None:
         if len(self._sessions) >= self.max_sessions:

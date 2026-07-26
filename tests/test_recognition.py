@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -9,7 +10,9 @@ import numpy as np
 
 from service.recognition import (
     RecognitionConfig,
+    SessionInUseError,
     SessionLimitError,
+    SessionNotFoundError,
     SessionRegistry,
     StreamRecognition,
     WhitelistLimitError,
@@ -127,6 +130,60 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SessionLimitError):
             sessions.create()
+
+    async def test_active_stream_lease_blocks_deletion_and_is_listed(self):
+        sessions = SessionRegistry()
+        session = sessions.get_or_create("active-session")
+        first = sessions.acquire_stream("active-session")
+        second = sessions.acquire_stream("active-session")
+
+        self.assertIs(first, session)
+        self.assertIs(second, session)
+        self.assertEqual(sessions.list_summaries()[0].active_stream_count, 2)
+        with self.assertRaises(SessionInUseError):
+            sessions.delete("active-session")
+
+        sessions.release_stream(first)
+        sessions.release_stream(second)
+        deleted = sessions.delete("active-session")
+
+        self.assertEqual(deleted.session_id, "active-session")
+        self.assertEqual(sessions.list_summaries(), ())
+        with self.assertRaises(SessionNotFoundError):
+            sessions.delete("active-session")
+
+    async def test_stream_acquire_and_delete_are_atomic(self):
+        for _ in range(50):
+            sessions = SessionRegistry()
+            original = sessions.get_or_create("raced-session")
+            barrier = threading.Barrier(2)
+
+            def acquire(registry=sessions, start=barrier):
+                start.wait()
+                return registry.acquire_stream("raced-session")
+
+            def delete(registry=sessions, start=barrier):
+                start.wait()
+                try:
+                    return registry.delete("raced-session")
+                except SessionInUseError:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                acquired_future = executor.submit(acquire)
+                deleted_future = executor.submit(delete)
+                acquired = acquired_future.result()
+                deleted = deleted_future.result()
+
+            if deleted is None:
+                self.assertIs(acquired, original)
+            else:
+                self.assertIsNot(acquired, original)
+            active = sessions.list_summaries()
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].active_stream_count, 1)
+            sessions.release_stream(acquired)
+            sessions.delete("raced-session")
 
     async def test_same_session_streams_share_only_the_whitelist(self):
         session = SessionRegistry().get_or_create("shared")

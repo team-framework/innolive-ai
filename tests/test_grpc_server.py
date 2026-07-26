@@ -518,6 +518,53 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             (1, 1),
         )
         self.assertTrue(all(item.created_at_unix_ms > 0 for item in listed.sessions))
+        self.assertTrue(all(item.active_stream_count == 0 for item in listed.sessions))
+
+    async def test_delete_session_fails_while_stream_lease_is_active(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            created = await server.stub.CreateSession(ai_processor_pb2.CreateSessionRequest())
+            call = server.stub.ProcessVideo()
+            await call.write(_request(session_id=created.session_id))
+            self.assertEqual((await call.read()).status_message, "success")
+
+            listed = await server.stub.ListSessions(ai_processor_pb2.ListSessionsRequest())
+            self.assertEqual(listed.sessions[0].active_stream_count, 1)
+            with self.assertRaises(grpc.aio.AioRpcError) as active:
+                await server.stub.DeleteSession(
+                    ai_processor_pb2.DeleteSessionRequest(session_id=created.session_id)
+                )
+            self.assertEqual(active.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+
+            await call.done_writing()
+            self.assertIs(await call.read(), grpc.aio.EOF)
+            await _wait_until(lambda: server.sessions.list_summaries()[0].active_stream_count == 0)
+            await server.stub.DeleteSession(
+                ai_processor_pb2.DeleteSessionRequest(session_id=created.session_id)
+            )
+            self.assertEqual(server.sessions.list_summaries(), ())
+            with self.assertRaises(grpc.aio.AioRpcError) as missing:
+                await server.stub.DeleteSession(
+                    ai_processor_pb2.DeleteSessionRequest(session_id=created.session_id)
+                )
+
+        self.assertEqual(missing.exception.code(), grpc.StatusCode.NOT_FOUND)
+
+    async def test_invalid_frame_does_not_hold_a_session_lease(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            created = await server.stub.CreateSession(ai_processor_pb2.CreateSessionRequest())
+            call = server.stub.ProcessVideo()
+            await call.write(_request(data=b"not-a-jpeg", session_id=created.session_id))
+            self.assertEqual((await call.read()).error_code, "DECODE_FAILED")
+            listed = await server.stub.ListSessions(ai_processor_pb2.ListSessionsRequest())
+            self.assertEqual(listed.sessions[0].active_stream_count, 0)
+
+            await server.stub.DeleteSession(
+                ai_processor_pb2.DeleteSessionRequest(session_id=created.session_id)
+            )
+            await call.done_writing()
+            self.assertIs(await call.read(), grpc.aio.EOF)
+
+        self.assertEqual(server.sessions.list_summaries(), ())
 
     async def test_create_session_reports_registry_capacity(self):
         async with LoopbackServer(FakeRuntime(), max_sessions=1) as server:

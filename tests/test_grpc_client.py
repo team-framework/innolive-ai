@@ -9,6 +9,7 @@ from typing import Any
 import cv2
 import grpc
 import numpy as np
+from google.protobuf import empty_pb2
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from grpc_client import (
@@ -115,6 +116,13 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             ]
         )
 
+    async def DeleteSession(self, request, context):
+        if request.session_id not in self.sessions:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "session does not exist")
+        self.sessions.remove(request.session_id)
+        self.whitelist_counts.pop(request.session_id, None)
+        return empty_pb2.Empty()
+
     @staticmethod
     def _success(request):
         return ai_processor_pb2.ProcessedVideoChunk(
@@ -193,6 +201,20 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             [item.session_id for item in listed],
             [first.session_id, second.session_id],
         )
+
+    async def test_client_deletes_a_session_and_preserves_rpc_errors(self):
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            created = await client.create_session()
+            await client.for_session(created.session_id).delete()
+            self.assertEqual(await client.list_sessions(), ())
+            with self.assertRaises(VideoRpcError) as missing:
+                await client.delete_session(created.session_id)
+
+        self.assertEqual(missing.exception.method, "DeleteSession")
+        self.assertEqual(missing.exception.code, grpc.StatusCode.NOT_FOUND)
 
     async def test_add_whitelist_sends_session_and_complete_jpeg(self):
         face = _jpeg(42)

@@ -17,6 +17,7 @@ from typing import Any
 
 import grpc
 import numpy as np
+from google.protobuf import empty_pb2
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from protos import ai_processor_pb2 as messages
@@ -36,7 +37,9 @@ from service.grpc_config import listen_address, server_options
 from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
 from service.recognition import (
     RecognitionConfig,
+    SessionInUseError,
     SessionLimitError,
+    SessionNotFoundError,
     SessionRegistry,
     SessionState,
     SessionSummary,
@@ -198,6 +201,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 await self._settle_inference(pending_inference)
             if stream is not None:
                 stream.recognition.close()
+                if stream.session is not None:
+                    self.sessions.release_stream(stream.session)
             if tracker is not None:
                 try:
                     tracker.reset()
@@ -242,7 +247,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         decoded_at = time.perf_counter()
 
         if stream.session is None:
-            stream.session = self.sessions.get_or_create(stream.session_id)
+            stream.session = self.sessions.acquire_stream(stream.session_id)
 
         result, failure = await self._run_inference(request, image, tracker, received_at)
         if failure is not None:
@@ -409,11 +414,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             await context.abort(grpc.StatusCode.INTERNAL, "AdaFace inference failed")
 
         try:
-            session = self.sessions.get_or_create(session_id)
+            entry, entry_count, version = self.sessions.append(session_id, embedding)
         except SessionLimitError as error:
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
-        try:
-            entry, entry_count, version = session.append(embedding)
         except WhitelistLimitError as error:
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
         except ValueError:
@@ -454,6 +457,19 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             sessions=[self._session_info(summary) for summary in self.sessions.list_summaries()]
         )
 
+    async def DeleteSession(self, request, context):
+        try:
+            session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        try:
+            self.sessions.delete(session_id)
+        except SessionNotFoundError as error:
+            await context.abort(grpc.StatusCode.NOT_FOUND, str(error))
+        except SessionInUseError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        return empty_pb2.Empty()
+
     @staticmethod
     def _session_info(summary: SessionSummary) -> messages.SessionInfo:
         return messages.SessionInfo(
@@ -461,6 +477,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             entry_count=summary.entry_count,
             whitelist_version=summary.whitelist_version,
             created_at_unix_ms=summary.created_at_unix_ms,
+            active_stream_count=summary.active_stream_count,
         )
 
     async def close(self) -> None:

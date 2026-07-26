@@ -1,3 +1,4 @@
+from google.protobuf import empty_pb2 as _empty_pb2
 from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
@@ -186,17 +187,25 @@ class ListSessionsRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class DeleteSessionRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
 class SessionInfo(_message.Message):
-    __slots__ = ("session_id", "entry_count", "whitelist_version", "created_at_unix_ms")
+    __slots__ = ("session_id", "entry_count", "whitelist_version", "created_at_unix_ms", "active_stream_count")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
     WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_STREAM_COUNT_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     entry_count: int
     whitelist_version: int
     created_at_unix_ms: int
-    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ..., created_at_unix_ms: _Optional[int] = ...) -> None: ...
+    active_stream_count: int
+    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ..., created_at_unix_ms: _Optional[int] = ..., active_stream_count: _Optional[int] = ...) -> None: ...
 
 class ListSessionsResponse(_message.Message):
     __slots__ = ("sessions",)

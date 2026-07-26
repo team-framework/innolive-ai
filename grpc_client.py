@@ -113,6 +113,9 @@ class VideoSession:
             timeout=timeout,
         )
 
+    async def delete(self, *, timeout: float = 2.0) -> None:
+        await self._client.delete_session(self.session_id, timeout=timeout)
+
     def process_video(
         self,
         frames: FrameSource,
@@ -306,6 +309,25 @@ class VideoProcessorClient:
         if len(session_ids) != len(set(session_ids)):
             raise VideoProtocolError("ListSessions returned duplicate session IDs")
         return tuple(response.sessions)
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        timeout: float = 2.0,
+    ) -> None:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        session_id = validate_session_id(session_id)
+        try:
+            await self._stub.DeleteSession(
+                ai_processor_pb2.DeleteSessionRequest(session_id=session_id),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError("DeleteSession", error.code(), error.details()) from error
 
     async def add_whitelist_many(
         self,
