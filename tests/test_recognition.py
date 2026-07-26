@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -101,6 +102,31 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((len(missing.entries), missing.version), (0, 0))
         self.assertEqual(created.snapshot().version, 0)
+
+    async def test_generated_sessions_are_unique_and_listed_with_manual_sessions(self):
+        sessions = SessionRegistry(max_sessions=40)
+        manual = sessions.get_or_create("manual-session")
+        manual.append(np.asarray([1.0, 0.0]))
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            generated = list(executor.map(lambda _: sessions.create(), range(32)))
+
+        generated_ids = {summary.session_id for summary in generated}
+        self.assertEqual(len(generated_ids), 32)
+        self.assertTrue(all(value.startswith("session-") for value in generated_ids))
+        listed = {summary.session_id: summary for summary in sessions.list_summaries()}
+        self.assertEqual(set(listed), {"manual-session", *generated_ids})
+        self.assertEqual(
+            (listed["manual-session"].entry_count, listed["manual-session"].whitelist_version),
+            (1, 1),
+        )
+
+    async def test_generated_session_obeys_the_registry_limit(self):
+        sessions = SessionRegistry(max_sessions=1)
+        sessions.create()
+
+        with self.assertRaises(SessionLimitError):
+            sessions.create()
 
     async def test_same_session_streams_share_only_the_whitelist(self):
         session = SessionRegistry().get_or_create("shared")

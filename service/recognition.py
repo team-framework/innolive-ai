@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -42,9 +43,19 @@ class WhitelistSnapshot:
     version: int
 
 
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    session_id: str
+    entry_count: int
+    whitelist_version: int
+    created_at_unix_ms: int
+
+
 class SessionState:
-    def __init__(self, max_entries: int) -> None:
+    def __init__(self, session_id: str, max_entries: int) -> None:
+        self.session_id = session_id
         self.max_entries = max_entries
+        self.created_at_unix_ms = time.time_ns() // 1_000_000
         self._entries: tuple[WhitelistEntry, ...] = ()
         self._version = 0
         self._lock = threading.Lock()
@@ -65,6 +76,15 @@ class SessionState:
             self._version += 1
             return entry, len(self._entries), self._version
 
+    def summary(self) -> SessionSummary:
+        with self._lock:
+            return SessionSummary(
+                session_id=self.session_id,
+                entry_count=len(self._entries),
+                whitelist_version=self._version,
+                created_at_unix_ms=self.created_at_unix_ms,
+            )
+
 
 class SessionRegistry:
     def __init__(self, *, max_sessions: int = 1_024, max_entries_per_session: int = 32):
@@ -83,11 +103,38 @@ class SessionRegistry:
             existing = self._sessions.get(validated)
             if existing is not None:
                 return existing
-            if len(self._sessions) >= self.max_sessions:
-                raise SessionLimitError(f"session registry is limited to {self.max_sessions}")
-            created = SessionState(self.max_entries_per_session)
+            self._ensure_capacity_locked()
+            created = SessionState(validated, self.max_entries_per_session)
             self._sessions[validated] = created
             return created
+
+    def create(self) -> SessionSummary:
+        with self._lock:
+            self._ensure_capacity_locked()
+            while True:
+                session_id = f"session-{uuid.uuid4().hex}"
+                if session_id not in self._sessions:
+                    break
+            session = SessionState(session_id, self.max_entries_per_session)
+            self._sessions[session_id] = session
+            return SessionSummary(
+                session_id=session_id,
+                entry_count=0,
+                whitelist_version=0,
+                created_at_unix_ms=session.created_at_unix_ms,
+            )
+
+    def list_summaries(self) -> tuple[SessionSummary, ...]:
+        with self._lock:
+            sessions = tuple(self._sessions.values())
+        summaries = (session.summary() for session in sessions)
+        return tuple(
+            sorted(
+                summaries,
+                key=lambda item: (item.created_at_unix_ms, item.session_id),
+                reverse=True,
+            )
+        )
 
     def snapshot(self, session_id: str) -> WhitelistSnapshot:
         validated = validate_session_id(session_id)
@@ -96,6 +143,10 @@ class SessionRegistry:
         if session is None:
             return WhitelistSnapshot((), 0)
         return session.snapshot()
+
+    def _ensure_capacity_locked(self) -> None:
+        if len(self._sessions) >= self.max_sessions:
+            raise SessionLimitError(f"session registry is limited to {self.max_sessions}")
 
 
 @dataclass(frozen=True, slots=True)

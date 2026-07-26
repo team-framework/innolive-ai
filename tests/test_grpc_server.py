@@ -32,6 +32,16 @@ def _jpeg(width: int = 64, height: int = 36) -> bytes:
     return payload.tobytes()
 
 
+def _image(extension: str, width: int = 64, height: int = 36) -> bytes:
+    encoded, payload = cv2.imencode(
+        extension,
+        np.zeros((height, width, 3), dtype=np.uint8),
+    )
+    if not encoded:
+        raise RuntimeError(f"test {extension} encoding failed")
+    return payload.tobytes()
+
+
 def _request(
     *,
     data: bytes | None = None,
@@ -172,11 +182,12 @@ class LoopbackServer:
         *,
         inference_timeout_seconds: float = 1.5,
         adaface: FakeAdaFace | None = None,
+        max_sessions: int = 1_024,
     ):
         self.runtime = runtime
         self.inference_timeout_seconds = inference_timeout_seconds
         self.adaface = adaface
-        self.sessions = SessionRegistry()
+        self.sessions = SessionRegistry(max_sessions=max_sessions)
         self.trackers: list[FakeTracker] = []
         self.bundle = None
         self.channel = None
@@ -224,6 +235,13 @@ class LoopbackServer:
 
 
 class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_registry_size_is_bounded_for_unpaginated_listing(self):
+        with self.assertRaisesRegex(ValueError, "1..1024"):
+            GrpcServerSettings(
+                runtime=RuntimeConfig(engine=Path("unused.engine")),
+                max_sessions=1_025,
+            )
+
     async def test_process_cannot_silently_share_an_existing_port(self):
         runtime = FakeRuntime()
         async with LoopbackServer(runtime) as server:
@@ -305,6 +323,33 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(responses[1].status_message, "success")
         self.assertEqual(responses[1].frame_id, 2)
         self.assertEqual(len(runtime.calls), 1)
+
+    async def test_process_video_keeps_the_jpeg_only_contract(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime) as server:
+            response = await server.stub.ProcessVideo(
+                _requests(_request(data=_image(".png"), frame_id=1))
+            ).read()
+            sessions = server.sessions.list_summaries()
+
+        self.assertEqual(response.error_code, "DECODE_FAILED")
+        self.assertEqual(runtime.calls, [])
+        self.assertEqual(sessions, ())
+
+    async def test_rejected_first_frame_does_not_consume_a_session_slot(self):
+        for request in (
+            _request(data=b"not-a-jpeg", session_id="invalid-image"),
+            _request(batch_size=2, session_id="invalid-batch"),
+        ):
+            with self.subTest(session_id=request.session_id):
+                async with LoopbackServer(FakeRuntime(), max_sessions=1) as server:
+                    rejected = await server.stub.ProcessVideo(_requests(request)).read()
+                    accepted = await server.stub.ProcessVideo(
+                        _requests(_request(session_id="valid-session"))
+                    ).read()
+
+                self.assertEqual(rejected.status_message, "failed")
+                self.assertEqual(accepted.status_message, "success")
 
     async def test_batch_size_greater_than_one_is_rejected(self):
         runtime = FakeRuntime()
@@ -427,6 +472,54 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((status_b.entry_count, status_b.whitelist_version), (1, 1))
         self.assertEqual((missing.entry_count, missing.whitelist_version), (0, 0))
         self.assertEqual(adaface.calls, 3)
+
+    async def test_add_whitelist_accepts_png_and_webp(self):
+        adaface = FakeAdaFace()
+        async with LoopbackServer(FakeRuntime(), adaface=adaface) as server:
+            responses = await asyncio.gather(
+                *(
+                    server.stub.AddWhitelist(
+                        ai_processor_pb2.FaceData(
+                            data=_image(extension),
+                            session_id="image-session",
+                        )
+                    )
+                    for extension in (".png", ".webp")
+                )
+            )
+
+        self.assertEqual({response.entry_count for response in responses}, {1, 2})
+        self.assertEqual(adaface.calls, 2)
+
+    async def test_create_and_list_sessions_are_atomic_and_session_scoped(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            created = await asyncio.gather(
+                *(
+                    server.stub.CreateSession(ai_processor_pb2.CreateSessionRequest())
+                    for _ in range(20)
+                )
+            )
+            first_id = created[0].session_id
+            server.sessions.get_or_create(first_id).append(np.asarray([1.0, 0.0]))
+            listed = await server.stub.ListSessions(ai_processor_pb2.ListSessionsRequest())
+
+        session_ids = [item.session_id for item in created]
+        self.assertEqual(len(session_ids), len(set(session_ids)))
+        summaries = {item.session_id: item for item in listed.sessions}
+        self.assertEqual(set(summaries), set(session_ids))
+        self.assertEqual(
+            (summaries[first_id].entry_count, summaries[first_id].whitelist_version),
+            (1, 1),
+        )
+        self.assertTrue(all(item.created_at_unix_ms > 0 for item in listed.sessions))
+
+    async def test_create_session_reports_registry_capacity(self):
+        async with LoopbackServer(FakeRuntime(), max_sessions=1) as server:
+            await server.stub.CreateSession(ai_processor_pb2.CreateSessionRequest())
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await server.stub.CreateSession(ai_processor_pb2.CreateSessionRequest())
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
 
     async def test_whitelist_status_rejects_an_empty_session(self):
         async with LoopbackServer(FakeRuntime()) as server:

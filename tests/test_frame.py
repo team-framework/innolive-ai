@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import zlib
 from unittest.mock import patch
 
-from service.frame import FrameLimits, decode_jpeg
+import cv2
+import numpy as np
+
+from service.frame import FrameLimits, decode_image, decode_jpeg
 
 
 def _jpeg_header(width: int, height: int) -> bytes:
@@ -21,7 +25,82 @@ def _jpeg_header(width: int, height: int) -> bytes:
     )
 
 
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return b"".join(
+        (
+            len(payload).to_bytes(4, "big"),
+            chunk_type,
+            payload,
+            checksum.to_bytes(4, "big"),
+        )
+    )
+
+
+def _png_header(width: int, height: int, *extra_chunks: bytes) -> bytes:
+    header = b"".join(
+        (
+            width.to_bytes(4, "big"),
+            height.to_bytes(4, "big"),
+            b"\x08\x02\x00\x00\x00",
+        )
+    )
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            _png_chunk(b"IHDR", header),
+            *extra_chunks,
+            _png_chunk(b"IEND", b""),
+        )
+    )
+
+
 class FrameBoundaryTests(unittest.TestCase):
+    def test_enrollment_decoder_accepts_png_and_webp(self):
+        image = np.zeros((48, 64, 3), dtype=np.uint8)
+        for extension in (".png", ".webp"):
+            with self.subTest(extension=extension):
+                success, encoded = cv2.imencode(extension, image)
+                self.assertTrue(success)
+                decoded = decode_image(encoded.tobytes())
+                self.assertEqual(decoded.shape, image.shape)
+
+    def test_png_dimensions_are_rejected_before_decode(self):
+        oversized = _png_header(641, 640)
+        with (
+            patch("service.frame.cv2.imdecode") as decoder,
+            self.assertRaisesRegex(ValueError, "long-edge 640"),
+        ):
+            decode_image(oversized)
+
+        decoder.assert_not_called()
+
+    def test_animated_png_and_webp_are_rejected_before_decode(self):
+        animated_png = _png_header(64, 48, _png_chunk(b"acTL", b"\x00" * 8))
+        vp8x = bytes((0x02, 0, 0, 0, 63, 0, 0, 47, 0, 0))
+        webp_body = b"WEBP" + b"VP8X" + len(vp8x).to_bytes(4, "little") + vp8x
+        animated_webp = b"RIFF" + len(webp_body).to_bytes(4, "little") + webp_body
+
+        for image in (animated_png, animated_webp):
+            with (
+                self.subTest(magic=image[:12]),
+                patch("service.frame.cv2.imdecode") as decoder,
+                self.assertRaisesRegex(ValueError, "animated"),
+            ):
+                decode_image(image)
+            decoder.assert_not_called()
+
+    def test_png_alpha_and_grayscale_are_normalized_to_three_channels(self):
+        for image in (
+            np.zeros((48, 64), dtype=np.uint8),
+            np.zeros((48, 64, 4), dtype=np.uint8),
+        ):
+            with self.subTest(shape=image.shape):
+                success, encoded = cv2.imencode(".png", image)
+                self.assertTrue(success)
+                decoded = decode_image(encoded.tobytes())
+                self.assertEqual(decoded.shape, (48, 64, 3))
+
     def test_declared_oversized_dimensions_are_rejected_before_decode(self):
         with (
             patch("service.frame.cv2.imdecode") as decoder,
