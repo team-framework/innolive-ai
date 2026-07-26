@@ -32,12 +32,23 @@ def _jpeg(value: int) -> bytes:
     return payload.tobytes()
 
 
+def _image(extension: str, value: int) -> bytes:
+    encoded, payload = cv2.imencode(
+        extension,
+        np.full((32, 48, 3), value, dtype=np.uint8),
+    )
+    if not encoded:
+        raise RuntimeError(f"test {extension} encoding failed")
+    return payload.tobytes()
+
+
 class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
     def __init__(self, mode: str = "success") -> None:
         self.mode = mode
         self.requests: list[Any] = []
         self.whitelist_requests: list[Any] = []
         self.whitelist_counts: dict[str, int] = {}
+        self.sessions: list[str] = []
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator[Any]:
         if self.mode == "early_eof":
@@ -77,6 +88,31 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             session_id=request.session_id,
             entry_count=count,
             whitelist_version=count,
+        )
+
+    async def CreateSession(self, request, context):
+        del request
+        del context
+        session_id = f"session-generated-{len(self.sessions) + 1}"
+        self.sessions.append(session_id)
+        return ai_processor_pb2.SessionInfo(
+            session_id=session_id,
+            created_at_unix_ms=len(self.sessions),
+        )
+
+    async def ListSessions(self, request, context):
+        del request
+        del context
+        return ai_processor_pb2.ListSessionsResponse(
+            sessions=[
+                ai_processor_pb2.SessionInfo(
+                    session_id=session_id,
+                    entry_count=self.whitelist_counts.get(session_id, 0),
+                    whitelist_version=self.whitelist_counts.get(session_id, 0),
+                    created_at_unix_ms=index,
+                )
+                for index, session_id in enumerate(self.sessions, start=1)
+            ]
         )
 
     @staticmethod
@@ -141,6 +177,23 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(await client.is_serving())
 
+    async def test_client_creates_and_lists_server_generated_sessions(self):
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            first, second = await asyncio.gather(
+                client.create_session(),
+                client.create_session(),
+            )
+            listed = await client.list_sessions()
+
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertCountEqual(
+            [item.session_id for item in listed],
+            [first.session_id, second.session_id],
+        )
+
     async def test_add_whitelist_sends_session_and_complete_jpeg(self):
         face = _jpeg(42)
         async with (
@@ -157,6 +210,23 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         request = loopback.servicer.whitelist_requests[0]
         self.assertEqual(request.session_id, "client-session")
         self.assertEqual(request.data, face)
+
+    async def test_add_whitelist_accepts_png_and_webp(self):
+        images = [_image(".png", 20), _image(".webp", 30)]
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            responses = await client.add_whitelist_many(
+                images,
+                session_id="image-session",
+            )
+
+        self.assertEqual([response.entry_count for response in responses], [1, 2])
+        self.assertEqual(
+            [request.data for request in loopback.servicer.whitelist_requests],
+            images,
+        )
 
     async def test_session_bound_client_hides_repeated_session_arguments(self):
         face = _jpeg(42)

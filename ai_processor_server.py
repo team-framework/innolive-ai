@@ -31,13 +31,15 @@ from service.adaface_model import (
     FaceCountError,
     FaceTooSmallError,
 )
-from service.frame import FrameLimits, decode_jpeg
+from service.frame import FrameLimits, decode_image, decode_jpeg
 from service.grpc_config import listen_address, server_options
 from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
 from service.recognition import (
     RecognitionConfig,
     SessionLimitError,
     SessionRegistry,
+    SessionState,
+    SessionSummary,
     StreamRecognition,
     WhitelistLimitError,
     validate_session_id,
@@ -58,6 +60,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
 SERVICE_NAME = "AiProcessor"
 PROFILE = "B1-640-Q90-W5"
+MAX_SESSIONS = 1_024
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +71,7 @@ class GrpcServerSettings:
     tracker_config: Path = DEFAULT_TRACKER
     host: str = "127.0.0.1"
     port: int = 50_051
-    max_sessions: int = 1_024
+    max_sessions: int = MAX_SESSIONS
     max_whitelist_entries: int = 32
     max_jpeg_bytes: int = MAX_JPEG_BYTES
     inference_timeout_seconds: float = 1.5
@@ -81,8 +84,8 @@ class GrpcServerSettings:
             raise ValueError("host must not be empty")
         if not 0 <= self.port <= 65_535:
             raise ValueError("port must be between 0 and 65535")
-        if self.max_sessions < 1:
-            raise ValueError("max_sessions must be at least one")
+        if not 1 <= self.max_sessions <= MAX_SESSIONS:
+            raise ValueError(f"max_sessions must be in 1..{MAX_SESSIONS}")
         if self.max_whitelist_entries < 1:
             raise ValueError("max_whitelist_entries must be at least one")
         if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
@@ -100,6 +103,13 @@ class FrameOutcome:
     response: Any
     fatal: bool = False
     pending_inference: asyncio.Task | None = None
+
+
+@dataclass(slots=True)
+class StreamState:
+    session_id: str
+    recognition: StreamRecognition
+    session: SessionState | None = None
 
 
 class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
@@ -132,9 +142,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.active_streams += 1
 
         tracker = None
-        recognition = None
-        session = None
-        stream_session_id: str | None = None
+        stream = None
         frame_sequence = 0
         pending_inference: asyncio.Task | None = None
         try:
@@ -156,30 +164,30 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     request_session_id = validate_session_id(request.session_id)
                 except ValueError as error:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-                if stream_session_id is None:
-                    stream_session_id = request_session_id
-                    try:
-                        session = self.sessions.get_or_create(stream_session_id)
-                    except SessionLimitError as error:
-                        await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
-                    recognition = StreamRecognition(
-                        self.adaface,
-                        self.settings.recognition,
-                        owner=stream_session_id,
+                if stream is None:
+                    stream = StreamState(
+                        session_id=request_session_id,
+                        recognition=StreamRecognition(
+                            self.adaface,
+                            self.settings.recognition,
+                            owner=request_session_id,
+                        ),
                     )
-                elif request_session_id != stream_session_id:
+                elif request_session_id != stream.session_id:
                     await context.abort(
                         grpc.StatusCode.INVALID_ARGUMENT,
                         "session_id cannot change within a ProcessVideo stream",
                     )
                 frame_sequence += 1
-                outcome = await self._process_request(
-                    request,
-                    tracker,
-                    session,
-                    recognition,
-                    frame_sequence,
-                )
+                try:
+                    outcome = await self._process_request(
+                        request,
+                        tracker,
+                        stream,
+                        frame_sequence,
+                    )
+                except SessionLimitError as error:
+                    await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
                 pending_inference = outcome.pending_inference
                 yield outcome.response
                 if outcome.fatal:
@@ -188,8 +196,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         finally:
             if pending_inference is not None:
                 await self._settle_inference(pending_inference)
-            if recognition is not None:
-                recognition.close()
+            if stream is not None:
+                stream.recognition.close()
             if tracker is not None:
                 try:
                     tracker.reset()
@@ -201,8 +209,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self,
         request: Any,
         tracker: Any,
-        session: Any,
-        recognition: StreamRecognition,
+        stream: StreamState,
         frame_sequence: int,
     ) -> FrameOutcome:
         received_at = time.perf_counter()
@@ -234,6 +241,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             )
         decoded_at = time.perf_counter()
 
+        if stream.session is None:
+            stream.session = self.sessions.get_or_create(stream.session_id)
+
         result, failure = await self._run_inference(request, image, tracker, received_at)
         if failure is not None:
             return failure
@@ -242,10 +252,10 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             if not isinstance(objects, list) or len(objects) > 100:
                 raise ValueError("runtime objects exceed the response contract")
             result.update(
-                recognition.process(
+                stream.recognition.process(
                     image,
                     objects,
-                    session.snapshot(),
+                    stream.session.snapshot(),
                     frame_sequence,
                 )
             )
@@ -370,14 +380,14 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             )
         try:
             image = await asyncio.to_thread(
-                decode_jpeg,
+                decode_image,
                 bytes(request.data),
                 self.frame_limits,
             )
         except (TypeError, ValueError):
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "face image could not be decoded within the server limits",
+                "face image must be a bounded JPEG, PNG, or WebP image",
             )
 
         future = self.adaface.submit(image, owner=session_id)
@@ -427,6 +437,30 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             session_id=session_id,
             entry_count=len(snapshot.entries),
             whitelist_version=snapshot.version,
+        )
+
+    async def CreateSession(self, request, context):
+        del request
+        try:
+            summary = self.sessions.create()
+        except SessionLimitError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+        return self._session_info(summary)
+
+    async def ListSessions(self, request, context):
+        del request
+        del context
+        return messages.ListSessionsResponse(
+            sessions=[self._session_info(summary) for summary in self.sessions.list_summaries()]
+        )
+
+    @staticmethod
+    def _session_info(summary: SessionSummary) -> messages.SessionInfo:
+        return messages.SessionInfo(
+            session_id=summary.session_id,
+            entry_count=summary.entry_count,
+            whitelist_version=summary.whitelist_version,
+            created_at_unix_ms=summary.created_at_unix_ms,
         )
 
     async def close(self) -> None:

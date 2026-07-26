@@ -132,6 +132,23 @@ class GrpcSchemaContractTests(unittest.TestCase):
             },
             {"session_id": 1, "entry_count": 2, "whitelist_version": 3},
         )
+        for method_name in ("CreateSession", "ListSessions"):
+            method = service.methods_by_name[method_name]
+            self.assertFalse(method.client_streaming)
+            self.assertFalse(method.server_streaming)
+        self.assertEqual(
+            {field.name: field.number for field in ai_processor_pb2.SessionInfo.DESCRIPTOR.fields},
+            {
+                "session_id": 1,
+                "entry_count": 2,
+                "whitelist_version": 3,
+                "created_at_unix_ms": 4,
+            },
+        )
+        self.assertEqual(
+            ai_processor_pb2.ListSessionsResponse.DESCRIPTOR.fields_by_name["sessions"].number,
+            1,
+        )
 
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()

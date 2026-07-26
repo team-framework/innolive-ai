@@ -8,6 +8,10 @@ service AiProcessor {
   rpc AddWhitelist(FaceData) returns (WhitelistResponse);
   // Returns non-sensitive whitelist metadata for one session.
   rpc GetWhitelistStatus(GetWhitelistStatusRequest) returns (GetWhitelistStatusResponse);
+  // Atomically creates an opaque session ID.
+  rpc CreateSession(CreateSessionRequest) returns (SessionInfo);
+  // Lists bounded in-memory sessions for a trusted management client.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
 }
 
 message VideoChunk {
@@ -93,7 +97,7 @@ message FrameStats {
 
 message FaceData {
   // Legacy message name retained for RPC path and generated-client compatibility.
-  // Contains one complete JPEG with exactly one detectable face.
+  // Contains one complete JPEG, PNG, or WebP image with exactly one detectable face.
   bytes data = 1;
   string session_id = 2;
 }
@@ -115,4 +119,19 @@ message GetWhitelistStatusResponse {
   string session_id = 1;
   uint32 entry_count = 2;
   uint64 whitelist_version = 3;
+}
+
+message CreateSessionRequest {}
+
+message ListSessionsRequest {}
+
+message SessionInfo {
+  string session_id = 1;
+  uint32 entry_count = 2;
+  uint64 whitelist_version = 3;
+  int64 created_at_unix_ms = 4;
+}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
 }

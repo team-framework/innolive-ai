@@ -177,3 +177,29 @@ class GetWhitelistStatusResponse(_message.Message):
     entry_count: int
     whitelist_version: int
     def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ...) -> None: ...
+
+class CreateSessionRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ListSessionsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SessionInfo(_message.Message):
+    __slots__ = ("session_id", "entry_count", "whitelist_version", "created_at_unix_ms")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    entry_count: int
+    whitelist_version: int
+    created_at_unix_ms: int
+    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ..., created_at_unix_ms: _Optional[int] = ...) -> None: ...
+
+class ListSessionsResponse(_message.Message):
+    __slots__ = ("sessions",)
+    SESSIONS_FIELD_NUMBER: _ClassVar[int]
+    sessions: _containers.RepeatedCompositeFieldContainer[SessionInfo]
+    def __init__(self, sessions: _Optional[_Iterable[_Union[SessionInfo, _Mapping]]] = ...) -> None: ...

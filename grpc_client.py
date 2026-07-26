@@ -69,6 +69,7 @@ class VideoResult:
 
 FrameSource = Iterable[VideoFrame] | AsyncIterable[VideoFrame]
 JpegSource = Iterable[bytes] | AsyncIterable[bytes]
+ImageSource = Iterable[bytes] | AsyncIterable[bytes]
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -92,7 +93,7 @@ class VideoSession:
 
     async def add_whitelist_many(
         self,
-        images: JpegSource,
+        images: ImageSource,
         *,
         timeout: float = 10.0,
     ) -> list[ai_processor_pb2.WhitelistResponse]:
@@ -257,24 +258,64 @@ class VideoProcessorClient:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         session_id = validate_session_id(session_id)
-        jpeg = _validate_jpeg(image)
+        encoded = _validate_image(image)
         try:
             return await self._stub.AddWhitelist(
-                ai_processor_pb2.FaceData(data=jpeg, session_id=session_id),
+                ai_processor_pb2.FaceData(data=encoded, session_id=session_id),
                 timeout=timeout,
             )
         except grpc.aio.AioRpcError as error:
             raise VideoRpcError("AddWhitelist", error.code(), error.details()) from error
 
+    async def create_session(
+        self,
+        *,
+        timeout: float = 2.0,
+    ) -> ai_processor_pb2.SessionInfo:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        try:
+            response = await self._stub.CreateSession(
+                ai_processor_pb2.CreateSessionRequest(),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError("CreateSession", error.code(), error.details()) from error
+        validate_session_id(response.session_id)
+        return response
+
+    async def list_sessions(
+        self,
+        *,
+        timeout: float = 2.0,
+    ) -> tuple[ai_processor_pb2.SessionInfo, ...]:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        try:
+            response = await self._stub.ListSessions(
+                ai_processor_pb2.ListSessionsRequest(),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError("ListSessions", error.code(), error.details()) from error
+        session_ids = [validate_session_id(item.session_id) for item in response.sessions]
+        if len(session_ids) != len(set(session_ids)):
+            raise VideoProtocolError("ListSessions returned duplicate session IDs")
+        return tuple(response.sessions)
+
     async def add_whitelist_many(
         self,
-        images: JpegSource,
+        images: ImageSource,
         *,
         session_id: str,
         timeout: float = 10.0,
     ) -> list[ai_processor_pb2.WhitelistResponse]:
         responses = []
-        async for image in _iterate_jpegs(images):
+        async for image in _iterate_bytes(images, label="images"):
             responses.append(
                 await self.add_whitelist(
                     image,
@@ -448,7 +489,7 @@ class VideoProcessorClient:
 
         async def frames() -> AsyncIterator[VideoFrame]:
             frame_id = start_frame_id
-            async for jpeg in _iterate_jpegs(jpegs):
+            async for jpeg in _iterate_bytes(jpegs, label="JPEGs"):
                 if frame_id > MAX_FRAME_ID:
                     raise ValueError("frame_id wrapped; open a new ProcessVideo stream")
                 yield VideoFrame(
@@ -579,15 +620,19 @@ async def _iterate_frames(frames: FrameSource) -> AsyncIterator[VideoFrame]:
                 close()
 
 
-async def _iterate_jpegs(jpegs: JpegSource) -> AsyncIterator[bytes]:
-    if isinstance(jpegs, AsyncIterable):
-        async for jpeg in jpegs:
-            yield jpeg
+async def _iterate_bytes(
+    source: Iterable[bytes] | AsyncIterable[bytes],
+    *,
+    label: str,
+) -> AsyncIterator[bytes]:
+    if isinstance(source, AsyncIterable):
+        async for payload in source:
+            yield payload
         return
-    if not isinstance(jpegs, Iterable):
-        raise TypeError("jpegs must be an iterable or async iterable")
-    for jpeg in jpegs:
-        yield jpeg
+    if not isinstance(source, Iterable):
+        raise TypeError(f"{label} must be an iterable or async iterable")
+    for payload in source:
+        yield payload
 
 
 def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
@@ -614,6 +659,24 @@ def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:
     if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
         raise ValueError("value must contain one complete JPEG")
     return jpeg
+
+
+def _validate_image(value: bytes | bytearray | memoryview) -> bytes:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("image must be bytes-like")
+    encoded = value if isinstance(value, bytes) else bytes(value)
+    if not encoded:
+        raise ValueError("image must not be empty")
+    if len(encoded) > MAX_JPEG_BYTES:
+        raise ValueError(f"image exceeds the {MAX_JPEG_BYTES} byte limit")
+    supported = (
+        encoded.startswith(b"\xff\xd8"),
+        encoded.startswith(b"\x89PNG\r\n\x1a\n"),
+        encoded.startswith(b"RIFF") and encoded[8:12] == b"WEBP",
+    )
+    if not any(supported):
+        raise ValueError("image must contain JPEG, PNG, or WebP data")
+    return encoded
 
 
 def _response_status(response: Any) -> tuple[str, str]:

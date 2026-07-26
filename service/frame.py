@@ -1,7 +1,8 @@
-"""Transport-neutral JPEG boundary validation for B1-640 frames."""
+"""Bounded image decoding for video frames and face enrollment."""
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 
 import cv2
@@ -77,6 +78,121 @@ def decode_jpeg(jpeg: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> np.n
     height, width = image.shape[:2]
     _validate_dimensions(width, height, limits)
     return image
+
+
+def decode_image(encoded: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> np.ndarray:
+    """Decode one bounded JPEG, PNG, or WebP enrollment image."""
+
+    if encoded.startswith(b"\xff\xd8"):
+        return decode_jpeg(encoded, limits)
+    if not encoded:
+        raise ValueError("encoded image must not be empty")
+    if len(encoded) > limits.max_jpeg_bytes:
+        raise ValueError(f"encoded image exceeds {limits.max_jpeg_bytes} byte limit")
+
+    width, height = _non_jpeg_dimensions(encoded)
+    _validate_dimensions(width, height, limits)
+    try:
+        image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except cv2.error as error:
+        raise ValueError("encoded image could not be decoded") from error
+    if image is None:
+        raise ValueError("encoded image could not be decoded")
+    decoded_height, decoded_width = image.shape[:2]
+    _validate_dimensions(decoded_width, decoded_height, limits)
+    return image
+
+
+def _non_jpeg_dimensions(encoded: bytes) -> tuple[int, int]:
+    if encoded.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _png_dimensions(encoded)
+    if encoded.startswith(b"RIFF") and encoded[8:12] == b"WEBP":
+        return _webp_dimensions(encoded)
+    raise ValueError("unsupported image format; expected JPEG, PNG, or WebP")
+
+
+def _png_dimensions(encoded: bytes) -> tuple[int, int]:
+    offset = 8
+    dimensions = None
+    while offset + 12 <= len(encoded):
+        chunk_size = int.from_bytes(encoded[offset : offset + 4], "big")
+        chunk_type = encoded[offset + 4 : offset + 8]
+        payload_start = offset + 8
+        payload_end = payload_start + chunk_size
+        chunk_end = payload_end + 4
+        if chunk_end > len(encoded):
+            raise ValueError("encoded image contains a truncated PNG chunk")
+        expected_crc = int.from_bytes(encoded[payload_end:chunk_end], "big")
+        actual_crc = zlib.crc32(encoded[offset + 4 : payload_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise ValueError("encoded image contains an invalid PNG checksum")
+        if dimensions is None:
+            if chunk_type != b"IHDR" or chunk_size != 13:
+                raise ValueError("encoded image contains an invalid PNG header")
+            dimensions = (
+                int.from_bytes(encoded[payload_start : payload_start + 4], "big"),
+                int.from_bytes(encoded[payload_start + 4 : payload_start + 8], "big"),
+            )
+        elif chunk_type == b"IHDR":
+            raise ValueError("encoded image contains more than one PNG header")
+        if chunk_type == b"acTL":
+            raise ValueError("animated PNG is not supported for face enrollment")
+        if chunk_type == b"IEND":
+            if chunk_size != 0 or chunk_end != len(encoded):
+                raise ValueError("encoded image contains an invalid PNG ending")
+            if dimensions is None:
+                raise ValueError("encoded image contains no PNG header")
+            return dimensions
+        offset = chunk_end
+    raise ValueError("encoded image contains no complete PNG image")
+
+
+def _webp_dimensions(encoded: bytes) -> tuple[int, int]:
+    if len(encoded) < 20 or int.from_bytes(encoded[4:8], "little") + 8 != len(encoded):
+        raise ValueError("encoded image contains an invalid WebP container")
+    offset = 12
+    canvas_dimensions = None
+    frame_dimensions = None
+    while offset + 8 <= len(encoded):
+        chunk_type = encoded[offset : offset + 4]
+        chunk_size = int.from_bytes(encoded[offset + 4 : offset + 8], "little")
+        payload_start = offset + 8
+        payload_end = payload_start + chunk_size
+        padded_end = payload_end + (chunk_size & 1)
+        if padded_end > len(encoded):
+            raise ValueError("encoded image contains a truncated WebP chunk")
+        payload = encoded[payload_start:payload_end]
+        if chunk_type == b"VP8X":
+            if len(payload) != 10 or canvas_dimensions is not None:
+                raise ValueError("encoded image contains an invalid WebP canvas")
+            if payload[0] & 0x02:
+                raise ValueError("animated WebP is not supported for face enrollment")
+            canvas_dimensions = (
+                1 + int.from_bytes(payload[4:7], "little"),
+                1 + int.from_bytes(payload[7:10], "little"),
+            )
+        elif chunk_type in (b"ANIM", b"ANMF"):
+            raise ValueError("animated WebP is not supported for face enrollment")
+        elif chunk_type == b"VP8L" and len(payload) >= 5 and payload[0] == 0x2F:
+            bits = int.from_bytes(payload[1:5], "little")
+            dimensions = (1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF))
+            if frame_dimensions is not None:
+                raise ValueError("encoded image contains more than one WebP frame")
+            frame_dimensions = dimensions
+        elif chunk_type == b"VP8 " and len(payload) >= 10 and payload[3:6] == b"\x9d\x01\x2a":
+            dimensions = (
+                int.from_bytes(payload[6:8], "little") & 0x3FFF,
+                int.from_bytes(payload[8:10], "little") & 0x3FFF,
+            )
+            if frame_dimensions is not None:
+                raise ValueError("encoded image contains more than one WebP frame")
+            frame_dimensions = dimensions
+        offset = padded_end
+    if offset != len(encoded) or frame_dimensions is None:
+        raise ValueError("encoded image contains no complete WebP frame")
+    if canvas_dimensions is not None and canvas_dimensions != frame_dimensions:
+        raise ValueError("WebP canvas dimensions do not match its frame")
+    return frame_dimensions
 
 
 def _validate_dimensions(width: int, height: int, limits: FrameLimits) -> None:

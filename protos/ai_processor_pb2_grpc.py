@@ -50,6 +50,16 @@ class AiProcessorStub:
                 request_serializer=protos_dot_ai__processor__pb2.GetWhitelistStatusRequest.SerializeToString,
                 response_deserializer=protos_dot_ai__processor__pb2.GetWhitelistStatusResponse.FromString,
                 _registered_method=True)
+        self.CreateSession = channel.unary_unary(
+                '/AiProcessor/CreateSession',
+                request_serializer=protos_dot_ai__processor__pb2.CreateSessionRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.SessionInfo.FromString,
+                _registered_method=True)
+        self.ListSessions = channel.unary_unary(
+                '/AiProcessor/ListSessions',
+                request_serializer=protos_dot_ai__processor__pb2.ListSessionsRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.ListSessionsResponse.FromString,
+                _registered_method=True)
 
 
 class AiProcessorServicer:
@@ -77,6 +87,20 @@ class AiProcessorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CreateSession(self, request, context):
+        """Atomically creates an opaque session ID.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListSessions(self, request, context):
+        """Lists in-memory sessions for the authenticated management client.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AiProcessorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -94,6 +118,16 @@ def add_AiProcessorServicer_to_server(servicer, server):
                     servicer.GetWhitelistStatus,
                     request_deserializer=protos_dot_ai__processor__pb2.GetWhitelistStatusRequest.FromString,
                     response_serializer=protos_dot_ai__processor__pb2.GetWhitelistStatusResponse.SerializeToString,
+            ),
+            'CreateSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateSession,
+                    request_deserializer=protos_dot_ai__processor__pb2.CreateSessionRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.SessionInfo.SerializeToString,
+            ),
+            'ListSessions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSessions,
+                    request_deserializer=protos_dot_ai__processor__pb2.ListSessionsRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.ListSessionsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -178,6 +212,60 @@ class AiProcessor:
             '/AiProcessor/GetWhitelistStatus',
             protos_dot_ai__processor__pb2.GetWhitelistStatusRequest.SerializeToString,
             protos_dot_ai__processor__pb2.GetWhitelistStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/CreateSession',
+            protos_dot_ai__processor__pb2.CreateSessionRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.SessionInfo.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSessions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/ListSessions',
+            protos_dot_ai__processor__pb2.ListSessionsRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.ListSessionsResponse.FromString,
             options,
             channel_credentials,
             insecure,
