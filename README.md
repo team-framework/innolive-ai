@@ -1,13 +1,14 @@
-# InnoLive face metadata server
+# InnoLive face video processor
 
-YOLO face segmentation과 stream-local BoT-SORT를 이용해 JPEG 영상의 얼굴 mask, bbox,
-track metadata를 반환합니다. 세션별 AdaFace whitelist에 일치하는 track은 blur 대상에서
-제외합니다. 운영 진입점은 bidirectional streaming gRPC
+YOLO face segmentation과 stream-local BoT-SORT를 이용해 얼굴을 추적하고 서버에서
+모자이크가 합성된 JPEG를 반환합니다. 세션별 AdaFace whitelist에 일치하는 track만
+모자이크에서 제외합니다. 운영 진입점은 bidirectional streaming gRPC
 `/AiProcessor/ProcessVideo`입니다. `server.py`는 브라우저 화면을 실제 gRPC 서버에 연결하는
 시연용 WebSocket-to-gRPC gateway이며 자체적으로 모델을 실행하지 않습니다.
 
-응답에는 입력 JPEG나 처리된 pixel이 포함되지 않습니다. 화면 합성 또는 blur는 client가
-보관한 원본 frame과 서버 metadata를 이용해 수행합니다.
+기존 생성 클라이언트는 `output_mode` 기본값에 따라 metadata-only로 계속 동작합니다. 새
+클라이언트는 `MOSAIC_JPEG`를 요청하고 `mosaic_jpeg`만 화면에 사용합니다. 합성이나 전송에
+실패하면 원본으로 되돌아가지 않습니다.
 
 ## 추론 backend
 
@@ -153,8 +154,7 @@ grpc_health_probe -addr=127.0.0.1:50051 -service=AiProcessor
 
 ## Python client
 
-`VideoProcessorClient`는 최대 W5 요청을 전송하면서 각 응답을 client가 보관한 정확한
-source JPEG와 다시 묶습니다.
+`VideoProcessorClient`는 최대 W5 요청을 전송하고 서버가 합성한 JPEG를 순서대로 반환합니다.
 
 ```python
 import asyncio
@@ -179,7 +179,7 @@ async def main() -> None:
         print([item.session_id for item in await client.list_sessions()])
         async for result in session.process_jpegs(frames):
             print(result.response.frame_id, result.response.faces)
-            source_jpeg = result.source_jpeg
+            protected_jpeg = result.mosaic_jpeg
         await session.delete_whitelist(entries[0].entry_id)
         await session.delete()
 
@@ -192,8 +192,9 @@ asyncio.run(main())
 `client.process_video(..., session_id=...)` 형태도 그대로 지원합니다. 하나의 client/channel로
 여러 session의 `ProcessVideo`를 동시에 실행할 수 있으며, client 종료 시 열려 있는 RPC를
 모두 취소합니다. client는 JPEG 크기/형식, frame ID 단조 증가,
-응답 순서, timestamp echo, metadata 크기, pixel 미포함을 검증하고 위반 시 fail-closed로
-stream을 종료합니다. RPC 실패는 `VideoRpcError`의 `method`, gRPC `code`, `details`로
+응답 순서, timestamp echo, payload 크기와 완전한 서버 JPEG를 검증하고 위반 시 fail-closed로
+stream을 종료합니다. `source_jpeg`는 요청-응답 상관관계와 기존 호출부 호환을 위해 남아
+있지만 출력 fallback으로 사용하지 않습니다. RPC 실패는 `VideoRpcError`의 `method`, gRPC `code`, `details`로
 구분할 수 있습니다. `AddWhitelist`의 기본 deadline은 10초이고, 수명이 정해지지 않은
 영상 stream의 deadline은 호출자가 `timeout`으로 지정합니다.
 
@@ -235,17 +236,21 @@ Request `VideoChunk`:
 - `frame_id`: 그대로 돌려주는 signed int64
 - `batch_size`: legacy field이며 0 또는 1만 허용
 - `session_id`: 비어 있지 않은 세션 식별자. 첫 메시지 값으로 stream이 고정됨
+- `output_mode`: `METADATA_ONLY` 또는 `MOSAIC_JPEG`. stream 도중 변경할 수 없음
 
 Response `ProcessedVideoChunk`:
 
 - `data`: 항상 empty
+- `mosaic_jpeg`: `MOSAIC_JPEG` 성공 응답에만 존재하는 Q90 서버 합성 JPEG
 - `status_message`: `success` 또는 `failed`
 - `faces`: bbox, polygon, confidence, track ID, hold 상태, `whitelisted` 판정
 - `timing`, `stats`: 단계별 시간과 detection/tracking 통계
 - 오류 시 `error_code`, `error_message`
 
+모자이크할 mask만 union한 뒤 유효 시그마를 유지한 축소 ROI에서 Gaussian Blur를 한 번
+계산하고 JPEG를 인코딩합니다. whitelist mask와 보호 mask가 겹치면 보호 mask가 우선합니다.
 invalid JPEG와 invalid batch는 해당 frame만 실패하고 stream을 유지합니다. inference,
-tracking, serialization 실패는 terminal error 후 stream을 닫습니다. inference timeout은
+tracking, mosaic, serialization 실패는 pixel 없는 terminal error 후 stream을 닫습니다. inference timeout은
 health를 `NOT_SERVING`으로 바꾸며, 이미 시작한 inference가 끝날 때까지 tracker와 stream
 admission을 보존합니다.
 
@@ -305,13 +310,18 @@ protoc -I. \
   protos/ai_processor.proto
 ```
 
-Go 호출부는 모든 `VideoChunk`에 같은 `session_id`를 넣고, 등록 시
+Go 호출부는 모든 `VideoChunk`에 같은 `session_id`와
+`VIDEO_OUTPUT_MODE_MOSAIC_JPEG`를 넣고 `ProcessedVideoChunk.mosaic_jpeg`를 downstream으로
+전달해야 합니다. 최악 조건의 JPEG와 metadata를 받을 수 있도록 channel에는 최소 5 MiB의
+receive limit도 설정합니다. `data`는 deprecated이며 계속 비어 있습니다. 등록 시
 `AddWhitelist(FaceData{session_id, data})`, 상태 확인 시 `GetWhitelistStatus`를 호출해야
 합니다. exemplar 삭제에는 `DeleteWhitelistRequest{session_id, entry_id}`를 사용합니다.
 시연용 자동 세션을 사용할 때는 `CreateSession`, 관리 목록은 `ListSessions` stub을 추가로
 생성하고 유휴 세션 정리에는 `DeleteSession`을 사용합니다. `DeleteWhitelist` RPC와
-`GetWhitelistStatusResponse.entry_ids = 4`는 additive 변경이며 기존 field number와 RPC
-path는 바뀌지 않아 재생성 전 client도 기존 기능을 계속 호출할 수 있습니다. Python 서버는
+`GetWhitelistStatusResponse.entry_ids = 4`, `VideoChunk.output_mode = 6`,
+`ProcessedVideoChunk.mosaic_jpeg = 13`은 additive 변경이며 기존 field number와 RPC
+path는 바뀌지 않습니다. 재생성 전 client는 새 JPEG를 읽을 수 없지만 기본 metadata-only
+요청은 계속 유효합니다. Python 서버는
 인증을 하지 않으므로 앞단에서 검증한 세션 값만 전달해야 합니다.
 
 ## 브라우저 gRPC 시연
@@ -354,7 +364,11 @@ JPEG로 정규화한 뒤 여러 장을 순차 등록합니다. drag-and-drop과 
 변환·등록·성공·실패 상태를 표시합니다. HEIC/AVIF 지원 여부는 브라우저 codec에 따릅니다.
 한 파일이 decode·얼굴 수·정렬 검사에 실패해도 다음 파일을 계속 시도합니다.
 
-브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v1과
+브라우저는 원본을 로컬에서 blur하지 않고 gRPC 서버가 반환한 JPEG만 그립니다. WebSocket
+요청은 ILF1, 성공 응답은 JSON metadata와 JPEG를 함께 담은 binary ILR1 envelope이며 오류는
+JSON text입니다. 누락·손상·sequence 불일치 응답은 검은 화면으로 fail-closed합니다.
+
+브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v2와
 `ProcessVideo` gRPC 경로를 확인한 뒤 서버가 광고한 해상도, JPEG 품질, FPS, request window가
 더 작은 경우 해당 한도에 맞춥니다. gateway도 WebSocket stream에 별도 admission 제한을
 두지 않으며 모든 연결이 공유 gRPC channel을 사용합니다.
@@ -370,7 +384,7 @@ node --check web/app.js
 node tests/test_web.mjs
 ```
 
-세션/track 판정 자체의 Python overhead는 모델 추론과 browser blur를 제외한 microbenchmark로
+세션/track 판정 자체의 Python overhead는 모델 추론과 모자이크 합성을 제외한 microbenchmark로
 비교할 수 있습니다.
 
 ```bash
@@ -389,7 +403,7 @@ node tests/test_web.mjs
 ```
 
 gate는 30 FPS, server p95 33.3 ms 이하, W5 이하, 순서가 맞는 모든 terminal 응답,
-metadata-only 응답, 지속적인 RTT 증가 없음을 검사합니다.
+서버 모자이크 JPEG, 지속적인 RTT 증가 없음을 검사합니다.
 
 ## 구조
 
@@ -402,7 +416,8 @@ service/tracking.py             stream-local BoT-SORT와 1-frame mask hold
 service/adaface_model.py         공유 AdaFace/YuNet bounded worker
 service/recognition.py           세션 whitelist와 stream-local track cache
 service/frame.py                영상 JPEG와 등록 JPEG/PNG/WebP 검증/decode
-service/protocol.py             ILF1 WebSocket codec와 payload limit
+service/mosaic.py               fail-closed mask union, blur, JPEG 합성
+service/protocol.py             ILF1/ILR1 WebSocket codec와 payload limit
 service/grpc_config.py          gRPC message, keepalive, bind 설정
 protos/                         schema와 생성된 Python stub
 scripts/export_tensorrt.py      배포 GPU용 TensorRT export
