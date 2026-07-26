@@ -71,6 +71,7 @@ DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
 SERVICE_NAME = "AiProcessor"
 PROFILE = "B1-640-Q90-W5"
 MAX_SESSIONS = 1_024
+MOSAIC_MAX_INFLIGHT = 2
 
 
 def _output_mode(value: int) -> int:
@@ -160,6 +161,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             max_workers=1,
             thread_name_prefix="frame-mosaic",
         )
+        self._mosaic_slots = asyncio.BoundedSemaphore(MOSAIC_MAX_INFLIGHT)
         self._accepting = False
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
@@ -316,16 +318,17 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             mosaic_started = time.perf_counter()
             try:
                 if any(item.get("whitelisted") is not True for item in objects):
-                    loop = asyncio.get_running_loop()
-                    mosaic = await loop.run_in_executor(
-                        self._mosaic_executor,
-                        partial(
-                            mosaic_jpeg,
-                            image,
-                            objects,
-                            max_bytes=self.settings.max_jpeg_bytes,
-                        ),
-                    )
+                    async with self._mosaic_slots:
+                        loop = asyncio.get_running_loop()
+                        mosaic = await loop.run_in_executor(
+                            self._mosaic_executor,
+                            partial(
+                                mosaic_jpeg,
+                                image,
+                                objects,
+                                max_bytes=self.settings.max_jpeg_bytes,
+                            ),
+                        )
                 else:
                     mosaic = bytes(request.data)
             except Exception:
