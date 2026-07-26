@@ -105,7 +105,7 @@ export function negotiateServerProfile(health, preferred = PROFILE) {
     240,
     violations,
   );
-  const maxStreams = profile.max_streams === undefined
+  const maxStreams = profile.max_streams === undefined || Number(profile.max_streams) === 0
     ? null
     : positiveInteger(profile.max_streams, "max_streams", violations);
 

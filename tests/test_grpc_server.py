@@ -171,12 +171,10 @@ class LoopbackServer:
         runtime: FakeRuntime,
         *,
         inference_timeout_seconds: float = 1.5,
-        max_streams: int = 1,
         adaface: FakeAdaFace | None = None,
     ):
         self.runtime = runtime
         self.inference_timeout_seconds = inference_timeout_seconds
-        self.max_streams = max_streams
         self.adaface = adaface
         self.sessions = SessionRegistry()
         self.trackers: list[FakeTracker] = []
@@ -196,7 +194,6 @@ class LoopbackServer:
             tracker_config=Path("unused-botsort.yaml"),
             host="127.0.0.1",
             port=0,
-            max_streams=self.max_streams,
             inference_timeout_seconds=self.inference_timeout_seconds,
             shutdown_grace_seconds=0,
         )
@@ -336,7 +333,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             )
-            self.assertEqual(server.bundle.servicer.admission.active, 0)
+            self.assertEqual(server.bundle.servicer.active_streams, 0)
             health = await server.health.Check(health_pb2.HealthCheckRequest(service=SERVICE_NAME))
             self.assertEqual(
                 health.status,
@@ -358,14 +355,16 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(runtime.calls), 1)
         self.assertTrue(server.trackers[0].reset_called)
 
-    async def test_capacity_one_does_not_block_health(self):
+    async def test_many_concurrent_streams_remain_admitted_and_health_stays_serving(self):
         runtime = FakeRuntime()
         async with LoopbackServer(runtime) as server:
-            first = server.stub.ProcessVideo()
-            await first.write(_request(timestamp=51, frame_id=5))
-            first_response = await first.read()
-            self.assertEqual(first_response.status_message, "success")
-            self.assertEqual(server.bundle.servicer.admission.active, 1)
+            calls = [server.stub.ProcessVideo() for _ in range(8)]
+            await asyncio.gather(
+                *(call.write(_request(timestamp=51, frame_id=5)) for call in calls)
+            )
+            responses = await asyncio.gather(*(call.read() for call in calls))
+            self.assertTrue(all(response.status_message == "success" for response in responses))
+            self.assertEqual(server.bundle.servicer.active_streams, 8)
 
             health = await server.health.Check(health_pb2.HealthCheckRequest(service=SERVICE_NAME))
             self.assertEqual(
@@ -373,18 +372,10 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 health_pb2.HealthCheckResponse.SERVING,
             )
 
-            second = server.stub.ProcessVideo()
-            await second.write(_request(timestamp=52, frame_id=6))
-            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
-                await second.read()
-            self.assertEqual(
-                rejected.exception.code(),
-                grpc.StatusCode.RESOURCE_EXHAUSTED,
-            )
-
-            await first.done_writing()
-            self.assertIs(await first.read(), grpc.aio.EOF)
-            await _wait_until(lambda: server.bundle.servicer.admission.active == 0)
+            await asyncio.gather(*(call.done_writing() for call in calls))
+            endings = await asyncio.gather(*(call.read() for call in calls))
+            self.assertTrue(all(ending is grpc.aio.EOF for ending in endings))
+            await _wait_until(lambda: server.bundle.servicer.active_streams == 0)
 
     async def test_add_whitelist_requires_an_available_adaface_model(self):
         runtime = FakeRuntime()
@@ -465,7 +456,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_session_concurrent_streams_use_distinct_trackers(self):
         runtime = FakeRuntime()
-        async with LoopbackServer(runtime, max_streams=2) as server:
+        async with LoopbackServer(runtime) as server:
             first = server.stub.ProcessVideo()
             second = server.stub.ProcessVideo()
             await asyncio.gather(
@@ -487,18 +478,18 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await call.write(_request(timestamp=61, frame_id=6))
             await asyncio.wait_for(runtime.inference_started.wait(), timeout=1.0)
             tracker = server.trackers[0]
-            self.assertEqual(server.bundle.servicer.admission.active, 1)
+            self.assertEqual(server.bundle.servicer.active_streams, 1)
 
             call.cancel()
             self.assertEqual(await call.code(), grpc.StatusCode.CANCELLED)
             await asyncio.sleep(0.05)
             self.assertFalse(runtime.inference_settled.is_set())
             self.assertFalse(tracker.reset_called)
-            self.assertEqual(server.bundle.servicer.admission.active, 1)
+            self.assertEqual(server.bundle.servicer.active_streams, 1)
 
             runtime.release_inference.set()
             await asyncio.wait_for(tracker.reset_event.wait(), timeout=1.0)
-            await _wait_until(lambda: server.bundle.servicer.admission.active == 0)
+            await _wait_until(lambda: server.bundle.servicer.active_streams == 0)
 
             self.assertTrue(runtime.inference_settled.is_set())
             self.assertTrue(tracker.reset_called)
@@ -518,7 +509,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.error_code, "INFERENCE_TIMEOUT")
             self.assertFalse(runtime.inference_settled.is_set())
             self.assertFalse(server.trackers[0].reset_called)
-            self.assertEqual(server.bundle.servicer.admission.active, 1)
+            self.assertEqual(server.bundle.servicer.active_streams, 1)
             health = await server.health.Check(health_pb2.HealthCheckRequest(service=SERVICE_NAME))
             self.assertEqual(
                 health.status,
@@ -527,7 +518,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             runtime.release_inference.set()
             self.assertIs(await call.read(), grpc.aio.EOF)
-            await _wait_until(lambda: server.bundle.servicer.admission.active == 0)
+            await _wait_until(lambda: server.bundle.servicer.active_streams == 0)
             self.assertTrue(server.trackers[0].reset_after_inference)
 
 

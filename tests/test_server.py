@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import AsyncIterator
+from contextlib import ExitStack
 from typing import Any
 
 import cv2
@@ -110,14 +111,13 @@ class FakeGrpcClient:
         )
 
 
-def app(client: FakeGrpcClient | None = None, *, max_streams: int = 4):
+def app(client: FakeGrpcClient | None = None):
     fake = client or FakeGrpcClient()
     application = create_app(
         ServerSettings(
             session_id="demo-session",
             grpc_target="test-grpc:50051",
             max_jpeg_bytes=4096,
-            max_streams=max_streams,
         ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
@@ -201,32 +201,16 @@ class GrpcDemoGatewayTests(unittest.TestCase):
 
         self.assertEqual((error["seq"], error["code"]), (5, "INFERENCE_FAILED"))
 
-    def test_second_browser_stream_is_rejected(self):
-        application, _ = app(max_streams=1)
-        with (
-            TestClient(application) as client,
-            client.websocket_connect("/ws"),
-            client.websocket_connect("/ws") as second,
-            self.assertRaises(WebSocketDisconnect) as closed,
-        ):
-            second.receive_text()
-        self.assertEqual(closed.exception.code, 1013)
+    def test_many_browser_streams_share_the_grpc_client_without_admission_limit(self):
+        application, fake = app()
+        with TestClient(application) as client, ExitStack() as stack:
+            websockets = [stack.enter_context(client.websocket_connect("/ws")) for _ in range(8)]
+            for websocket in websockets:
+                websocket.send_bytes(encode_request(1, jpeg()))
+            results = [decode_response(websocket.receive_text()) for websocket in websockets]
 
-    def test_multiple_browser_streams_share_the_grpc_client(self):
-        application, fake = app(max_streams=4)
-        with (
-            TestClient(application) as client,
-            client.websocket_connect("/ws") as first,
-            client.websocket_connect("/ws") as second,
-        ):
-            first.send_bytes(encode_request(1, jpeg()))
-            second.send_bytes(encode_request(1, jpeg()))
-            first_result = decode_response(first.receive_text())
-            second_result = decode_response(second.receive_text())
-
-        self.assertEqual(first_result["type"], "result")
-        self.assertEqual(second_result["type"], "result")
-        self.assertEqual(len(fake.received), 2)
+        self.assertTrue(all(result["type"] == "result" for result in results))
+        self.assertEqual(len(fake.received), 8)
 
     def test_not_serving_grpc_backend_rejects_health_and_stream(self):
         application, _ = app(FakeGrpcClient(serving=False))
