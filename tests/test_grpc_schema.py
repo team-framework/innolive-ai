@@ -93,6 +93,36 @@ class GrpcSchemaContractTests(unittest.TestCase):
         self.assertTrue(video.fields_by_name["batch_size"].GetOptions().deprecated)
         self.assertTrue(processed.fields_by_name["data"].GetOptions().deprecated)
 
+    def test_session_and_whitelist_fields_are_additive(self):
+        expected = {
+            "VideoChunk": {"session_id": 5},
+            "FaceMetadata": {"whitelisted": 10},
+            "FrameStats": {
+                "adaface_calls": 9,
+                "adaface_queue_overflow": 10,
+                "whitelisted_tracks": 11,
+            },
+            "FaceData": {"data": 1, "session_id": 2},
+            "WhitelistResponse": {
+                "status_message": 1,
+                "timestamp": 2,
+                "entry_id": 3,
+                "entry_count": 4,
+                "whitelist_version": 5,
+            },
+        }
+        for message_name, fields in expected.items():
+            descriptor = ai_processor_pb2.DESCRIPTOR.message_types_by_name[message_name]
+            self.assertEqual(
+                {name: descriptor.fields_by_name[name].number for name in fields},
+                fields,
+            )
+
+        service = ai_processor_pb2.DESCRIPTOR.services_by_name["AiProcessor"]
+        add_whitelist = service.methods_by_name["AddWhitelist"]
+        self.assertFalse(add_whitelist.client_streaming)
+        self.assertFalse(add_whitelist.server_streaming)
+
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()
         current = ai_processor_pb2.ProcessedVideoChunk(

@@ -11,7 +11,7 @@ import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +21,27 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from protos import ai_processor_pb2 as messages
 from protos import ai_processor_pb2_grpc
+from service.adaface_model import (
+    DEFAULT_ADAFACE_WEIGHTS,
+    DEFAULT_FACE_DETECTOR,
+    AdaFaceConfig,
+    AdaFaceRuntime,
+    AdaFaceUnavailable,
+    FaceAlignmentError,
+    FaceCountError,
+    FaceTooSmallError,
+)
 from service.frame import FrameLimits, decode_jpeg
 from service.grpc_config import listen_address, server_options
 from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.recognition import (
+    RecognitionConfig,
+    SessionLimitError,
+    SessionRegistry,
+    StreamRecognition,
+    WhitelistLimitError,
+    validate_session_id,
+)
 from service.runtime import (
     BACKENDS,
     DEFAULT_CHECKPOINT,
@@ -45,10 +63,14 @@ PROFILE = "B1-640-Q90-W5"
 @dataclass(frozen=True, slots=True)
 class GrpcServerSettings:
     runtime: RuntimeConfig
+    adaface: AdaFaceConfig = field(default_factory=AdaFaceConfig)
+    recognition: RecognitionConfig = field(default_factory=RecognitionConfig)
     tracker_config: Path = DEFAULT_TRACKER
     host: str = "127.0.0.1"
     port: int = 50_051
-    max_streams: int = 1
+    max_streams: int = 4
+    max_sessions: int = 1_024
+    max_whitelist_entries: int = 32
     max_jpeg_bytes: int = MAX_JPEG_BYTES
     inference_timeout_seconds: float = 1.5
     shutdown_grace_seconds: float = 5.0
@@ -62,6 +84,10 @@ class GrpcServerSettings:
             raise ValueError("port must be between 0 and 65535")
         if self.max_streams < 1:
             raise ValueError("max_streams must be at least one")
+        if self.max_sessions < 1:
+            raise ValueError("max_sessions must be at least one")
+        if self.max_whitelist_entries < 1:
+            raise ValueError("max_whitelist_entries must be at least one")
         if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
             raise ValueError(f"max_jpeg_bytes must be in 1..{MAX_JPEG_BYTES}")
         if not math.isfinite(self.inference_timeout_seconds) or self.inference_timeout_seconds <= 0:
@@ -105,11 +131,15 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         runtime: Any,
         settings: GrpcServerSettings,
         *,
+        sessions: SessionRegistry,
+        adaface: Any | None,
         tracker_factory: Callable[..., Any] = StreamTracker,
         mark_unhealthy: Callable[[], Awaitable[None]] | None = None,
     ):
         self.runtime = runtime
         self.settings = settings
+        self.sessions = sessions
+        self.adaface = adaface
         self.tracker_factory = tracker_factory
         self.mark_unhealthy = mark_unhealthy
         self.admission = StreamAdmission(settings.max_streams)
@@ -127,6 +157,10 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             )
 
         tracker = None
+        recognition = None
+        session = None
+        stream_session_id: str | None = None
+        frame_sequence = 0
         pending_inference: asyncio.Task | None = None
         try:
             try:
@@ -143,7 +177,34 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 )
 
             async for request in request_iterator:
-                outcome = await self._process_request(request, tracker)
+                try:
+                    request_session_id = validate_session_id(request.session_id)
+                except ValueError as error:
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+                if stream_session_id is None:
+                    stream_session_id = request_session_id
+                    try:
+                        session = self.sessions.get_or_create(stream_session_id)
+                    except SessionLimitError as error:
+                        await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+                    recognition = StreamRecognition(
+                        self.adaface,
+                        self.settings.recognition,
+                        owner=stream_session_id,
+                    )
+                elif request_session_id != stream_session_id:
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        "session_id cannot change within a ProcessVideo stream",
+                    )
+                frame_sequence += 1
+                outcome = await self._process_request(
+                    request,
+                    tracker,
+                    session,
+                    recognition,
+                    frame_sequence,
+                )
                 pending_inference = outcome.pending_inference
                 yield outcome.response
                 if outcome.fatal:
@@ -152,6 +213,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         finally:
             if pending_inference is not None:
                 await self._settle_inference(pending_inference)
+            if recognition is not None:
+                recognition.close()
             if tracker is not None:
                 try:
                     tracker.reset()
@@ -159,7 +222,14 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     LOGGER.exception("tracker reset failed")
             self.admission.leave()
 
-    async def _process_request(self, request: Any, tracker: Any) -> FrameOutcome:
+    async def _process_request(
+        self,
+        request: Any,
+        tracker: Any,
+        session: Any,
+        recognition: StreamRecognition,
+        frame_sequence: int,
+    ) -> FrameOutcome:
         received_at = time.perf_counter()
         if request.batch_size not in (0, 1):
             return FrameOutcome(
@@ -193,6 +263,17 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         if failure is not None:
             return failure
         try:
+            objects = result.get("objects", [])
+            if not isinstance(objects, list) or len(objects) > 100:
+                raise ValueError("runtime objects exceed the response contract")
+            result.update(
+                recognition.process(
+                    image,
+                    objects,
+                    session.snapshot(),
+                    frame_sequence,
+                )
+            )
             response = self._success_response(
                 request,
                 image,
@@ -296,10 +377,69 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         )
 
     async def AddWhitelist(self, request, context):
-        del request
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "AddWhitelist is not part of the serving data plane",
+        try:
+            session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        if not request.data:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "face image must not be empty")
+        if len(request.data) > self.settings.max_jpeg_bytes:
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"face image exceeds the {self.settings.max_jpeg_bytes} byte limit",
+            )
+        if self.adaface is None or not getattr(self.adaface, "ready", False):
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "AdaFace is not available",
+            )
+        try:
+            image = await asyncio.to_thread(
+                decode_jpeg,
+                bytes(request.data),
+                self.frame_limits,
+            )
+        except (TypeError, ValueError):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "face image could not be decoded within the server limits",
+            )
+
+        future = self.adaface.submit(image, owner=session_id)
+        if future is None:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "AdaFace queue is full")
+        try:
+            embedding = await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=self.settings.inference_timeout_seconds,
+            )
+        except TimeoutError:
+            await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "AdaFace inference timed out")
+        except (FaceCountError, FaceTooSmallError, FaceAlignmentError) as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except AdaFaceUnavailable as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        except Exception:
+            LOGGER.exception("AdaFace whitelist enrollment failed")
+            await context.abort(grpc.StatusCode.INTERNAL, "AdaFace inference failed")
+
+        try:
+            session = self.sessions.get_or_create(session_id)
+        except SessionLimitError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+        try:
+            entry, entry_count, version = session.append(embedding)
+        except WhitelistLimitError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+        except ValueError:
+            LOGGER.exception("AdaFace returned an invalid whitelist embedding")
+            await context.abort(grpc.StatusCode.INTERNAL, "AdaFace returned an invalid embedding")
+        return messages.WhitelistResponse(
+            status_message="success",
+            timestamp=time.time_ns(),
+            entry_id=entry.entry_id,
+            entry_count=entry_count,
+            whitelist_version=version,
         )
 
     async def close(self) -> None:
@@ -343,8 +483,6 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
     ):
         serialize_started = time.perf_counter()
         objects = result.get("objects", [])
-        if not isinstance(objects, list) or len(objects) > 100:
-            raise ValueError("runtime objects exceed the response contract")
         faces = [self._face_metadata(item) for item in objects]
         timing = result.get("timing_ms", {})
         response = messages.ProcessedVideoChunk(
@@ -373,6 +511,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 held_tracks=int(result.get("held_tracks", 0)),
                 tracks=int(result.get("tracks", 0)),
                 tracker_frame=int(result.get("tracker_frame", 0)),
+                adaface_calls=int(result.get("adaface_calls", 0)),
+                adaface_queue_overflow=int(result.get("adaface_queue_overflow", 0)),
+                whitelisted_tracks=int(result.get("whitelisted_tracks", 0)),
             ),
         )
         response.timing.serialize_ms = (
@@ -421,6 +562,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             hold_frames=int(item.get("hold_frames", 0)),
             class_name=str(item.get("class_name", "face")),
             mask_area_px=mask_area,
+            whitelisted=bool(item.get("whitelisted", False)),
         )
         if "track_id" in item and item["track_id"] is not None:
             face.track_id = int(item["track_id"])
@@ -473,6 +615,8 @@ def build_grpc_server(
     settings: GrpcServerSettings,
     runtime: Any,
     *,
+    sessions: SessionRegistry | None = None,
+    adaface: Any | None = None,
     tracker_factory: Callable[..., Any] = StreamTracker,
 ) -> GrpcServerBundle:
     server = grpc.aio.server(options=server_options())
@@ -486,6 +630,12 @@ def build_grpc_server(
     servicer = AiProcessorServicer(
         runtime,
         settings,
+        sessions=sessions
+        or SessionRegistry(
+            max_sessions=settings.max_sessions,
+            max_entries_per_session=settings.max_whitelist_entries,
+        ),
+        adaface=adaface,
         tracker_factory=tracker_factory,
         mark_unhealthy=mark_unhealthy,
     )
@@ -509,6 +659,7 @@ def build_grpc_server(
 
 async def serve(settings: GrpcServerSettings) -> None:
     runtime = None
+    adaface = None
     bundle = None
     try:
         runtime = await asyncio.to_thread(RuntimeManager, settings.runtime)
@@ -520,7 +671,21 @@ async def serve(settings: GrpcServerSettings) -> None:
         tracker_probe.reset()
         if not runtime.ready:
             raise RuntimeError("runtime warm-up did not reach ready state")
-        bundle = build_grpc_server(settings, runtime)
+        adaface = await asyncio.to_thread(
+            AdaFaceRuntime,
+            settings.adaface,
+            fallback_device=runtime.device,
+        )
+        sessions = SessionRegistry(
+            max_sessions=settings.max_sessions,
+            max_entries_per_session=settings.max_whitelist_entries,
+        )
+        bundle = build_grpc_server(
+            settings,
+            runtime,
+            sessions=sessions,
+            adaface=adaface,
+        )
         await bundle.set_serving(True)
         await bundle.server.start()
         LOGGER.info(
@@ -532,6 +697,12 @@ async def serve(settings: GrpcServerSettings) -> None:
             runtime.device,
             settings.max_streams,
         )
+        if adaface.ready:
+            LOGGER.info("AdaFace ready: %s", adaface.health())
+        else:
+            LOGGER.warning(
+                "AdaFace unavailable; all faces remain protected: %s", adaface.load_error
+            )
         await bundle.server.wait_for_termination()
     finally:
         if bundle is not None:
@@ -539,6 +710,8 @@ async def serve(settings: GrpcServerSettings) -> None:
             await bundle.health_servicer.enter_graceful_shutdown()
             await bundle.server.stop(settings.shutdown_grace_seconds)
             await bundle.servicer.close()
+        if adaface is not None:
+            await asyncio.to_thread(adaface.close)
         if runtime is not None:
             await asyncio.to_thread(runtime.close)
 
@@ -582,7 +755,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-streams",
         type=positive_int,
-        default=positive_int(os.getenv("GRPC_MAX_STREAMS", "1")),
+        default=positive_int(os.getenv("GRPC_MAX_STREAMS", "4")),
+    )
+    parser.add_argument(
+        "--adaface-weights",
+        type=Path,
+        default=Path(os.getenv("ADAFACE_WEIGHTS", str(DEFAULT_ADAFACE_WEIGHTS))),
+    )
+    parser.add_argument(
+        "--adaface-detector",
+        type=Path,
+        default=Path(os.getenv("ADAFACE_DETECTOR", str(DEFAULT_FACE_DETECTOR))),
+    )
+    parser.add_argument("--adaface-device", default=os.getenv("ADAFACE_DEVICE", "auto"))
+    parser.add_argument(
+        "--adaface-threshold",
+        type=float,
+        default=float(os.getenv("ADAFACE_COSINE_THRESHOLD", "0.4")),
+    )
+    parser.add_argument(
+        "--adaface-min-face-size",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_MIN_FACE_SIZE", "40")),
+    )
+    parser.add_argument(
+        "--adaface-queue-capacity",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_QUEUE_CAPACITY", "8")),
+    )
+    parser.add_argument(
+        "--adaface-revalidate-frames",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_REVALIDATE_FRAMES", "30")),
+    )
+    parser.add_argument(
+        "--adaface-missing-track-frames",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_MISSING_TRACK_FRAMES", "3")),
+    )
+    parser.add_argument(
+        "--adaface-max-pending-per-stream",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_MAX_PENDING_PER_STREAM", "4")),
+    )
+    parser.add_argument(
+        "--max-sessions",
+        type=positive_int,
+        default=positive_int(os.getenv("MAX_SESSIONS", "1024")),
+    )
+    parser.add_argument(
+        "--max-whitelist-entries",
+        type=positive_int,
+        default=positive_int(os.getenv("MAX_WHITELIST_ENTRIES", "32")),
     )
     parser.add_argument(
         "--inference-timeout",
@@ -614,10 +838,26 @@ def main() -> None:
             device=arguments.device,
             warmup_runs=arguments.warmup_runs,
         ),
+        adaface=AdaFaceConfig(
+            weights=arguments.adaface_weights,
+            detector=arguments.adaface_detector,
+            device=arguments.adaface_device,
+            min_face_size=arguments.adaface_min_face_size,
+            queue_capacity=arguments.adaface_queue_capacity,
+        ),
+        recognition=RecognitionConfig(
+            cosine_threshold=arguments.adaface_threshold,
+            revalidate_frames=arguments.adaface_revalidate_frames,
+            missing_track_frames=arguments.adaface_missing_track_frames,
+            max_pending_per_stream=arguments.adaface_max_pending_per_stream,
+            min_face_size=arguments.adaface_min_face_size,
+        ),
         tracker_config=arguments.tracker_config,
         host=arguments.host,
         port=arguments.port,
         max_streams=arguments.max_streams,
+        max_sessions=arguments.max_sessions,
+        max_whitelist_entries=arguments.max_whitelist_entries,
         inference_timeout_seconds=arguments.inference_timeout,
         shutdown_grace_seconds=arguments.shutdown_grace,
         ssl_certfile=arguments.ssl_certfile,

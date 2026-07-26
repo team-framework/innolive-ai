@@ -52,13 +52,15 @@ class AiProcessorServicer:
     """
 
     def ProcessVideo(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """One ordered, long-lived video flow per call. A call owns its tracker state.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def AddWhitelist(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Adds one face exemplar to the session-scoped in-memory whitelist.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
