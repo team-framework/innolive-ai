@@ -33,8 +33,9 @@ class Sample:
     sequence: int
     sent_at: float
     received_at: float
-    jpeg_bytes: int
-    metadata_bytes: int
+    input_jpeg_bytes: int
+    mosaic_jpeg_bytes: int
+    response_bytes: int
     server_total_ms: float
 
     @property
@@ -82,14 +83,17 @@ async def run_stream(
             if result.source_jpeg != jpegs[sequence - 1]:
                 raise RuntimeError(f"source JPEG mismatch for frame {sequence}")
             if bytes(response.data):
-                raise RuntimeError("server returned forbidden JPEG/raw pixel data")
+                raise RuntimeError("server returned the deprecated pixel field")
+            if not result.mosaic_jpeg:
+                raise RuntimeError("server did not return a mosaic JPEG")
             samples.append(
                 Sample(
                     sequence=sequence,
                     sent_at=sent_at[sequence],
                     received_at=received_at,
-                    jpeg_bytes=len(result.source_jpeg),
-                    metadata_bytes=int(response.ByteSize()),
+                    input_jpeg_bytes=len(result.source_jpeg),
+                    mosaic_jpeg_bytes=len(result.mosaic_jpeg),
+                    response_bytes=int(response.ByteSize()),
                     server_total_ms=_server_total_ms(response),
                 )
             )
@@ -124,7 +128,7 @@ def summarize(
         "server_total_p95_at_most_33_3_ms": percentile(server, 95) <= MAX_SERVER_P95_MS,
         "max_inflight_at_most_5": max_inflight <= WINDOW,
         "terminal_sequence_complete": sequences == list(range(1, len(samples) + 1)),
-        "metadata_only": True,
+        "server_mosaic_jpeg": all(sample.mosaic_jpeg_bytes > 0 for sample in samples),
         "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
@@ -139,8 +143,9 @@ def summarize(
             "rtt_ms": distribution(rtt),
             "server_total_ms": distribution(server),
             "latency_growth_ms": round(latency_growth_ms, 2),
-            "jpeg_bytes": distribution([sample.jpeg_bytes for sample in samples]),
-            "metadata_bytes": distribution([sample.metadata_bytes for sample in samples]),
+            "input_jpeg_bytes": distribution([sample.input_jpeg_bytes for sample in samples]),
+            "mosaic_jpeg_bytes": distribution([sample.mosaic_jpeg_bytes for sample in samples]),
+            "response_bytes": distribution([sample.response_bytes for sample in samples]),
         },
         "provenance": {
             "input": str(input_path),
