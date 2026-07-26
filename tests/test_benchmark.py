@@ -4,12 +4,8 @@ import unittest
 
 import numpy as np
 
-from scripts.benchmark_stream import (
-    _contains_pixels,
-    health_url,
-    percentile,
-    resize_long_edge,
-)
+from scripts.benchmark_stream import _contains_pixels, health_url
+from scripts.benchmark_utils import percentile, resize_long_edge
 
 
 class BenchmarkContractTests(unittest.TestCase):

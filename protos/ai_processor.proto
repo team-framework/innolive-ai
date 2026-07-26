@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+// Intentionally no package: existing clients call /AiProcessor/ProcessVideo.
+service AiProcessor {
+  rpc ProcessVideo(stream VideoChunk) returns (stream ProcessedVideoChunk);
+  rpc AddWhitelist(FaceData) returns (WhitelistResponse);
+}
+
+message VideoChunk {
+  // One complete JPEG frame.
+  bytes data = 1;
+  // Opaque client value echoed in the response. Its historical unit is not fixed.
+  int64 timestamp = 2;
+  // Opaque client frame identifier echoed in the response.
+  int64 frame_id = 3;
+  // Legacy B4 scheduling hint. The B1 serving profile accepts only zero or one.
+  uint32 batch_size = 4 [deprecated = true];
+}
+
+message ProcessedVideoChunk {
+  // Legacy processed-JPEG response. Metadata-only serving leaves this empty.
+  bytes data = 1 [deprecated = true];
+  int64 timestamp = 2;
+  string status_message = 3;
+  repeated FaceMetadata faces = 4;
+  int32 width = 5;
+  int32 height = 6;
+  int64 frame_id = 7;
+  double processing_ms = 8;
+  ProcessingTiming timing = 9;
+  string error_code = 10;
+  string error_message = 11;
+  FrameStats stats = 12;
+}
+
+message ProcessingTiming {
+  double queue_ms = 1;
+  double decode_ms = 2;
+  double inference_ms = 3;
+  double tracking_ms = 4;
+  // Legacy server-side JPEG blur/encode stage; zero for metadata-only responses.
+  double blur_encode_ms = 5;
+  uint32 inference_batch_size = 6;
+  double serialize_ms = 7;
+  double server_total_ms = 8;
+  double runtime_total_ms = 9;
+}
+
+message Point {
+  float x = 1;
+  float y = 2;
+}
+
+message BoundingBox {
+  float x1 = 1;
+  float y1 = 2;
+  float x2 = 3;
+  float y2 = 4;
+}
+
+message FaceMetadata {
+  BoundingBox bbox = 1;
+  float confidence = 2;
+  repeated Point polygon = 3;
+  optional int64 track_id = 4;
+  string source = 5;
+  bool held = 6;
+  uint32 hold_frames = 7;
+  string class_name = 8;
+  float mask_area_px = 9;
+}
+
+message FrameStats {
+  uint32 detections = 1;
+  uint32 raw_detections = 2;
+  uint32 continuation_candidates = 3;
+  uint32 detector_backed_tracks = 4;
+  uint32 low_confidence_continuations = 5;
+  uint32 held_tracks = 6;
+  uint32 tracks = 7;
+  uint64 tracker_frame = 8;
+}
+
+message FaceData {
+  bytes data = 1;
+}
+
+message WhitelistResponse {
+  string status_message = 1;
+  int64 timestamp = 2;
+}

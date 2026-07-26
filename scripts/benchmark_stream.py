@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import platform
-import statistics
 import sys
 import time
 import urllib.request
@@ -18,22 +16,24 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import cv2
-import numpy as np
 import websockets
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from service.protocol import (  # noqa: E402
+from scripts.benchmark_utils import (
+    distribution,
+    load_jpegs,
+    percentile,
+    sha256_file,
+)
+from service.protocol import (
     MAX_RESPONSE_BYTES,
     decode_response,
     encode_request,
 )
 
-
-LONG_EDGE = 640
-JPEG_QUALITY = 90
 WINDOW = 5
 MIN_FRAMES = 120
 MIN_RESULT_FPS = 30.0
@@ -52,43 +52,6 @@ class Sample:
     @property
     def rtt_ms(self) -> float:
         return (self.received_at - self.sent_at) * 1000
-
-
-def resize_long_edge(image: np.ndarray) -> np.ndarray:
-    height, width = image.shape[:2]
-    scale = min(1.0, LONG_EDGE / max(width, height))
-    target = (max(32, round(width * scale)), max(32, round(height * scale)))
-    if target == (width, height):
-        return image
-    return cv2.resize(image, target, interpolation=cv2.INTER_AREA)
-
-
-def load_jpegs(video_path: Path, frame_limit: int) -> list[bytes]:
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open video: {video_path}")
-    frames: list[bytes] = []
-    try:
-        while len(frames) < frame_limit:
-            ok, image = capture.read()
-            if not ok:
-                break
-            image = resize_long_edge(image)
-            encoded, jpeg = cv2.imencode(
-                ".jpg",
-                image,
-                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-            )
-            if not encoded:
-                raise RuntimeError(f"JPEG encode failed at frame {len(frames) + 1}")
-            frames.append(jpeg.tobytes())
-    finally:
-        capture.release()
-    if len(frames) < frame_limit:
-        raise RuntimeError(
-            f"video supplied {len(frames)} frames; {frame_limit} are required"
-        )
-    return frames
 
 
 async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
@@ -117,7 +80,7 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
             raw = await websocket.recv()
             received_at = time.perf_counter()
             if not isinstance(raw, str):
-                raise RuntimeError("server returned binary data; metadata JSON is required")
+                raise TypeError("server returned binary data; metadata JSON is required")
             metadata = decode_response(raw)
             sequence = metadata["seq"]
             if sequence not in pending:
@@ -169,13 +132,11 @@ def summarize(
     gates = {
         "frames_at_least_120": len(samples) >= MIN_FRAMES,
         "result_fps_at_least_30": result_fps >= MIN_RESULT_FPS,
-        "server_total_p95_at_most_33_3_ms": percentile(server, 95)
-        <= MAX_SERVER_P95_MS,
+        "server_total_p95_at_most_33_3_ms": percentile(server, 95) <= MAX_SERVER_P95_MS,
         "max_inflight_at_most_5": max_inflight <= WINDOW,
         "terminal_sequence_complete": [sample.sequence for sample in samples]
         == list(range(1, len(samples) + 1)),
-        "latency_not_continuously_growing": latency_growth_ms
-        <= max(20.0, first_p50 * 0.20),
+        "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
         "profile": "B1-640-Q90-W5",
@@ -189,9 +150,7 @@ def summarize(
             "server_total_ms": distribution(server),
             "latency_growth_ms": round(latency_growth_ms, 2),
             "jpeg_bytes": distribution([sample.jpeg_bytes for sample in samples]),
-            "metadata_bytes": distribution(
-                [sample.metadata_bytes for sample in samples]
-            ),
+            "metadata_bytes": distribution([sample.metadata_bytes for sample in samples]),
         },
         "provenance": {
             "input": str(input_path),
@@ -208,23 +167,6 @@ def summarize(
             for sample in samples
         ],
     }
-
-
-def distribution(values: list[float | int]) -> dict[str, float]:
-    return {
-        "mean": round(float(statistics.fmean(values)), 2),
-        "p50": round(percentile(values, 50), 2),
-        "p95": round(percentile(values, 95), 2),
-        "max": round(float(max(values)), 2),
-    }
-
-
-def percentile(values: list[float | int], percent: int) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(float(value) for value in values)
-    index = max(0, min(len(ordered) - 1, int(np.ceil(len(ordered) * percent / 100)) - 1))
-    return ordered[index]
 
 
 def _contains_pixels(value: Any) -> bool:
@@ -248,16 +190,8 @@ def read_health(websocket_url: str) -> dict[str, Any] | None:
     try:
         with urllib.request.urlopen(health_url(websocket_url), timeout=5) as response:
             return json.load(response)
-    except Exception:
+    except (OSError, ValueError, json.JSONDecodeError):
         return None
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:

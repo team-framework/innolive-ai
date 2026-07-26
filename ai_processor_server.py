@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Production gRPC entry point for the B1-640 face metadata pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import math
+import os
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import grpc
+import numpy as np
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
+
+from protos import ai_processor_pb2 as messages
+from protos import ai_processor_pb2_grpc
+from service.frame import FrameLimits, decode_jpeg
+from service.grpc_config import listen_address, server_options
+from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.runtime import (
+    BACKENDS,
+    DEFAULT_CHECKPOINT,
+    DEFAULT_ENGINE,
+    InferenceFailure,
+    RuntimeConfig,
+    RuntimeManager,
+    TrackingFailure,
+)
+from service.tracking import StreamTracker
+
+LOGGER = logging.getLogger("innolive.grpc")
+ROOT = Path(__file__).resolve().parent
+DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
+SERVICE_NAME = "AiProcessor"
+PROFILE = "B1-640-Q90-W5"
+
+
+@dataclass(frozen=True, slots=True)
+class GrpcServerSettings:
+    runtime: RuntimeConfig
+    tracker_config: Path = DEFAULT_TRACKER
+    host: str = "127.0.0.1"
+    port: int = 50_051
+    max_streams: int = 1
+    max_jpeg_bytes: int = MAX_JPEG_BYTES
+    inference_timeout_seconds: float = 1.5
+    shutdown_grace_seconds: float = 5.0
+    ssl_certfile: Path | None = None
+    ssl_keyfile: Path | None = None
+
+    def __post_init__(self) -> None:
+        if not self.host.strip():
+            raise ValueError("host must not be empty")
+        if not 0 <= self.port <= 65_535:
+            raise ValueError("port must be between 0 and 65535")
+        if self.max_streams < 1:
+            raise ValueError("max_streams must be at least one")
+        if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
+            raise ValueError(f"max_jpeg_bytes must be in 1..{MAX_JPEG_BYTES}")
+        if not math.isfinite(self.inference_timeout_seconds) or self.inference_timeout_seconds <= 0:
+            raise ValueError("inference_timeout_seconds must be positive")
+        if not math.isfinite(self.shutdown_grace_seconds) or self.shutdown_grace_seconds < 0:
+            raise ValueError("shutdown_grace_seconds cannot be negative")
+        if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
+            raise ValueError("ssl_certfile and ssl_keyfile must be provided together")
+
+
+class StreamAdmission:
+    """Limit only ProcessVideo streams so health remains independently available."""
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.active = 0
+
+    def enter(self) -> bool:
+        # Every RPC runs on the server event loop and this method never yields.
+        if self.active >= self.capacity:
+            return False
+        self.active += 1
+        return True
+
+    def leave(self) -> None:
+        self.active = max(0, self.active - 1)
+
+
+@dataclass(slots=True)
+class FrameOutcome:
+    response: Any
+    fatal: bool = False
+    pending_inference: asyncio.Task | None = None
+
+
+class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
+    """One ordered B1 inference/tracker lane per ProcessVideo RPC."""
+
+    def __init__(
+        self,
+        runtime: Any,
+        settings: GrpcServerSettings,
+        *,
+        tracker_factory: Callable[..., Any] = StreamTracker,
+        mark_unhealthy: Callable[[], Awaitable[None]] | None = None,
+    ):
+        self.runtime = runtime
+        self.settings = settings
+        self.tracker_factory = tracker_factory
+        self.mark_unhealthy = mark_unhealthy
+        self.admission = StreamAdmission(settings.max_streams)
+        self.frame_limits = FrameLimits(max_jpeg_bytes=settings.max_jpeg_bytes)
+        self._inference_tasks: set[asyncio.Task] = set()
+        self._accepting = False
+
+    async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
+        if not self._accepting or not self.runtime.ready:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "runtime is not ready")
+        if not self.admission.enter():
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "ProcessVideo stream capacity reached",
+            )
+
+        tracker = None
+        pending_inference: asyncio.Task | None = None
+        try:
+            try:
+                tracker = self.tracker_factory(
+                    self.settings.tracker_config,
+                    getattr(self.runtime, "device", self.settings.runtime.device),
+                )
+            except Exception:
+                LOGGER.exception("tracker initialization failed")
+                await self._mark_runtime_unhealthy()
+                await context.abort(
+                    grpc.StatusCode.INTERNAL,
+                    "tracker initialization failed",
+                )
+
+            async for request in request_iterator:
+                outcome = await self._process_request(request, tracker)
+                pending_inference = outcome.pending_inference
+                yield outcome.response
+                if outcome.fatal:
+                    return
+                pending_inference = None
+        finally:
+            if pending_inference is not None:
+                await self._settle_inference(pending_inference)
+            if tracker is not None:
+                try:
+                    tracker.reset()
+                except Exception:
+                    LOGGER.exception("tracker reset failed")
+            self.admission.leave()
+
+    async def _process_request(self, request: Any, tracker: Any) -> FrameOutcome:
+        received_at = time.perf_counter()
+        if request.batch_size not in (0, 1):
+            return FrameOutcome(
+                self._error_response(
+                    request,
+                    "INVALID_BATCH_SIZE",
+                    "batch_size must be zero or one for the B1 profile",
+                    received_at,
+                )
+            )
+
+        try:
+            image = await asyncio.to_thread(
+                decode_jpeg,
+                bytes(request.data),
+                self.frame_limits,
+            )
+        except (TypeError, ValueError):
+            LOGGER.info("frame %d JPEG decode rejected", request.frame_id)
+            return FrameOutcome(
+                self._error_response(
+                    request,
+                    "DECODE_FAILED",
+                    "frame could not be decoded within the B1 limits",
+                    received_at,
+                )
+            )
+        decoded_at = time.perf_counter()
+
+        result, failure = await self._run_inference(request, image, tracker, received_at)
+        if failure is not None:
+            return failure
+        try:
+            response = self._success_response(
+                request,
+                image,
+                result,
+                received_at,
+                decoded_at,
+            )
+            if response.ByteSize() > MAX_RESPONSE_BYTES:
+                raise ValueError("protobuf response exceeds the byte limit")
+            return FrameOutcome(response)
+        except (TypeError, ValueError, OverflowError):
+            LOGGER.exception("frame %d protobuf serialization failed", request.frame_id)
+            return FrameOutcome(
+                self._error_response(
+                    request,
+                    "SERIALIZATION_FAILED",
+                    "result metadata exceeded the serialization contract",
+                    received_at,
+                    inference_batch_size=1,
+                ),
+                fatal=True,
+            )
+
+    async def _run_inference(
+        self,
+        request: Any,
+        image: np.ndarray,
+        tracker: Any,
+        received_at: float,
+    ) -> tuple[dict[str, Any] | None, FrameOutcome | None]:
+        task = asyncio.create_task(
+            self.runtime.infer(image, tracker),
+            name=f"grpc-infer-{request.frame_id}",
+        )
+        self._inference_tasks.add(task)
+        task.add_done_callback(self._inference_tasks.discard)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.settings.inference_timeout_seconds,
+            )
+            return result, None
+        except TimeoutError:
+            await self._mark_runtime_unhealthy()
+            return None, self._fatal_inference_outcome(
+                request,
+                "INFERENCE_TIMEOUT",
+                "frame inference exceeded the server timeout",
+                received_at,
+                pending=task,
+            )
+        except TrackingFailure:
+            LOGGER.exception("frame %d tracking failed", request.frame_id)
+            return None, self._fatal_inference_outcome(
+                request,
+                "TRACKING_FAILED",
+                "frame tracking failed",
+                received_at,
+            )
+        except InferenceFailure:
+            LOGGER.exception("frame %d inference failed", request.frame_id)
+            await self._mark_runtime_unhealthy()
+            return None, self._fatal_inference_outcome(
+                request,
+                "INFERENCE_FAILED",
+                "frame inference failed",
+                received_at,
+            )
+        except asyncio.CancelledError:
+            await self._settle_inference(task)
+            raise
+        except Exception:
+            LOGGER.exception("frame %d processing failed", request.frame_id)
+            await self._mark_runtime_unhealthy()
+            return None, self._fatal_inference_outcome(
+                request,
+                "PROCESSING_FAILED",
+                "frame processing failed",
+                received_at,
+            )
+
+    def _fatal_inference_outcome(
+        self,
+        request: Any,
+        code: str,
+        message: str,
+        received_at: float,
+        *,
+        pending: asyncio.Task | None = None,
+    ) -> FrameOutcome:
+        return FrameOutcome(
+            self._error_response(
+                request,
+                code,
+                message,
+                received_at,
+                inference_batch_size=1,
+            ),
+            fatal=True,
+            pending_inference=pending,
+        )
+
+    async def AddWhitelist(self, request, context):
+        del request
+        await context.abort(
+            grpc.StatusCode.UNIMPLEMENTED,
+            "AddWhitelist is not part of the serving data plane",
+        )
+
+    async def close(self) -> None:
+        self._accepting = False
+        tasks = tuple(self._inference_tasks)
+        for task in tasks:
+            await self._settle_inference(task)
+
+    def set_accepting(self, accepting: bool) -> None:
+        self._accepting = accepting
+
+    async def _mark_runtime_unhealthy(self) -> None:
+        self._accepting = False
+        if self.mark_unhealthy is not None:
+            try:
+                await self.mark_unhealthy()
+            except Exception:
+                LOGGER.exception("failed to publish NOT_SERVING health state")
+
+    @staticmethod
+    async def _settle_inference(task: asyncio.Task) -> None:
+        """Do not release/reset tracker state before shielded GPU work settles."""
+
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    def _success_response(
+        self,
+        request,
+        image: np.ndarray,
+        result: dict[str, Any],
+        received_at: float,
+        decoded_at: float,
+    ):
+        serialize_started = time.perf_counter()
+        objects = result.get("objects", [])
+        if not isinstance(objects, list) or len(objects) > 100:
+            raise ValueError("runtime objects exceed the response contract")
+        faces = [self._face_metadata(item) for item in objects]
+        timing = result.get("timing_ms", {})
+        response = messages.ProcessedVideoChunk(
+            data=b"",
+            timestamp=request.timestamp,
+            status_message="success",
+            faces=faces,
+            width=int(image.shape[1]),
+            height=int(image.shape[0]),
+            frame_id=request.frame_id,
+            timing=messages.ProcessingTiming(
+                queue_ms=float(timing.get("queue", 0.0)),
+                decode_ms=(decoded_at - received_at) * 1_000,
+                inference_ms=float(timing.get("inference", 0.0)),
+                tracking_ms=float(timing.get("tracking", 0.0)),
+                blur_encode_ms=0.0,
+                inference_batch_size=1,
+                runtime_total_ms=float(timing.get("runtime_total", 0.0)),
+            ),
+            stats=messages.FrameStats(
+                detections=int(result.get("detections", 0)),
+                raw_detections=int(result.get("raw_detections", 0)),
+                continuation_candidates=int(result.get("continuation_candidates", 0)),
+                detector_backed_tracks=int(result.get("detector_backed_tracks", 0)),
+                low_confidence_continuations=int(result.get("low_confidence_continuations", 0)),
+                held_tracks=int(result.get("held_tracks", 0)),
+                tracks=int(result.get("tracks", 0)),
+                tracker_frame=int(result.get("tracker_frame", 0)),
+            ),
+        )
+        response.timing.serialize_ms = (
+            float(timing.get("serialize", 0.0)) + (time.perf_counter() - serialize_started) * 1_000
+        )
+        response.timing.server_total_ms = (time.perf_counter() - received_at) * 1_000
+        response.processing_ms = response.timing.server_total_ms
+        return response
+
+    @staticmethod
+    def _face_metadata(item: dict[str, Any]):
+        bbox = item.get("bbox")
+        polygon = item.get("mask_polygon")
+        if (
+            not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(math.isfinite(float(value)) for value in bbox)
+        ):
+            raise ValueError("face bbox is invalid")
+        if not isinstance(polygon, list) or not 3 <= len(polygon) <= 64:
+            raise ValueError("face polygon is invalid")
+        points = []
+        for point in polygon:
+            if (
+                not isinstance(point, list)
+                or len(point) != 2
+                or not all(math.isfinite(float(value)) for value in point)
+            ):
+                raise ValueError("face polygon point is invalid")
+            points.append(messages.Point(x=float(point[0]), y=float(point[1])))
+        confidence = float(item.get("confidence", 0.0))
+        mask_area = float(item.get("mask_area_px", 0.0))
+        if not math.isfinite(confidence) or not math.isfinite(mask_area):
+            raise ValueError("face confidence or area is invalid")
+        face = messages.FaceMetadata(
+            bbox=messages.BoundingBox(
+                x1=float(bbox[0]),
+                y1=float(bbox[1]),
+                x2=float(bbox[2]),
+                y2=float(bbox[3]),
+            ),
+            confidence=confidence,
+            polygon=points,
+            source=str(item.get("source", "detected")),
+            held=bool(item.get("held", False)),
+            hold_frames=int(item.get("hold_frames", 0)),
+            class_name=str(item.get("class_name", "face")),
+            mask_area_px=mask_area,
+        )
+        if "track_id" in item and item["track_id"] is not None:
+            face.track_id = int(item["track_id"])
+        return face
+
+    @staticmethod
+    def _error_response(
+        request,
+        code: str,
+        message: str,
+        received_at: float,
+        *,
+        inference_batch_size: int = 0,
+    ):
+        elapsed_ms = (time.perf_counter() - received_at) * 1_000
+        return messages.ProcessedVideoChunk(
+            data=b"",
+            timestamp=request.timestamp,
+            status_message="failed",
+            frame_id=request.frame_id,
+            processing_ms=elapsed_ms,
+            timing=messages.ProcessingTiming(
+                inference_batch_size=inference_batch_size,
+                server_total_ms=elapsed_ms,
+            ),
+            error_code=code,
+            error_message=message,
+        )
+
+
+@dataclass(slots=True)
+class GrpcServerBundle:
+    server: grpc.aio.Server
+    servicer: AiProcessorServicer
+    health_servicer: health.aio.HealthServicer
+    bound_port: int
+
+    async def set_serving(self, serving: bool) -> None:
+        status = (
+            health_pb2.HealthCheckResponse.SERVING
+            if serving
+            else health_pb2.HealthCheckResponse.NOT_SERVING
+        )
+        self.servicer.set_accepting(serving)
+        await self.health_servicer.set("", status)
+        await self.health_servicer.set(SERVICE_NAME, status)
+
+
+def build_grpc_server(
+    settings: GrpcServerSettings,
+    runtime: Any,
+    *,
+    tracker_factory: Callable[..., Any] = StreamTracker,
+) -> GrpcServerBundle:
+    server = grpc.aio.server(options=server_options())
+    health_servicer = health.aio.HealthServicer()
+
+    async def mark_unhealthy() -> None:
+        status = health_pb2.HealthCheckResponse.NOT_SERVING
+        await health_servicer.set("", status)
+        await health_servicer.set(SERVICE_NAME, status)
+
+    servicer = AiProcessorServicer(
+        runtime,
+        settings,
+        tracker_factory=tracker_factory,
+        mark_unhealthy=mark_unhealthy,
+    )
+    ai_processor_pb2_grpc.add_AiProcessorServicer_to_server(servicer, server)
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    address = listen_address(settings.host, settings.port)
+    if settings.ssl_certfile is not None:
+        keyfile = settings.ssl_keyfile
+        if keyfile is None:
+            raise AssertionError("TLS key is required with a certificate")
+        private_key = keyfile.read_bytes()
+        certificate_chain = settings.ssl_certfile.read_bytes()
+        credentials = grpc.ssl_server_credentials(((private_key, certificate_chain),))
+        bound_port = server.add_secure_port(address, credentials)
+    else:
+        bound_port = server.add_insecure_port(address)
+    if bound_port == 0:
+        raise RuntimeError(f"failed to bind gRPC server to {address}")
+    return GrpcServerBundle(server, servicer, health_servicer, bound_port)
+
+
+async def serve(settings: GrpcServerSettings) -> None:
+    runtime = None
+    bundle = None
+    try:
+        runtime = await asyncio.to_thread(RuntimeManager, settings.runtime)
+        tracker_probe = await asyncio.to_thread(
+            StreamTracker,
+            settings.tracker_config,
+            runtime.device,
+        )
+        tracker_probe.reset()
+        if not runtime.ready:
+            raise RuntimeError("runtime warm-up did not reach ready state")
+        bundle = build_grpc_server(settings, runtime)
+        await bundle.set_serving(True)
+        await bundle.server.start()
+        LOGGER.info(
+            "gRPC %s listening on %s:%d (backend=%s device=%s streams=%d)",
+            PROFILE,
+            settings.host,
+            bundle.bound_port,
+            runtime.backend,
+            runtime.device,
+            settings.max_streams,
+        )
+        await bundle.server.wait_for_termination()
+    finally:
+        if bundle is not None:
+            bundle.servicer.set_accepting(False)
+            await bundle.health_servicer.enter_graceful_shutdown()
+            await bundle.server.stop(settings.shutdown_grace_seconds)
+            await bundle.servicer.close()
+        if runtime is not None:
+            await asyncio.to_thread(runtime.close)
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least one")
+    return parsed
+
+
+def port_number(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 65_535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return parsed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="InnoLive B1-640 metadata-only gRPC server")
+    parser.add_argument("--host", default=os.getenv("GRPC_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port",
+        type=port_number,
+        default=port_number(os.getenv("GRPC_PORT", "50051")),
+    )
+    parser.add_argument("--engine", type=Path, default=DEFAULT_ENGINE)
+    parser.add_argument("--model", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--backend",
+        choices=sorted(BACKENDS),
+        default=os.getenv("AI_BACKEND", "auto").casefold(),
+    )
+    parser.add_argument("--tracker-config", type=Path, default=DEFAULT_TRACKER)
+    parser.add_argument("--device", default=os.getenv("AI_DEVICE", "auto"))
+    parser.add_argument(
+        "--warmup-runs",
+        type=positive_int,
+        default=positive_int(os.getenv("AI_WARMUP_RUNS", "2")),
+    )
+    parser.add_argument(
+        "--max-streams",
+        type=positive_int,
+        default=positive_int(os.getenv("GRPC_MAX_STREAMS", "1")),
+    )
+    parser.add_argument(
+        "--inference-timeout",
+        type=float,
+        default=float(os.getenv("GRPC_INFERENCE_TIMEOUT", "1.5")),
+    )
+    parser.add_argument(
+        "--shutdown-grace",
+        type=float,
+        default=float(os.getenv("GRPC_SHUTDOWN_GRACE", "5")),
+    )
+    parser.add_argument("--ssl-certfile", type=Path)
+    parser.add_argument("--ssl-keyfile", type=Path)
+    parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
+    return parser.parse_args()
+
+
+def main() -> None:
+    arguments = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, arguments.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    settings = GrpcServerSettings(
+        runtime=RuntimeConfig(
+            checkpoint=arguments.model,
+            engine=arguments.engine,
+            backend=arguments.backend,
+            device=arguments.device,
+            warmup_runs=arguments.warmup_runs,
+        ),
+        tracker_config=arguments.tracker_config,
+        host=arguments.host,
+        port=arguments.port,
+        max_streams=arguments.max_streams,
+        inference_timeout_seconds=arguments.inference_timeout,
+        shutdown_grace_seconds=arguments.shutdown_grace,
+        ssl_certfile=arguments.ssl_certfile,
+        ssl_keyfile=arguments.ssl_keyfile,
+    )
+    with suppress(KeyboardInterrupt):
+        asyncio.run(serve(settings))
+
+
+if __name__ == "__main__":
+    main()

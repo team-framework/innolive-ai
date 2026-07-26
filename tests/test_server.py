@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import unittest
-import asyncio
-from pathlib import Path
+from collections.abc import AsyncIterator
+from typing import Any
 
 import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from server import ServerSettings, create_app, decode_jpeg
+from grpc_client import VideoResult
+from protos import ai_processor_pb2
+from server import ServerSettings, create_app
 from service.protocol import decode_response, encode_request
-from service.runtime import InferenceFailure, RuntimeConfig, TrackingFailure
 
 
 def jpeg(width: int = 64, height: int = 36) -> bytes:
@@ -24,182 +25,183 @@ def jpeg(width: int = 64, height: int = 36) -> bytes:
     return encoded.tobytes()
 
 
-class FakeTracker:
-    frame_id = 1
-
-    def __init__(self, *_args):
-        self.reset_called = False
-
-    def reset(self):
-        self.reset_called = True
-
-
-class FakeRuntime:
-    ready = True
-
-    def __init__(self, _config):
+class FakeGrpcClient:
+    def __init__(self, *, serving: bool = True, mode: str = "success") -> None:
+        self.serving = serving
+        self.mode = mode
         self.closed = False
+        self.received: list[Any] = []
 
-    async def infer(self, _image, _tracker):
-        return {
-            "objects": [],
-            "detections": 0,
-            "raw_detections": 0,
-            "continuation_candidates": 0,
-            "detector_backed_tracks": 0,
-            "low_confidence_continuations": 0,
-            "held_tracks": 0,
-            "tracks": 0,
-            "tracker_frame": 1,
-            "timing_ms": {
-                "queue": 0.1,
-                "inference": 1.0,
-                "tracking": 0.2,
-                "serialize": 0.1,
-                "runtime_total": 1.3,
-            },
-        }
+    async def __aenter__(self):
+        return self
 
-    def health(self):
-        return {"ready": self.ready, "runtime_instances": 1, "scheduler": "serialized_b1"}
-
-    def close(self):
-        self.ready = False
+    async def __aexit__(self, *_exc_info: object) -> None:
         self.closed = True
 
+    async def is_serving(self, service: str, *, timeout: float) -> bool:
+        self.health_request = (service, timeout)
+        return self.serving
 
-def settings(**overrides) -> ServerSettings:
-    values = {
-        "runtime": RuntimeConfig(Path("unused.engine")),
-        "max_jpeg_bytes": 4096,
-    }
-    values.update(overrides)
-    return ServerSettings(**values)
+    async def process_video(
+        self,
+        frames,
+        *,
+        window: int,
+        raise_frame_errors: bool,
+    ) -> AsyncIterator[VideoResult]:
+        self.stream_options = (window, raise_frame_errors)
+        async for frame in frames:
+            self.received.append(frame)
+            response = self._response(frame)
+            yield VideoResult(source_jpeg=frame.data, response=response)
+            if response.error_code == "INFERENCE_FAILED":
+                return
+
+    def _response(self, frame):
+        if self.mode == "decode_then_success" and b"broken" in frame.data:
+            return ai_processor_pb2.ProcessedVideoChunk(
+                timestamp=frame.timestamp,
+                status_message="failed",
+                frame_id=frame.frame_id,
+                error_code="DECODE_FAILED",
+                error_message="frame could not be decoded",
+            )
+        if self.mode == "fatal":
+            return ai_processor_pb2.ProcessedVideoChunk(
+                timestamp=frame.timestamp,
+                status_message="failed",
+                frame_id=frame.frame_id,
+                error_code="INFERENCE_FAILED",
+                error_message="injected inference failure",
+            )
+        return ai_processor_pb2.ProcessedVideoChunk(
+            timestamp=frame.timestamp,
+            status_message="success",
+            width=64,
+            height=36,
+            frame_id=frame.frame_id,
+            timing=ai_processor_pb2.ProcessingTiming(
+                queue_ms=0.1,
+                decode_ms=0.2,
+                inference_ms=1.0,
+                tracking_ms=0.3,
+                serialize_ms=0.1,
+                server_total_ms=1.7,
+                runtime_total_ms=1.4,
+                inference_batch_size=1,
+            ),
+            stats=ai_processor_pb2.FrameStats(tracker_frame=frame.frame_id),
+        )
 
 
-def app(runtime_factory=FakeRuntime, **setting_overrides):
-    return create_app(
-        settings(**setting_overrides),
-        runtime_factory=runtime_factory,
-        tracker_factory=FakeTracker,
+def app(client: FakeGrpcClient | None = None):
+    fake = client or FakeGrpcClient()
+    application = create_app(
+        ServerSettings(grpc_target="test-grpc:50051", max_jpeg_bytes=4096),
+        client_factory=lambda *_args, **_kwargs: fake,
     )
+    return application, fake
 
 
-class InputBoundaryTests(unittest.TestCase):
-    def test_accepts_portrait_and_landscape_at_long_edge_limit(self):
-        configured = settings(max_jpeg_bytes=100_000)
-        self.assertEqual(decode_jpeg(jpeg(640, 360), configured).shape, (360, 640, 3))
-        self.assertEqual(decode_jpeg(jpeg(360, 640), configured).shape, (640, 360, 3))
+class GrpcDemoGatewayTests(unittest.TestCase):
+    def test_health_identifies_the_real_grpc_route(self):
+        application, fake = app()
+        with TestClient(application) as client:
+            health = client.get("/healthz")
 
-    def test_rejects_oversized_dimensions_and_invalid_jpeg(self):
-        configured = settings(max_jpeg_bytes=100_000)
-        with self.assertRaisesRegex(ValueError, "long-edge"):
-            decode_jpeg(jpeg(641, 360), configured)
-        with self.assertRaisesRegex(ValueError, "decoded"):
-            decode_jpeg(b"not jpeg", configured)
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(
+            health.json()["transport_path"], ["browser-websocket", "grpc-bidi-ProcessVideo"]
+        )
+        self.assertEqual(health.json()["grpc"]["target"], "test-grpc:50051")
+        self.assertTrue(health.json()["grpc"]["serving"])
+        self.assertTrue(fake.closed)
 
+    def test_result_passes_through_process_video_as_metadata_only(self):
+        application, fake = app()
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
+            websocket.send_bytes(encode_request(7, jpeg()))
+            result = decode_response(websocket.receive_text())
 
-class WebSocketContractTests(unittest.TestCase):
-    def test_result_is_metadata_only_and_matches_sequence(self):
-        with TestClient(app()) as client:
-            self.assertEqual(client.get("/readyz").status_code, 200)
-            with client.websocket_connect("/ws") as websocket:
-                websocket.send_bytes(encode_request(7, jpeg()))
-                result = decode_response(websocket.receive_text())
-        self.assertEqual(result["type"], "result")
-        self.assertEqual(result["seq"], 7)
-        self.assertEqual(result["width"], 64)
-        self.assertEqual(result["height"], 36)
+        self.assertEqual((result["type"], result["seq"]), ("result", 7))
+        self.assertEqual((result["width"], result["height"]), (64, 36))
+        self.assertEqual(result["transport"], "grpc")
+        self.assertIn("grpc_round_trip", result["timing_ms"])
         self.assertNotIn("jpeg", result)
         self.assertNotIn("data", result)
+        self.assertEqual(fake.stream_options, (5, False))
+        self.assertEqual(fake.received[0].frame_id, 7)
 
-    def test_bad_jpeg_gets_one_terminal_error_and_stream_can_continue(self):
+    def test_grpc_decode_error_is_forwarded_and_stream_can_continue(self):
+        application, _ = app(FakeGrpcClient(mode="decode_then_success"))
         invalid = b"\xff\xd8broken\xff\xd9"
-        with TestClient(app()) as client, client.websocket_connect("/ws") as websocket:
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
             websocket.send_bytes(encode_request(1, invalid))
             error = decode_response(websocket.receive_text())
             websocket.send_bytes(encode_request(2, jpeg()))
             result = decode_response(websocket.receive_text())
-        self.assertEqual((error["type"], error["seq"], error["code"]), ("error", 1, "DECODE_FAILED"))
+
+        self.assertEqual(
+            (error["type"], error["seq"], error["code"]),
+            ("error", 1, "DECODE_FAILED"),
+        )
         self.assertEqual((result["type"], result["seq"]), ("result", 2))
 
-    def test_duplicate_sequence_is_terminal_error(self):
-        with TestClient(app()) as client, client.websocket_connect("/ws") as websocket:
+    def test_duplicate_sequence_is_rejected_before_grpc(self):
+        application, fake = app()
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
             websocket.send_bytes(encode_request(3, jpeg()))
             self.assertEqual(decode_response(websocket.receive_text())["type"], "result")
             websocket.send_bytes(encode_request(3, jpeg()))
             error = decode_response(websocket.receive_text())
-        self.assertEqual(error["code"], "NON_MONOTONIC_SEQUENCE")
 
-    def test_unknown_header_returns_recoverable_sequence_then_closes(self):
+        self.assertEqual(error["code"], "NON_MONOTONIC_SEQUENCE")
+        self.assertEqual([frame.frame_id for frame in fake.received], [3])
+
+    def test_unknown_header_returns_sequence_then_closes(self):
+        application, _ = app()
         payload = b"OLD1\x00\x00\x00\x09" + jpeg()
-        with TestClient(app()) as client, client.websocket_connect("/ws") as websocket:
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
             websocket.send_bytes(payload)
             error = decode_response(websocket.receive_text())
             with self.assertRaises(WebSocketDisconnect):
                 websocket.receive_text()
+
         self.assertEqual((error["seq"], error["code"]), (9, "INVALID_HEADER"))
 
-    def test_inference_failure_returns_terminal_error_without_partial_result(self):
-        class FailedInference(FakeRuntime):
-            async def infer(self, _image, _tracker):
-                raise InferenceFailure("injected failure")
-
-        with TestClient(app(FailedInference)) as client, client.websocket_connect("/ws") as websocket:
+    def test_fatal_grpc_frame_error_is_forwarded_then_closes(self):
+        application, _ = app(FakeGrpcClient(mode="fatal"))
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
             websocket.send_bytes(encode_request(5, jpeg()))
             error = decode_response(websocket.receive_text())
+            with self.assertRaises(WebSocketDisconnect):
+                websocket.receive_text()
+
         self.assertEqual((error["seq"], error["code"]), (5, "INFERENCE_FAILED"))
-        self.assertNotIn("objects", error)
 
-    def test_tracking_failure_has_its_own_terminal_stage(self):
-        class FailedTracking(FakeRuntime):
-            async def infer(self, _image, _tracker):
-                raise TrackingFailure("injected failure")
-
-        with TestClient(app(FailedTracking)) as client, client.websocket_connect("/ws") as websocket:
-            websocket.send_bytes(encode_request(8, jpeg()))
-            error = decode_response(websocket.receive_text())
-        self.assertEqual((error["seq"], error["code"]), (8, "TRACKING_FAILED"))
-
-    def test_serialization_failure_returns_error_instead_of_partial_metadata(self):
-        class OversizedMetadata(FakeRuntime):
-            async def infer(self, image, tracker):
-                result = await super().infer(image, tracker)
-                result["objects"] = [{"mask_polygon": "x" * (600 * 1024)}]
-                return result
-
-        with TestClient(app(OversizedMetadata)) as client, client.websocket_connect("/ws") as websocket:
-            websocket.send_bytes(encode_request(10, jpeg()))
-            error = decode_response(websocket.receive_text())
-        self.assertEqual((error["seq"], error["code"]), (10, "SERIALIZATION_FAILED"))
-
-    def test_timeout_returns_terminal_error(self):
-        class SlowInference(FakeRuntime):
-            async def infer(self, _image, _tracker):
-                await asyncio.sleep(0.02)
-                return await super().infer(_image, _tracker)
-
-        configured = app(SlowInference, inference_timeout_seconds=0.001)
-        with TestClient(configured) as client, client.websocket_connect("/ws") as websocket:
-            websocket.send_bytes(encode_request(6, jpeg()))
-            error = decode_response(websocket.receive_text())
-        self.assertEqual((error["seq"], error["code"]), (6, "INFERENCE_TIMEOUT"))
-
-    def test_second_stream_is_rejected_by_admission_control(self):
-        with TestClient(app()) as client, client.websocket_connect("/ws"):
-            with client.websocket_connect("/ws") as second:
-                with self.assertRaises(WebSocketDisconnect) as closed:
-                    second.receive_text()
+    def test_second_browser_stream_is_rejected(self):
+        application, _ = app()
+        with (
+            TestClient(application) as client,
+            client.websocket_connect("/ws"),
+            client.websocket_connect("/ws") as second,
+            self.assertRaises(WebSocketDisconnect) as closed,
+        ):
+            second.receive_text()
         self.assertEqual(closed.exception.code, 1013)
 
-    def test_readiness_failure_rejects_health_and_stream(self):
-        def failed_runtime(_config):
-            raise RuntimeError("warm-up failed")
-
-        with TestClient(app(failed_runtime)) as client:
+    def test_not_serving_grpc_backend_rejects_health_and_stream(self):
+        application, _ = app(FakeGrpcClient(serving=False))
+        with TestClient(application) as client:
             health = client.get("/healthz")
             self.assertEqual(health.status_code, 503)
-            self.assertEqual(health.json()["status"], "not_ready")
+            self.assertFalse(health.json()["grpc"]["serving"])
+            with (
+                client.websocket_connect("/ws") as websocket,
+                self.assertRaises(WebSocketDisconnect) as closed,
+            ):
+                websocket.receive_text()
+        self.assertEqual(closed.exception.code, 1013)
 
 
 if __name__ == "__main__":

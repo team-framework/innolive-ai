@@ -179,7 +179,7 @@ class App {
       [
         "start", "stop", "status", "source", "output", "capture",
         "capture-fps", "sent-fps", "result-fps", "display-fps", "round-trip",
-        "server-time", "queue", "dropped", "diagnostics",
+        "grpc-round-trip", "server-time", "queue", "dropped", "diagnostics",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -283,7 +283,7 @@ class App {
         this.measurementStartedAt = performance.now();
         this.lastMetricSampleAt = this.measurementStartedAt;
         this.elements.stop.disabled = false;
-        this.setStatus("연결됨 · ILF1 B1-640-Q90-W5", true);
+        this.setStatus("연결됨 · WebSocket → gRPC ProcessVideo", true);
         this.blackout("첫 보호 결과 대기 중");
         this.scheduleCapture();
       };
@@ -315,8 +315,9 @@ class App {
       || Number(profile.client_window) !== PROFILE.requestWindow
       || Number(profile.target_fps) !== PROFILE.targetFps
       || Number(profile.max_streams) !== 1
-      || health.runtime?.scheduler !== "serialized_b1"
-      || Number(health.runtime?.runtime_instances) !== 1
+      || health.grpc?.service !== "AiProcessor"
+      || health.grpc?.serving !== true
+      || health.transport_path?.[1] !== "grpc-bidi-ProcessVideo"
     ) {
       throw new Error("server does not satisfy the B1-640-Q90-W5 contract");
     }
@@ -670,6 +671,7 @@ class App {
     this.elements["result-fps"].textContent = String(metrics.result_fps);
     this.elements["display-fps"].textContent = String(metrics.display_fps);
     this.elements["round-trip"].textContent = `${item.rtt.toFixed(1)} / ${metrics.round_trip_p95_ms} ms`;
+    this.elements["grpc-round-trip"].textContent = `${Number(timing.grpc_round_trip || 0).toFixed(1)} ms`;
     this.elements["server-time"].textContent = `${Number(timing.server_total || 0).toFixed(1)} ms`;
     this.elements.queue.textContent = `${metrics.pending_frames} / ${metrics.inflight_requests}`;
     this.elements.dropped.textContent = `${metrics.capture_dropped} / ${metrics.stale_results + metrics.render_dropped}`;

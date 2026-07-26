@@ -5,8 +5,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from service.runtime import RuntimeConfig, validate_engine
+from service.runtime import RuntimeConfig, select_runtime, validate_engine
 
 
 class RuntimeContractTests(unittest.TestCase):
@@ -65,6 +66,29 @@ class RuntimeContractTests(unittest.TestCase):
             (Path(temporary) / "best.pt").write_bytes(b"different")
             with self.assertRaisesRegex(RuntimeError, "checkpoint hash"):
                 validate_engine(RuntimeConfig(engine=engine))
+
+    def test_auto_falls_back_to_pytorch_when_tensorrt_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "best.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            config = RuntimeConfig(checkpoint=checkpoint, device="cpu")
+            with patch("service.runtime._tensorrt_supported", return_value=False):
+                selection = select_runtime(config)
+        self.assertEqual(selection.backend, "pytorch")
+        self.assertEqual(selection.artifact, checkpoint.resolve())
+        self.assertEqual(selection.device, "cpu")
+
+    def test_explicit_tensorrt_never_silently_falls_back(self):
+        config = RuntimeConfig(backend="tensorrt")
+        with (
+            patch("service.runtime._tensorrt_supported", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "TensorRT requires"),
+        ):
+            select_runtime(config)
+
+    def test_normalizes_backend_and_device_options(self):
+        config = RuntimeConfig(backend=" PyTorch ", device=" MPS ")
+        self.assertEqual((config.backend, config.device), ("pytorch", "mps"))
 
 
 if __name__ == "__main__":

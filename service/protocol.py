@@ -6,7 +6,6 @@ import json
 import struct
 from typing import Any
 
-
 MAGIC = b"ILF1"
 VERSION = 1
 HEADER = struct.Struct("!4sI")

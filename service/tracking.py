@@ -9,8 +9,7 @@ from typing import Any
 import numpy as np
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
 from ultralytics.trackers.utils.stracks import parse_bboxes
-from ultralytics.utils import IterableSimpleNamespace, YAML
-
+from ultralytics.utils import YAML, IterableSimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "botsort.yaml"
@@ -69,16 +68,17 @@ class _ConnectionBOTSORT(BOTSORT):
                     results.conf,
                     results.cls,
                     features,
+                    strict=False,
                 )
             ]
         return [
             self._track_class(xywh, score, cls)
-            for xywh, score, cls in zip(bboxes, results.conf, results.cls)
+            for xywh, score, cls in zip(bboxes, results.conf, results.cls, strict=False)
         ]
 
 
 class StreamTracker:
-    """One ordered tracker and mask cache owned by one WebSocket connection."""
+    """One ordered tracker and mask cache owned by one client stream."""
 
     def __init__(self, config: Path = DEFAULT_CONFIG, device: str = "0"):
         config_path = config.expanduser().resolve()
@@ -112,7 +112,22 @@ class StreamTracker:
         width: int,
         height: int,
     ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-        current: list[dict[str, Any]] = []
+        current, current_ids, current_boxes, low_confidence_continuations = self._record_current(
+            objects
+        )
+        held = self._held_objects(current_ids, current_boxes, width, height)
+        self._prune_masks()
+        return current + held, {
+            "detector_backed_tracks": len(objects),
+            "low_confidence_continuations": low_confidence_continuations,
+            "held_tracks": len(held),
+        }
+
+    def _record_current(
+        self,
+        objects: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], set[int], list[np.ndarray], int]:
+        tracked_objects: list[dict[str, Any]] = []
         current_ids: set[int] = set()
         current_boxes: list[np.ndarray] = []
         low_confidence_continuations = 0
@@ -121,21 +136,15 @@ class StreamTracker:
             tracked = dict(item)
             track_id = int(tracked["track_id"])
             confidence = float(tracked["confidence"])
-            source = (
-                "continued_low"
-                if confidence < ACTIVATION_CONFIDENCE
-                else "detected"
-            )
+            source = "continued_low" if confidence < ACTIVATION_CONFIDENCE else "detected"
             if source == "continued_low":
                 low_confidence_continuations += 1
             tracked.update({"source": source, "held": False, "hold_frames": 0})
-            current.append(tracked)
+            tracked_objects.append(tracked)
             current_ids.add(track_id)
             bbox = np.asarray(tracked["bbox"], dtype=np.float32)
             current_boxes.append(bbox)
-            polygon = np.asarray(tracked["mask_polygon"], dtype=np.float32).reshape(
-                (-1, 2)
-            )
+            polygon = np.asarray(tracked["mask_polygon"], dtype=np.float32).reshape((-1, 2))
             if len(polygon) >= 3:
                 self._masks[track_id] = _MaskState(
                     bbox=bbox.copy(),
@@ -145,8 +154,16 @@ class StreamTracker:
                     class_name=str(tracked["class_name"]),
                     last_detection_frame=self.frame_id,
                 )
+        return tracked_objects, current_ids, current_boxes, low_confidence_continuations
 
-        held_tracks = 0
+    def _held_objects(
+        self,
+        current_ids: set[int],
+        current_boxes: list[np.ndarray],
+        width: int,
+        height: int,
+    ) -> list[dict[str, Any]]:
+        held: list[dict[str, Any]] = []
         for lost in self._tracker.lost_stracks:
             track_id = int(lost.track_id)
             state = self._masks.get(track_id)
@@ -165,7 +182,7 @@ class StreamTracker:
             polygon = _warp_polygon(state.polygon, state.bbox, target, width, height)
             if len(polygon) < 3:
                 continue
-            current.append(
+            held.append(
                 {
                     "track_id": track_id,
                     "class_id": state.class_id,
@@ -175,9 +192,7 @@ class StreamTracker:
                         4,
                     ),
                     "bbox": [round(float(value), 1) for value in target],
-                    "mask_polygon": [
-                        [round(float(x), 1), round(float(y), 1)] for x, y in polygon
-                    ],
+                    "mask_polygon": [[round(float(x), 1), round(float(y), 1)] for x, y in polygon],
                     "mask_area_px": round(_polygon_area(polygon), 1),
                     "source": "held",
                     "held": True,
@@ -185,17 +200,12 @@ class StreamTracker:
                     "hold_limit": 1,
                 }
             )
-            held_tracks += 1
+        return held
 
+    def _prune_masks(self) -> None:
         for track_id, state in list(self._masks.items()):
             if self.frame_id - state.last_detection_frame > 30:
                 del self._masks[track_id]
-
-        return current, {
-            "detector_backed_tracks": len(objects),
-            "low_confidence_continuations": low_confidence_continuations,
-            "held_tracks": held_tracks,
-        }
 
     def reset(self) -> None:
         self._tracker.reset()
