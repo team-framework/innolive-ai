@@ -7,6 +7,7 @@ import {
   captureDeadline,
   fitLongEdge,
   framePacket,
+  negotiateServerProfile,
   objectsToBlur,
   parseTerminal,
   percentile,
@@ -25,6 +26,54 @@ assert.deepEqual(PROFILE, {
 assert.deepEqual(fitLongEdge(1920, 1080), [640, 360]);
 assert.deepEqual(fitLongEdge(1080, 1920), [360, 640]);
 assert.deepEqual(fitLongEdge(320, 240), [320, 240]);
+
+const health = {
+  status: "ok",
+  profile: "a-newer-profile-name",
+  protocol: { name: "ILF1", version: 1 },
+  transport_path: ["browser-websocket", "metrics", "grpc-bidi-ProcessVideo"],
+  grpc: { service: "AiProcessor", serving: true },
+  serving_profile: {
+    engine_batch: 4,
+    max_long_edge: 1280,
+    jpeg_quality: 95,
+    client_window: 12,
+    target_fps: 60,
+    max_streams: 32,
+  },
+};
+assert.deepEqual(negotiateServerProfile(health), {
+  ...PROFILE,
+  maxStreams: 32,
+});
+assert.deepEqual(negotiateServerProfile({
+  ...health,
+  serving_profile: {
+    engine_batch: 1,
+    image_size: 320,
+    jpeg_quality: 75,
+    client_window: 2,
+    target_fps: 15,
+  },
+}), {
+  ...PROFILE,
+  longEdge: 320,
+  jpegQuality: 0.75,
+  targetFps: 15,
+  requestWindow: 2,
+  maxStreams: null,
+});
+assert.throws(
+  () => negotiateServerProfile({ ...health, protocol: { name: "ILF1", version: 2 } }),
+  /ILF1 v1 is required/,
+);
+assert.throws(
+  () => negotiateServerProfile({
+    ...health,
+    serving_profile: { ...health.serving_profile, max_streams: 0 },
+  }),
+  /max_streams must be a positive integer/,
+);
 
 const jpeg = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])]);
 const packet = new Uint8Array(await framePacket(0x01020304, jpeg).arrayBuffer());
@@ -115,4 +164,4 @@ renderQueue.finish(frame3);
 assert.equal(renderQueue.lastCommittedSequence, 3);
 assert.equal(renderQueue.enqueue(frame2).accepted, false, "commit sequence must be monotonic");
 
-console.log("ILF1 B1-640-Q90-W5 browser contract passed");
+console.log("ILF1 browser compatibility contract passed");

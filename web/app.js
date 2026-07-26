@@ -64,6 +64,88 @@ export function objectsToBlur(objects) {
   return objects.filter((object) => object.whitelisted !== true);
 }
 
+export function negotiateServerProfile(health, preferred = PROFILE) {
+  const profile = health?.serving_profile || {};
+  const violations = [];
+  if (health?.status !== "ok") violations.push("server is not ready");
+  if (health?.protocol?.name !== "ILF1") violations.push("ILF1 is required");
+  if (Number(health?.protocol?.version) !== preferred.protocolVersion) {
+    violations.push(`ILF1 v${preferred.protocolVersion} is required`);
+  }
+  if (health?.grpc?.serving !== true) violations.push("gRPC backend is not serving");
+  if (
+    !Array.isArray(health?.transport_path)
+    || !health.transport_path.includes("grpc-bidi-ProcessVideo")
+  ) {
+    violations.push("gRPC ProcessVideo transport is required");
+  }
+
+  positiveInteger(profile.engine_batch, "engine_batch", violations);
+  const maxLongEdge = positiveInteger(
+    profile.max_long_edge ?? profile.image_size,
+    "max_long_edge",
+    violations,
+  );
+  const jpegQuality = finiteRange(
+    profile.jpeg_quality,
+    "jpeg_quality",
+    1,
+    100,
+    violations,
+  );
+  const requestWindow = positiveInteger(
+    profile.client_window,
+    "client_window",
+    violations,
+  );
+  const targetFps = finiteRange(
+    profile.target_fps,
+    "target_fps",
+    Number.MIN_VALUE,
+    240,
+    violations,
+  );
+  const maxStreams = profile.max_streams === undefined
+    ? null
+    : positiveInteger(profile.max_streams, "max_streams", violations);
+
+  if (maxLongEdge !== null && maxLongEdge < 32) {
+    violations.push("max_long_edge must be at least 32");
+  }
+  if (violations.length) {
+    throw new Error(`incompatible server: ${violations.join("; ")}`);
+  }
+
+  return Object.freeze({
+    protocolVersion: preferred.protocolVersion,
+    longEdge: Math.min(preferred.longEdge, maxLongEdge),
+    jpegQuality: Math.min(preferred.jpegQuality, jpegQuality / 100),
+    targetFps: Math.min(preferred.targetFps, targetFps),
+    requestWindow: Math.min(preferred.requestWindow, requestWindow),
+    timeoutMs: preferred.timeoutMs,
+    upscaleSmallInputs: preferred.upscaleSmallInputs,
+    maxStreams,
+  });
+}
+
+function positiveInteger(value, name, violations) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    violations.push(`${name} must be a positive integer`);
+    return null;
+  }
+  return number;
+}
+
+function finiteRange(value, name, minimum, maximum, violations) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < minimum || number > maximum) {
+    violations.push(`${name} must be in ${minimum}..${maximum}`);
+    return null;
+  }
+  return number;
+}
+
 export function captureDeadline(
   currentDeadline,
   now,
@@ -209,6 +291,7 @@ class App {
     this.nextSequence = 1;
     this.nextCaptureDeadline = null;
     this.lastTerminalSequence = 0;
+    this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
     this.measurementStartedAt = null;
     this.lastMetricSampleAt = null;
@@ -257,13 +340,16 @@ class App {
     try {
       const response = await fetch("/healthz", { cache: "no-store" });
       if (!response.ok) throw new Error(`server is not ready (${response.status})`);
-      this.validateHealth(await response.json());
+      this.activeProfile = negotiateServerProfile(await response.json());
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: "user",
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          frameRate: { ideal: PROFILE.targetFps, max: PROFILE.targetFps },
+          frameRate: {
+            ideal: this.activeProfile.targetFps,
+            max: this.activeProfile.targetFps,
+          },
         },
         audio: false,
       });
@@ -306,27 +392,6 @@ class App {
     }
   }
 
-  validateHealth(health) {
-    const profile = health.serving_profile || {};
-    if (
-      health.status !== "ok"
-      || health.profile !== "B1-640-Q90-W5"
-      || health.protocol?.name !== "ILF1"
-      || Number(health.protocol?.version) !== PROFILE.protocolVersion
-      || Number(profile.engine_batch) !== 1
-      || Number(profile.max_long_edge) !== PROFILE.longEdge
-      || Number(profile.jpeg_quality) !== 90
-      || Number(profile.client_window) !== PROFILE.requestWindow
-      || Number(profile.target_fps) !== PROFILE.targetFps
-      || Number(profile.max_streams) !== 1
-      || health.grpc?.service !== "AiProcessor"
-      || health.grpc?.serving !== true
-      || health.transport_path?.[1] !== "grpc-bidi-ProcessVideo"
-    ) {
-      throw new Error("server does not satisfy the B1-640-Q90-W5 contract");
-    }
-  }
-
   scheduleCapture() {
     this.clearCaptureSchedule();
     if (!this.running) return;
@@ -349,7 +414,11 @@ class App {
   capture(now) {
     this.scheduleCapture();
     if (!this.running) return;
-    const deadline = captureDeadline(this.nextCaptureDeadline, now);
+    const deadline = captureDeadline(
+      this.nextCaptureDeadline,
+      now,
+      1000 / this.activeProfile.targetFps,
+    );
     this.nextCaptureDeadline = deadline.nextDeadline;
     if (!deadline.due) return;
     this.mark(this.rates.capture, now);
@@ -363,6 +432,7 @@ class App {
     const [width, height] = fitLongEdge(
       this.elements.source.videoWidth,
       this.elements.source.videoHeight,
+      this.activeProfile.longEdge,
     );
     this.elements.capture.width = width;
     this.elements.capture.height = height;
@@ -382,7 +452,7 @@ class App {
       }
       this.pendingLatest = { jpeg, capturedAt, width, height };
       this.pump();
-    }, "image/jpeg", PROFILE.jpegQuality);
+    }, "image/jpeg", this.activeProfile.jpegQuality);
   }
 
   pump() {
@@ -391,7 +461,7 @@ class App {
       || !this.pendingLatest
       || !this.socket
       || this.socket.readyState !== WebSocket.OPEN
-      || this.inFlight.size >= PROFILE.requestWindow
+      || this.inFlight.size >= this.activeProfile.requestWindow
     ) return;
     if (this.nextSequence > MAX_SEQUENCE) {
       this.failClosed("sequence exhausted; reconnect required");
@@ -403,7 +473,7 @@ class App {
     const sentAt = performance.now();
     const timeout = setTimeout(
       () => this.failClosed(`response timeout for seq ${sequence}`),
-      PROFILE.timeoutMs,
+      this.activeProfile.timeoutMs,
     );
     const request = {
       ...frame,
@@ -490,9 +560,9 @@ class App {
       this.counters.bitmapOwnerPeak,
       this.counters.bitmapOwners,
     );
-    if (this.counters.bitmapOwners > PROFILE.requestWindow + 2) {
+    if (this.counters.bitmapOwners > this.activeProfile.requestWindow + 2) {
       this.counters.bitmapOwners -= 1;
-      throw new Error("bitmap ownership exceeded the W5 + active + waiting bound");
+      throw new Error("bitmap ownership exceeded the negotiated window bound");
     }
     window.__INNOLIVE_BITMAP_OWNERS__ = this.counters.bitmapOwners;
     return new BitmapLease(
@@ -634,7 +704,7 @@ class App {
     const elapsedMs = Math.max(0, now - this.measurementStartedAt);
     const elapsedSeconds = Math.max(elapsedMs / 1000, Number.EPSILON);
     const metrics = {
-      profile: PROFILE,
+      profile: this.activeProfile,
       seq: item.sequence,
       capture_fps: this.rate(this.rates.capture, now),
       encoded_fps: this.rate(this.rates.encoded, now),
@@ -675,7 +745,7 @@ class App {
       capture_to_display_ms: Number(latency.captureToDisplay.toFixed(2)),
       capture_to_display_p50_ms: this.roundedPercentile(this.samples.captureToDisplay, 0.50),
       capture_to_display_p95_ms: this.roundedPercentile(this.samples.captureToDisplay, 0.95),
-      upscale_small_inputs: PROFILE.upscaleSmallInputs,
+      upscale_small_inputs: this.activeProfile.upscaleSmallInputs,
       server: item.metadata,
     };
     this.elements["capture-fps"].textContent = `${metrics.capture_fps} / ${metrics.encoded_fps}`;
