@@ -44,7 +44,9 @@ from service.recognition import (
     SessionState,
     SessionSummary,
     StreamRecognition,
+    WhitelistEntryNotFoundError,
     WhitelistLimitError,
+    validate_entry_id,
     validate_session_id,
 )
 from service.runtime import (
@@ -440,6 +442,27 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             session_id=session_id,
             entry_count=len(snapshot.entries),
             whitelist_version=snapshot.version,
+            entry_ids=[entry.entry_id for entry in snapshot.entries],
+        )
+
+    async def DeleteWhitelist(self, request, context):
+        try:
+            session_id = validate_session_id(request.session_id)
+            entry_id = validate_entry_id(request.entry_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        try:
+            deleted_entry_id, entry_count, version = self.sessions.delete_whitelist_entry(
+                session_id, entry_id
+            )
+        except (SessionNotFoundError, WhitelistEntryNotFoundError) as error:
+            await context.abort(grpc.StatusCode.NOT_FOUND, str(error))
+        return messages.WhitelistResponse(
+            status_message="success",
+            timestamp=time.time_ns(),
+            entry_id=deleted_entry_id,
+            entry_count=entry_count,
+            whitelist_version=version,
         )
 
     async def CreateSession(self, request, context):
@@ -831,6 +854,11 @@ def parse_args() -> argparse.Namespace:
         default=positive_int(os.getenv("ADAFACE_MAX_PENDING_PER_STREAM", "4")),
     )
     parser.add_argument(
+        "--adaface-pending-timeout",
+        type=float,
+        default=float(os.getenv("ADAFACE_PENDING_TIMEOUT", "1.0")),
+    )
+    parser.add_argument(
         "--max-sessions",
         type=positive_int,
         default=positive_int(os.getenv("MAX_SESSIONS", "1024")),
@@ -882,6 +910,7 @@ def main() -> None:
             revalidate_frames=arguments.adaface_revalidate_frames,
             missing_track_frames=arguments.adaface_missing_track_frames,
             max_pending_per_stream=arguments.adaface_max_pending_per_stream,
+            pending_timeout_seconds=arguments.adaface_pending_timeout,
             min_face_size=arguments.adaface_min_face_size,
         ),
         tracker_config=arguments.tracker_config,

@@ -16,7 +16,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.grpc_config import channel_options
 from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
-from service.recognition import validate_session_id
+from service.recognition import validate_entry_id, validate_session_id
 
 MAX_WINDOW = 5
 MAX_FRAME_ID = 2**32 - 1
@@ -99,6 +99,18 @@ class VideoSession:
     ) -> list[ai_processor_pb2.WhitelistResponse]:
         return await self._client.add_whitelist_many(
             images,
+            session_id=self.session_id,
+            timeout=timeout,
+        )
+
+    async def delete_whitelist(
+        self,
+        entry_id: str,
+        *,
+        timeout: float = 2.0,
+    ) -> ai_processor_pb2.WhitelistResponse:
+        return await self._client.delete_whitelist(
+            entry_id,
             session_id=self.session_id,
             timeout=timeout,
         )
@@ -270,6 +282,33 @@ class VideoProcessorClient:
         except grpc.aio.AioRpcError as error:
             raise VideoRpcError("AddWhitelist", error.code(), error.details()) from error
 
+    async def delete_whitelist(
+        self,
+        entry_id: str,
+        *,
+        session_id: str,
+        timeout: float = 2.0,
+    ) -> ai_processor_pb2.WhitelistResponse:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        session_id = validate_session_id(session_id)
+        entry_id = validate_entry_id(entry_id)
+        try:
+            response = await self._stub.DeleteWhitelist(
+                ai_processor_pb2.DeleteWhitelistRequest(
+                    session_id=session_id,
+                    entry_id=entry_id,
+                ),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError("DeleteWhitelist", error.code(), error.details()) from error
+        if response.entry_id != entry_id:
+            raise VideoProtocolError("DeleteWhitelist returned a different entry ID")
+        return response
+
     async def create_session(
         self,
         *,
@@ -359,7 +398,7 @@ class VideoProcessorClient:
             raise ValueError("timeout must be positive")
         session_id = validate_session_id(session_id)
         try:
-            return await self._stub.GetWhitelistStatus(
+            response = await self._stub.GetWhitelistStatus(
                 ai_processor_pb2.GetWhitelistStatusRequest(session_id=session_id),
                 timeout=timeout,
             )
@@ -369,6 +408,17 @@ class VideoProcessorClient:
                 error.code(),
                 error.details(),
             ) from error
+        if response.session_id != session_id:
+            raise VideoProtocolError("GetWhitelistStatus returned a different session ID")
+        try:
+            entry_ids = [validate_entry_id(entry_id) for entry_id in response.entry_ids]
+        except ValueError as error:
+            raise VideoProtocolError("GetWhitelistStatus returned an invalid entry ID") from error
+        if len(entry_ids) != response.entry_count:
+            raise VideoProtocolError("GetWhitelistStatus returned an inconsistent entry count")
+        if len(entry_ids) != len(set(entry_ids)):
+            raise VideoProtocolError("GetWhitelistStatus returned duplicate entry IDs")
+        return response
 
     async def process_video(
         self,

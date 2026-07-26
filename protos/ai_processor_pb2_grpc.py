@@ -46,6 +46,11 @@ class AiProcessorStub:
                 request_serializer=protos_dot_ai__processor__pb2.FaceData.SerializeToString,
                 response_deserializer=protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
                 _registered_method=True)
+        self.DeleteWhitelist = channel.unary_unary(
+                '/AiProcessor/DeleteWhitelist',
+                request_serializer=protos_dot_ai__processor__pb2.DeleteWhitelistRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
+                _registered_method=True)
         self.GetWhitelistStatus = channel.unary_unary(
                 '/AiProcessor/GetWhitelistStatus',
                 request_serializer=protos_dot_ai__processor__pb2.GetWhitelistStatusRequest.SerializeToString,
@@ -81,6 +86,13 @@ class AiProcessorServicer:
 
     def AddWhitelist(self, request, context):
         """Adds one face exemplar to the session-scoped in-memory whitelist.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteWhitelist(self, request, context):
+        """Removes one face exemplar from a session-scoped in-memory whitelist.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -125,6 +137,11 @@ def add_AiProcessorServicer_to_server(servicer, server):
             'AddWhitelist': grpc.unary_unary_rpc_method_handler(
                     servicer.AddWhitelist,
                     request_deserializer=protos_dot_ai__processor__pb2.FaceData.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.WhitelistResponse.SerializeToString,
+            ),
+            'DeleteWhitelist': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteWhitelist,
+                    request_deserializer=protos_dot_ai__processor__pb2.DeleteWhitelistRequest.FromString,
                     response_serializer=protos_dot_ai__processor__pb2.WhitelistResponse.SerializeToString,
             ),
             'GetWhitelistStatus': grpc.unary_unary_rpc_method_handler(
@@ -202,6 +219,33 @@ class AiProcessor:
             target,
             '/AiProcessor/AddWhitelist',
             protos_dot_ai__processor__pb2.FaceData.SerializeToString,
+            protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteWhitelist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/DeleteWhitelist',
+            protos_dot_ai__processor__pb2.DeleteWhitelistRequest.SerializeToString,
             protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
             options,
             channel_credentials,

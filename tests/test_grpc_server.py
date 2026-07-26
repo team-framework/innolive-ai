@@ -124,6 +124,34 @@ class FakeRuntime:
         }
 
 
+class FaceRuntime(FakeRuntime):
+    async def infer(
+        self,
+        image: np.ndarray,
+        tracker: FakeTracker,
+    ) -> dict[str, Any]:
+        result = await super().infer(image, tracker)
+        result.update(
+            objects=[
+                {
+                    "bbox": [10.0, 2.0, 50.0, 34.0],
+                    "mask_polygon": [
+                        [10.0, 2.0],
+                        [50.0, 2.0],
+                        [50.0, 34.0],
+                        [10.0, 34.0],
+                    ],
+                    "confidence": 0.9,
+                    "track_id": 1,
+                    "source": "detected",
+                }
+            ],
+            detections=1,
+            tracks=1,
+        )
+        return result
+
+
 class FailedRuntime(FakeRuntime):
     async def infer(
         self,
@@ -476,8 +504,81 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((status_a.entry_count, status_a.whitelist_version), (2, 2))
         self.assertEqual((status_b.entry_count, status_b.whitelist_version), (1, 1))
         self.assertEqual((missing.entry_count, missing.whitelist_version), (0, 0))
+        self.assertCountEqual(status_a.entry_ids, [first.entry_id, second.entry_id])
+        self.assertEqual(list(status_b.entry_ids), [other.entry_id])
+        self.assertEqual(list(missing.entry_ids), [])
         self.assertEqual(adaface.calls, 3)
         self.assertEqual(adaface.enrollment_calls, 3)
+
+    async def test_delete_whitelist_updates_status_during_an_active_stream(self):
+        adaface = FakeAdaFace()
+        async with LoopbackServer(FaceRuntime(), adaface=adaface) as server:
+            first = await server.stub.AddWhitelist(
+                ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+            )
+            adaface.embedding = np.asarray([0.0, 1.0], dtype=np.float32)
+            second = await server.stub.AddWhitelist(
+                ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+            )
+            adaface.embedding = np.asarray([1.0, 0.0], dtype=np.float32)
+            call = server.stub.ProcessVideo()
+            await call.write(_request(frame_id=1, session_id="session-a"))
+            self.assertFalse((await call.read()).faces[0].whitelisted)
+            await call.write(_request(frame_id=2, session_id="session-a"))
+            self.assertTrue((await call.read()).faces[0].whitelisted)
+
+            deleted = await server.stub.DeleteWhitelist(
+                ai_processor_pb2.DeleteWhitelistRequest(
+                    session_id="session-a",
+                    entry_id=first.entry_id,
+                )
+            )
+            status = await server.stub.GetWhitelistStatus(
+                ai_processor_pb2.GetWhitelistStatusRequest(session_id="session-a")
+            )
+            listed = await server.stub.ListSessions(ai_processor_pb2.ListSessionsRequest())
+
+            self.assertEqual(
+                (deleted.entry_id, deleted.entry_count, deleted.whitelist_version),
+                (first.entry_id, 1, 3),
+            )
+            self.assertEqual(
+                (status.entry_count, status.whitelist_version, list(status.entry_ids)),
+                (1, 3, [second.entry_id]),
+            )
+            self.assertEqual(listed.sessions[0].active_stream_count, 1)
+
+            await call.write(_request(frame_id=3, session_id="session-a"))
+            self.assertFalse((await call.read()).faces[0].whitelisted)
+            await call.write(_request(frame_id=4, session_id="session-a"))
+            self.assertFalse((await call.read()).faces[0].whitelisted)
+
+            for request in (
+                ai_processor_pb2.DeleteWhitelistRequest(
+                    session_id="session-a",
+                    entry_id=first.entry_id,
+                ),
+                ai_processor_pb2.DeleteWhitelistRequest(
+                    session_id="missing-session",
+                    entry_id=second.entry_id,
+                ),
+            ):
+                with self.assertRaises(grpc.aio.AioRpcError) as missing:
+                    await server.stub.DeleteWhitelist(request)
+                self.assertEqual(missing.exception.code(), grpc.StatusCode.NOT_FOUND)
+
+            await call.done_writing()
+            self.assertIs(await call.read(), grpc.aio.EOF)
+
+    async def test_delete_whitelist_validates_session_and_entry_ids(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            for request in (
+                ai_processor_pb2.DeleteWhitelistRequest(session_id=" ", entry_id="entry"),
+                ai_processor_pb2.DeleteWhitelistRequest(session_id="session", entry_id=" "),
+            ):
+                with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                    await server.stub.DeleteWhitelist(request)
+                self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
     async def test_add_whitelist_accepts_png_and_webp(self):
         adaface = FakeAdaFace()

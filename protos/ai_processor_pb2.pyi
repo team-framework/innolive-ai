@@ -170,14 +170,24 @@ class GetWhitelistStatusRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ...) -> None: ...
 
 class GetWhitelistStatusResponse(_message.Message):
-    __slots__ = ("session_id", "entry_count", "whitelist_version")
+    __slots__ = ("session_id", "entry_count", "whitelist_version", "entry_ids")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
     WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_IDS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     entry_count: int
     whitelist_version: int
-    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ...) -> None: ...
+    entry_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ..., entry_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class DeleteWhitelistRequest(_message.Message):
+    __slots__ = ("session_id", "entry_id")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    entry_id: str
+    def __init__(self, session_id: _Optional[str] = ..., entry_id: _Optional[str] = ...) -> None: ...
 
 class CreateSessionRequest(_message.Message):
     __slots__ = ()

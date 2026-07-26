@@ -125,12 +125,29 @@ class GrpcSchemaContractTests(unittest.TestCase):
         get_status = service.methods_by_name["GetWhitelistStatus"]
         self.assertFalse(get_status.client_streaming)
         self.assertFalse(get_status.server_streaming)
+        delete_whitelist = service.methods_by_name["DeleteWhitelist"]
+        self.assertFalse(delete_whitelist.client_streaming)
+        self.assertFalse(delete_whitelist.server_streaming)
+        self.assertEqual(delete_whitelist.input_type.full_name, "DeleteWhitelistRequest")
+        self.assertEqual(delete_whitelist.output_type.full_name, "WhitelistResponse")
+        self.assertEqual(
+            {
+                field.name: field.number
+                for field in ai_processor_pb2.DeleteWhitelistRequest.DESCRIPTOR.fields
+            },
+            {"session_id": 1, "entry_id": 2},
+        )
         self.assertEqual(
             {
                 field.name: field.number
                 for field in ai_processor_pb2.GetWhitelistStatusResponse.DESCRIPTOR.fields
             },
-            {"session_id": 1, "entry_count": 2, "whitelist_version": 3},
+            {
+                "session_id": 1,
+                "entry_count": 2,
+                "whitelist_version": 3,
+                "entry_ids": 4,
+            },
         )
         for method_name in ("CreateSession", "ListSessions", "DeleteSession"):
             method = service.methods_by_name[method_name]

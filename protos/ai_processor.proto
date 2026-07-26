@@ -8,6 +8,8 @@ service AiProcessor {
   rpc ProcessVideo(stream VideoChunk) returns (stream ProcessedVideoChunk);
   // Adds one face exemplar to the session-scoped in-memory whitelist.
   rpc AddWhitelist(FaceData) returns (WhitelistResponse);
+  // Removes one face exemplar from a session-scoped in-memory whitelist.
+  rpc DeleteWhitelist(DeleteWhitelistRequest) returns (WhitelistResponse);
   // Returns non-sensitive whitelist metadata for one session.
   rpc GetWhitelistStatus(GetWhitelistStatusRequest) returns (GetWhitelistStatusResponse);
   // Atomically creates an opaque session ID.
@@ -123,6 +125,12 @@ message GetWhitelistStatusResponse {
   string session_id = 1;
   uint32 entry_count = 2;
   uint64 whitelist_version = 3;
+  repeated string entry_ids = 4;
+}
+
+message DeleteWhitelistRequest {
+  string session_id = 1;
+  string entry_id = 2;
 }
 
 message CreateSessionRequest {}
