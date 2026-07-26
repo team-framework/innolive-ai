@@ -3,6 +3,7 @@
 import grpc
 import warnings
 
+from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from protos import ai_processor_pb2 as protos_dot_ai__processor__pb2
 
 GRPC_GENERATED_VERSION = '1.81.1'
@@ -60,6 +61,11 @@ class AiProcessorStub:
                 request_serializer=protos_dot_ai__processor__pb2.ListSessionsRequest.SerializeToString,
                 response_deserializer=protos_dot_ai__processor__pb2.ListSessionsResponse.FromString,
                 _registered_method=True)
+        self.DeleteSession = channel.unary_unary(
+                '/AiProcessor/DeleteSession',
+                request_serializer=protos_dot_ai__processor__pb2.DeleteSessionRequest.SerializeToString,
+                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+                _registered_method=True)
 
 
 class AiProcessorServicer:
@@ -101,6 +107,13 @@ class AiProcessorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DeleteSession(self, request, context):
+        """Deletes an idle in-memory session. Active video streams prevent deletion.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AiProcessorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -128,6 +141,11 @@ def add_AiProcessorServicer_to_server(servicer, server):
                     servicer.ListSessions,
                     request_deserializer=protos_dot_ai__processor__pb2.ListSessionsRequest.FromString,
                     response_serializer=protos_dot_ai__processor__pb2.ListSessionsResponse.SerializeToString,
+            ),
+            'DeleteSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSession,
+                    request_deserializer=protos_dot_ai__processor__pb2.DeleteSessionRequest.FromString,
+                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -266,6 +284,33 @@ class AiProcessor:
             '/AiProcessor/ListSessions',
             protos_dot_ai__processor__pb2.ListSessionsRequest.SerializeToString,
             protos_dot_ai__processor__pb2.ListSessionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/DeleteSession',
+            protos_dot_ai__processor__pb2.DeleteSessionRequest.SerializeToString,
+            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,

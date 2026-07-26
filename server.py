@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -59,6 +59,7 @@ _END_OF_FRAMES = object()
 RPC_HTTP_STATUS = {
     "INVALID_ARGUMENT": 400,
     "FAILED_PRECONDITION": 412,
+    "NOT_FOUND": 404,
     "RESOURCE_EXHAUSTED": 429,
     "DEADLINE_EXCEEDED": 504,
     "UNAVAILABLE": 503,
@@ -220,6 +221,22 @@ class GrpcDemoGateway:
             {"sessions": [_session_info_payload(session) for session in sessions]},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def delete_session(self, request: Request) -> Response:
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        try:
+            session_id = validate_session_id(request.path_params.get("session_id"))
+        except ValueError as error:
+            return _api_error(400, "INVALID_ARGUMENT", str(error))
+        try:
+            await client.delete_session(session_id)
+        except VideoRpcError as error:
+            if error.code.name == "FAILED_PRECONDITION":
+                return _api_error(409, error.code.name, error.details)
+            return _rpc_error_response(error)
+        return Response(status_code=204)
 
     async def whitelist_status(self, request: Request) -> JSONResponse:
         client = await self._api_client(request)
@@ -599,6 +616,7 @@ def create_app(
     app.add_api_route("/readyz", gateway.readiness, methods=["GET"])
     app.add_api_route("/api/sessions", gateway.create_session, methods=["POST"])
     app.add_api_route("/api/sessions", gateway.list_sessions, methods=["GET"])
+    app.add_api_route("/api/sessions/{session_id:path}", gateway.delete_session, methods=["DELETE"])
     app.add_api_route("/api/whitelist", gateway.whitelist_status, methods=["GET"])
     app.add_api_route("/api/whitelist", gateway.add_whitelist, methods=["POST"])
     app.add_api_websocket_route("/ws", gateway.stream)
@@ -632,6 +650,7 @@ def _session_info_payload(session: Any) -> dict[str, int | str]:
         "entry_count": int(session.entry_count),
         "whitelist_version": int(session.whitelist_version),
         "created_at_unix_ms": int(session.created_at_unix_ms),
+        "active_stream_count": int(session.active_stream_count),
     }
 
 

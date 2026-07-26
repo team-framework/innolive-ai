@@ -40,6 +40,7 @@ class FakeGrpcClient:
         self.whitelist_counts: dict[str, int] = {}
         self.whitelist_versions: dict[str, int] = {}
         self.sessions: dict[str, int] = {}
+        self.active_stream_counts: dict[str, int] = {}
         self.created_sessions = 0
 
     async def __aenter__(self):
@@ -122,6 +123,23 @@ class FakeGrpcClient:
         )
         return tuple(self._session_info(session_id) for session_id in newest_first)
 
+    async def delete_session(self, session_id: str):
+        if session_id not in self.sessions:
+            raise VideoRpcError(
+                "DeleteSession",
+                grpc.StatusCode.NOT_FOUND,
+                "session does not exist",
+            )
+        if self.active_stream_counts.get(session_id, 0):
+            raise VideoRpcError(
+                "DeleteSession",
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "session has active video streams",
+            )
+        del self.sessions[session_id]
+        self.whitelist_counts.pop(session_id, None)
+        self.whitelist_versions.pop(session_id, None)
+
     def _ensure_session(self, session_id: str) -> None:
         if session_id not in self.sessions:
             self.sessions[session_id] = 1_000 + len(self.sessions)
@@ -132,6 +150,7 @@ class FakeGrpcClient:
             entry_count=self.whitelist_counts.get(session_id, 0),
             whitelist_version=self.whitelist_versions.get(session_id, 0),
             created_at_unix_ms=self.sessions[session_id],
+            active_stream_count=self.active_stream_counts.get(session_id, 0),
         )
 
     def _response(self, frame):
@@ -300,6 +319,34 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(created.json()["error"]["code"], "RESOURCE_EXHAUSTED")
         self.assertEqual(listed.status_code, 429)
         self.assertEqual(listed.json()["error"]["code"], "RESOURCE_EXHAUSTED")
+
+    def test_session_api_deletes_only_idle_existing_sessions(self):
+        application, fake = app()
+        with TestClient(application) as client:
+            session_id = client.post("/api/sessions").json()["session_id"]
+            fake.active_stream_counts[session_id] = 1
+            active = client.delete(f"/api/sessions/{session_id}")
+            fake.active_stream_counts[session_id] = 0
+            deleted = client.delete(f"/api/sessions/{session_id}")
+            missing = client.delete(f"/api/sessions/{session_id}")
+
+        self.assertEqual(active.status_code, 409)
+        self.assertEqual(active.json()["error"]["code"], "FAILED_PRECONDITION")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["code"], "NOT_FOUND")
+
+    def test_session_delete_preserves_an_encoded_session_path(self):
+        application, _ = app()
+        with TestClient(application) as client:
+            created = client.post(
+                "/api/whitelist?session_id=session%2Fwith%20spaces",
+                content=jpeg(),
+            )
+            deleted = client.delete("/api/sessions/session%2Fwith%20spaces")
+
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(deleted.status_code, 204)
 
     def test_whitelist_api_validates_session_and_body_limit(self):
         application, _ = app()

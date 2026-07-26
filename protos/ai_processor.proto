@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "google/protobuf/empty.proto";
+
 // Intentionally no package: existing clients call /AiProcessor/ProcessVideo.
 service AiProcessor {
   // One ordered, long-lived video flow per call. A call owns its tracker state.
@@ -12,6 +14,8 @@ service AiProcessor {
   rpc CreateSession(CreateSessionRequest) returns (SessionInfo);
   // Lists bounded in-memory sessions for a trusted management client.
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Deletes an idle in-memory session. Active video streams prevent deletion.
+  rpc DeleteSession(DeleteSessionRequest) returns (google.protobuf.Empty);
 }
 
 message VideoChunk {
@@ -125,11 +129,16 @@ message CreateSessionRequest {}
 
 message ListSessionsRequest {}
 
+message DeleteSessionRequest {
+  string session_id = 1;
+}
+
 message SessionInfo {
   string session_id = 1;
   uint32 entry_count = 2;
   uint64 whitelist_version = 3;
   int64 created_at_unix_ms = 4;
+  uint32 active_stream_count = 5;
 }
 
 message ListSessionsResponse {
