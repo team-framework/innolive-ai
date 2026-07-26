@@ -153,9 +153,12 @@ class SessionRegistry:
 class RecognitionConfig:
     cosine_threshold: float = 0.4
     revalidate_frames: int = 30
+    quick_retry_frames: int = 5
+    quick_retry_limit: int = 2
     missing_track_frames: int = 3
     max_pending_per_stream: int = 4
     min_face_size: int = 40
+    query_min_face_size: int = 24
     crop_margin: float = 0.25
 
     def __post_init__(self) -> None:
@@ -165,12 +168,18 @@ class RecognitionConfig:
             raise ValueError("recognition cosine_threshold must be in -1..1")
         if self.revalidate_frames < 1:
             raise ValueError("revalidate_frames must be at least one")
+        if self.quick_retry_frames < 1:
+            raise ValueError("quick_retry_frames must be at least one")
+        if self.quick_retry_limit < 0:
+            raise ValueError("quick_retry_limit must not be negative")
         if self.missing_track_frames < 1:
             raise ValueError("missing_track_frames must be at least one")
         if self.max_pending_per_stream < 1:
             raise ValueError("max_pending_per_stream must be at least one")
         if self.min_face_size < 16:
             raise ValueError("min_face_size must be at least 16")
+        if self.query_min_face_size < 16:
+            raise ValueError("query_min_face_size must be at least 16")
         if not math.isfinite(self.crop_margin) or not 0 <= self.crop_margin <= 1:
             raise ValueError("crop_margin must be in 0..1")
 
@@ -192,6 +201,7 @@ class TrackDecision:
     whitelist_version: int = 0
     pending_token: RecognitionToken | None = None
     status_before_pending: str = "unknown"
+    quick_retry_count: int = 0
 
 
 @dataclass(slots=True)
@@ -278,6 +288,15 @@ class StreamRecognition:
         if future is None:
             return "overflow"
 
+        if state.whitelist_version != snapshot.version:
+            state.quick_retry_count = 0
+        elif (
+            state.last_checked_frame >= 0
+            and state.status in {"unknown", "non_whitelisted"}
+            and state.quick_retry_count < self.config.quick_retry_limit
+        ):
+            state.quick_retry_count += 1
+
         token = RecognitionToken(
             track_id=track_id,
             generation=state.generation,
@@ -305,7 +324,13 @@ class StreamRecognition:
             and state.whitelist_version != whitelist_version
         ):
             return True
-        return frame_sequence - state.last_checked_frame >= self.config.revalidate_frames
+        interval = self.config.revalidate_frames
+        if (
+            state.status in {"unknown", "non_whitelisted"}
+            and state.quick_retry_count < self.config.quick_retry_limit
+        ):
+            interval = self.config.quick_retry_frames
+        return frame_sequence - state.last_checked_frame >= interval
 
     def _apply_completed(self, current_whitelist_version: int) -> None:
         for token, pending in tuple(self._pending.items()):
@@ -333,11 +358,11 @@ class StreamRecognition:
                 similarity = max(
                     float(np.dot(embedding, entry.embedding)) for entry in pending.entries
                 )
-                state.status = (
-                    "whitelisted"
-                    if similarity >= self.config.cosine_threshold
-                    else "non_whitelisted"
-                )
+                if similarity >= self.config.cosine_threshold:
+                    state.status = "whitelisted"
+                    state.quick_retry_count = 0
+                else:
+                    state.status = "non_whitelisted"
             except Exception:
                 state.status = "unknown"
 
@@ -397,7 +422,8 @@ def _face_crop(
     height = y2 - y1
     if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
         return None
-    if min(width, height) < config.min_face_size:
+    query_min_face_size = min(config.min_face_size, config.query_min_face_size)
+    if min(width, height) < query_min_face_size:
         return None
     margin_x = width * config.crop_margin
     margin_y = height * config.crop_margin

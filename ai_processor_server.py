@@ -390,7 +390,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 "face image must be a bounded JPEG, PNG, or WebP image",
             )
 
-        future = self.adaface.submit(image, owner=session_id)
+        future = self.adaface.submit_enrollment(image, owner=session_id)
         if future is None:
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "AdaFace queue is full")
         try:

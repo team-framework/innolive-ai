@@ -185,6 +185,56 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.calls, 1)
         self.assertTrue(face["whitelisted"])
 
+    async def test_non_match_retries_twice_before_using_the_long_interval(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(embeddings=[np.asarray([0.0, 1.0], dtype=np.float32)] * 4)
+        config = RecognitionConfig(revalidate_frames=30, missing_track_frames=1)
+        recognition = StreamRecognition(runtime, config, owner="session")
+        face = _object(1)
+
+        for frame_sequence in range(1, 41):
+            recognition.process(self.image, [face], session.snapshot(), frame_sequence)
+
+        self.assertEqual(runtime.calls, 3)
+        self.assertFalse(face["whitelisted"])
+        recognition.process(self.image, [face], session.snapshot(), 41)
+        self.assertEqual(runtime.calls, 4)
+
+    async def test_failed_query_retries_quickly_and_success_resets_retry_count(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime(deferred=True)
+        recognition = StreamRecognition(runtime, self.config, owner="session")
+        face = _object(1)
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+        runtime.futures[0].set_exception(RuntimeError("alignment failed"))
+        recognition.process(self.image, [face], session.snapshot(), 2)
+        for frame_sequence in range(3, 6):
+            recognition.process(self.image, [face], session.snapshot(), frame_sequence)
+
+        self.assertEqual(runtime.calls, 1)
+        recognition.process(self.image, [face], session.snapshot(), 6)
+        self.assertEqual(runtime.calls, 2)
+        runtime.futures[1].set_result(np.asarray([1.0, 0.0], dtype=np.float32))
+        recognition.process(self.image, [face], session.snapshot(), 7)
+
+        self.assertTrue(face["whitelisted"])
+        self.assertEqual(recognition._states[1].quick_retry_count, 0)
+
+    async def test_video_query_accepts_a_face_smaller_than_enrollment_minimum(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime()
+        recognition = StreamRecognition(runtime, self.config, owner="session")
+        face = _object(1)
+        face["bbox"] = [10.0, 10.0, 34.0, 34.0]
+
+        recognition.process(self.image, [face], session.snapshot(), 1)
+
+        self.assertEqual(runtime.calls, 1)
+
     async def test_new_whitelist_entry_rechecks_an_active_non_whitelisted_track(self):
         session = SessionRegistry().get_or_create("session")
         session.append(np.asarray([1.0, 0.0]))
