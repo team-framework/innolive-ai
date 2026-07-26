@@ -91,7 +91,8 @@ class GrpcSchemaContractTests(unittest.TestCase):
         video = ai_processor_pb2.VideoChunk.DESCRIPTOR
         processed = ai_processor_pb2.ProcessedVideoChunk.DESCRIPTOR
         self.assertTrue(video.fields_by_name["batch_size"].GetOptions().deprecated)
-        self.assertTrue(processed.fields_by_name["data"].GetOptions().deprecated)
+        self.assertFalse(processed.fields_by_name["data"].GetOptions().deprecated)
+        self.assertTrue(processed.fields_by_name["mosaic_jpeg"].GetOptions().deprecated)
 
     def test_session_and_whitelist_fields_are_additive(self):
         expected = {
@@ -184,8 +185,8 @@ class GrpcSchemaContractTests(unittest.TestCase):
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()
         current = ai_processor_pb2.ProcessedVideoChunk(
-            data=b"legacy-pixel-field",
-            mosaic_jpeg=b"new-server-mosaic",
+            data=b"server-mosaic",
+            mosaic_jpeg=b"deprecated-alias",
             timestamp=17,
             status_message="success",
             width=640,
@@ -199,7 +200,7 @@ class GrpcSchemaContractTests(unittest.TestCase):
         legacy = legacy_class()
         legacy.ParseFromString(current.SerializeToString())
 
-        self.assertEqual(legacy.data, b"legacy-pixel-field")
+        self.assertEqual(legacy.data, b"server-mosaic")
         self.assertEqual(legacy.timestamp, 17)
         self.assertEqual(legacy.status_message, "success")
         self.assertEqual((legacy.width, legacy.height), (640, 360))

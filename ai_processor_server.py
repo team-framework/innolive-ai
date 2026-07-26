@@ -76,7 +76,7 @@ MOSAIC_MAX_INFLIGHT = 2
 
 def _output_mode(value: int) -> int:
     if value == messages.VIDEO_OUTPUT_MODE_UNSPECIFIED:
-        return messages.VIDEO_OUTPUT_MODE_METADATA_ONLY
+        return messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
     if value in {
         messages.VIDEO_OUTPUT_MODE_METADATA_ONLY,
         messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
@@ -312,7 +312,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 fatal=True,
             )
 
-        mosaic = b""
+        processed_data = b""
         blur_encode_ms = 0.0
         if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
             mosaic_started = time.perf_counter()
@@ -320,7 +320,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 if any(item.get("whitelisted") is not True for item in objects):
                     async with self._mosaic_slots:
                         loop = asyncio.get_running_loop()
-                        mosaic = await loop.run_in_executor(
+                        processed_data = await loop.run_in_executor(
                             self._mosaic_executor,
                             partial(
                                 mosaic_jpeg,
@@ -330,7 +330,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             ),
                         )
                 else:
-                    mosaic = bytes(request.data)
+                    processed_data = bytes(request.data)
             except Exception:
                 LOGGER.exception("frame %d mosaic composition failed", request.frame_id)
                 return FrameOutcome(
@@ -352,7 +352,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 result,
                 received_at,
                 decoded_at,
-                mosaic,
+                processed_data,
                 blur_encode_ms,
             )
             if response.ByteSize() > MAX_GRPC_RESPONSE_BYTES:
@@ -628,7 +628,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         result: dict[str, Any],
         received_at: float,
         decoded_at: float,
-        mosaic: bytes,
+        processed_data: bytes,
         blur_encode_ms: float,
     ):
         serialize_started = time.perf_counter()
@@ -636,8 +636,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         faces = [self._face_metadata(item) for item in objects]
         timing = result.get("timing_ms", {})
         response = messages.ProcessedVideoChunk(
-            data=b"",
-            mosaic_jpeg=mosaic,
+            data=processed_data,
             timestamp=request.timestamp,
             status_message="success",
             faces=faces,
