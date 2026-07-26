@@ -417,6 +417,18 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             whitelist_version=version,
         )
 
+    async def GetWhitelistStatus(self, request, context):
+        try:
+            session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        snapshot = self.sessions.snapshot(session_id)
+        return messages.GetWhitelistStatusResponse(
+            session_id=session_id,
+            entry_count=len(snapshot.entries),
+            whitelist_version=snapshot.version,
+        )
+
     async def close(self) -> None:
         self._accepting = False
         tasks = tuple(self._inference_tasks)

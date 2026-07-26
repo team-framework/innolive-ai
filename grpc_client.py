@@ -90,6 +90,28 @@ class VideoSession:
             timeout=timeout,
         )
 
+    async def add_whitelist_many(
+        self,
+        images: JpegSource,
+        *,
+        timeout: float = 10.0,
+    ) -> list[ai_processor_pb2.WhitelistResponse]:
+        return await self._client.add_whitelist_many(
+            images,
+            session_id=self.session_id,
+            timeout=timeout,
+        )
+
+    async def get_whitelist_status(
+        self,
+        *,
+        timeout: float = 2.0,
+    ) -> ai_processor_pb2.GetWhitelistStatusResponse:
+        return await self._client.get_whitelist_status(
+            self.session_id,
+            timeout=timeout,
+        )
+
     def process_video(
         self,
         frames: FrameSource,
@@ -243,6 +265,47 @@ class VideoProcessorClient:
             )
         except grpc.aio.AioRpcError as error:
             raise VideoRpcError("AddWhitelist", error.code(), error.details()) from error
+
+    async def add_whitelist_many(
+        self,
+        images: JpegSource,
+        *,
+        session_id: str,
+        timeout: float = 10.0,
+    ) -> list[ai_processor_pb2.WhitelistResponse]:
+        responses = []
+        async for image in _iterate_jpegs(images):
+            responses.append(
+                await self.add_whitelist(
+                    image,
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+            )
+        return responses
+
+    async def get_whitelist_status(
+        self,
+        session_id: str,
+        *,
+        timeout: float = 2.0,
+    ) -> ai_processor_pb2.GetWhitelistStatusResponse:
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        session_id = validate_session_id(session_id)
+        try:
+            return await self._stub.GetWhitelistStatus(
+                ai_processor_pb2.GetWhitelistStatusRequest(session_id=session_id),
+                timeout=timeout,
+            )
+        except grpc.aio.AioRpcError as error:
+            raise VideoRpcError(
+                "GetWhitelistStatus",
+                error.code(),
+                error.details(),
+            ) from error
 
     async def process_video(
         self,

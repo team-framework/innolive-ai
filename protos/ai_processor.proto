@@ -6,6 +6,8 @@ service AiProcessor {
   rpc ProcessVideo(stream VideoChunk) returns (stream ProcessedVideoChunk);
   // Adds one face exemplar to the session-scoped in-memory whitelist.
   rpc AddWhitelist(FaceData) returns (WhitelistResponse);
+  // Returns non-sensitive whitelist metadata for one session.
+  rpc GetWhitelistStatus(GetWhitelistStatusRequest) returns (GetWhitelistStatusResponse);
 }
 
 message VideoChunk {
@@ -103,4 +105,14 @@ message WhitelistResponse {
   string entry_id = 3;
   uint32 entry_count = 4;
   uint64 whitelist_version = 5;
+}
+
+message GetWhitelistStatusRequest {
+  string session_id = 1;
+}
+
+message GetWhitelistStatusResponse {
+  string session_id = 1;
+  uint32 entry_count = 2;
+  uint64 whitelist_version = 3;
 }

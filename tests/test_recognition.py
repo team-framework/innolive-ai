@@ -93,6 +93,15 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(SessionLimitError):
             sessions.get_or_create("session-b")
 
+    async def test_status_lookup_does_not_create_a_session(self):
+        sessions = SessionRegistry(max_sessions=1)
+
+        missing = sessions.snapshot("missing-session")
+        created = sessions.get_or_create("session-a")
+
+        self.assertEqual((len(missing.entries), missing.version), (0, 0))
+        self.assertEqual(created.snapshot().version, 0)
+
     async def test_same_session_streams_share_only_the_whitelist(self):
         session = SessionRegistry().get_or_create("shared")
         session.append(np.asarray([1.0, 0.0]))
