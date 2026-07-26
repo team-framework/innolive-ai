@@ -28,6 +28,7 @@ from service.protocol import (
     VERSION,
     decode_request,
     encode_response,
+    encode_result,
     recover_sequence,
 )
 from service.recognition import validate_entry_id, validate_session_id
@@ -102,14 +103,14 @@ class ServerMetrics:
         self.results = 0
         self.errors: Counter[str] = Counter()
         self.jpeg_bytes = 0
-        self.metadata_bytes = 0
+        self.response_bytes = 0
         self.detections = 0
         self.tracks = 0
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
 
     def record_result(self, payload: dict[str, Any], response_bytes: int) -> None:
         self.results += 1
-        self.metadata_bytes += response_bytes
+        self.response_bytes += response_bytes
         stats = payload.get("stats", {})
         self.detections += int(stats.get("detections", 0))
         self.tracks += int(stats.get("tracks", 0))
@@ -119,7 +120,7 @@ class ServerMetrics:
 
     def record_error(self, stage: str, response_bytes: int) -> None:
         self.errors[stage] += 1
-        self.metadata_bytes += response_bytes
+        self.response_bytes += response_bytes
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -128,7 +129,7 @@ class ServerMetrics:
             "terminal_errors": sum(self.errors.values()),
             "errors_by_stage": dict(self.errors),
             "jpeg_bytes": self.jpeg_bytes,
-            "metadata_bytes": self.metadata_bytes,
+            "response_bytes": self.response_bytes,
             "detections": self.detections,
             "tracks": self.tracks,
             "latency_ms": {stage: _percentiles(values) for stage, values in self._latency.items()},
@@ -512,12 +513,11 @@ class GrpcWebSocketSession:
         sequence = int(response.frame_id)
         if not self.outstanding or self.outstanding[0] != sequence:
             raise VideoClientError(f"unexpected gRPC terminal for frame {sequence}")
-        self.outstanding.popleft()
-        self.slots.release()
-        started = self.sent_at.pop(sequence)
+        started = self.sent_at[sequence]
         round_trip_ms = (time.perf_counter() - started) * 1_000
 
         if str(response.status_message).casefold() != "success":
+            self._complete_frame(sequence)
             code = str(response.error_code).strip() or "GRPC_FRAME_FAILED"
             message = str(response.error_message).strip() or str(response.status_message)
             await self._send_error(sequence, code, message, "grpc")
@@ -528,10 +528,23 @@ class GrpcWebSocketSession:
             return True
 
         payload = self._result_payload(response, round_trip_ms)
-        encoded = encode_response(payload)
-        await self._send_text(encoded)
-        self.metrics.record_result(payload, len(encoded.encode("utf-8")))
+        try:
+            encoded = encode_result(payload, bytes(response.mosaic_jpeg))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise VideoClientError(
+                f"gRPC result for frame {sequence} has no valid mosaic JPEG"
+            ) from error
+        self._complete_frame(sequence)
+        await self._send_bytes(encoded)
+        self.metrics.record_result(payload, len(encoded))
         return True
+
+    def _complete_frame(self, sequence: int) -> None:
+        completed = self.outstanding.popleft()
+        if completed != sequence:
+            raise VideoClientError(f"unexpected gRPC terminal for frame {sequence}")
+        self.sent_at.pop(sequence)
+        self.slots.release()
 
     def _result_payload(self, response: Any, round_trip_ms: float) -> dict[str, Any]:
         timing = response.timing
@@ -540,6 +553,7 @@ class GrpcWebSocketSession:
             "decode": round(float(timing.decode_ms), 2),
             "inference": round(float(timing.inference_ms), 2),
             "tracking": round(float(timing.tracking_ms), 2),
+            "blur_encode": round(float(timing.blur_encode_ms), 2),
             "serialize": round(float(timing.serialize_ms), 2),
             "runtime_total": round(float(timing.runtime_total_ms), 2),
             "server_total": round(float(timing.server_total_ms), 2),
@@ -594,6 +608,10 @@ class GrpcWebSocketSession:
     async def _send_text(self, payload: str) -> None:
         async with self.send_lock:
             await self.websocket.send_text(payload)
+
+    async def _send_bytes(self, payload: bytes) -> None:
+        async with self.send_lock:
+            await self.websocket.send_bytes(payload)
 
 
 def _face_object(face: Any) -> dict[str, Any]:

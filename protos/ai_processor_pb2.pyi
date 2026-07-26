@@ -1,5 +1,6 @@
 from google.protobuf import empty_pb2 as _empty_pb2
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
@@ -7,22 +8,33 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class VideoOutputMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    VIDEO_OUTPUT_MODE_UNSPECIFIED: _ClassVar[VideoOutputMode]
+    VIDEO_OUTPUT_MODE_METADATA_ONLY: _ClassVar[VideoOutputMode]
+    VIDEO_OUTPUT_MODE_MOSAIC_JPEG: _ClassVar[VideoOutputMode]
+VIDEO_OUTPUT_MODE_UNSPECIFIED: VideoOutputMode
+VIDEO_OUTPUT_MODE_METADATA_ONLY: VideoOutputMode
+VIDEO_OUTPUT_MODE_MOSAIC_JPEG: VideoOutputMode
+
 class VideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id")
+    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     FRAME_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_MODE_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     frame_id: int
     batch_size: int
     session_id: str
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ...) -> None: ...
+    output_mode: VideoOutputMode
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ..., output_mode: _Optional[_Union[VideoOutputMode, str]] = ...) -> None: ...
 
 class ProcessedVideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats")
+    __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats", "mosaic_jpeg")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
@@ -35,6 +47,7 @@ class ProcessedVideoChunk(_message.Message):
     ERROR_CODE_FIELD_NUMBER: _ClassVar[int]
     ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
+    MOSAIC_JPEG_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     status_message: str
@@ -47,7 +60,8 @@ class ProcessedVideoChunk(_message.Message):
     error_code: str
     error_message: str
     stats: FrameStats
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., status_message: _Optional[str] = ..., faces: _Optional[_Iterable[_Union[FaceMetadata, _Mapping]]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., frame_id: _Optional[int] = ..., processing_ms: _Optional[float] = ..., timing: _Optional[_Union[ProcessingTiming, _Mapping]] = ..., error_code: _Optional[str] = ..., error_message: _Optional[str] = ..., stats: _Optional[_Union[FrameStats, _Mapping]] = ...) -> None: ...
+    mosaic_jpeg: bytes
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., status_message: _Optional[str] = ..., faces: _Optional[_Iterable[_Union[FaceMetadata, _Mapping]]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., frame_id: _Optional[int] = ..., processing_ms: _Optional[float] = ..., timing: _Optional[_Union[ProcessingTiming, _Mapping]] = ..., error_code: _Optional[str] = ..., error_message: _Optional[str] = ..., stats: _Optional[_Union[FrameStats, _Mapping]] = ..., mosaic_jpeg: _Optional[bytes] = ...) -> None: ...
 
 class ProcessingTiming(_message.Message):
     __slots__ = ("queue_ms", "decode_ms", "inference_ms", "tracking_ms", "blur_encode_ms", "inference_batch_size", "serialize_ms", "server_total_ms", "runtime_total_ms")

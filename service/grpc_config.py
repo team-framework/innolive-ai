@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
 
 PROTOBUF_OVERHEAD_BYTES = 64 * 1024
 
@@ -13,7 +13,7 @@ def server_options() -> tuple[tuple[str, int], ...]:
     minimum_ping_ms = _positive_env("GRPC_MIN_RECV_PING_MS", 30_000)
     return (
         ("grpc.max_receive_message_length", MAX_JPEG_BYTES + PROTOBUF_OVERHEAD_BYTES),
-        ("grpc.max_send_message_length", MAX_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES),
+        ("grpc.max_send_message_length", MAX_GRPC_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES),
         ("grpc.so_reuseport", 0),
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.min_ping_interval_without_data_ms", minimum_ping_ms),
@@ -30,7 +30,7 @@ def channel_options() -> tuple[tuple[str, int], ...]:
         ("grpc.max_send_message_length", MAX_JPEG_BYTES + PROTOBUF_OVERHEAD_BYTES),
         (
             "grpc.max_receive_message_length",
-            MAX_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES,
+            MAX_GRPC_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES,
         ),
         ("grpc.keepalive_time_ms", keepalive_ms),
         ("grpc.keepalive_timeout_ms", 20_000),

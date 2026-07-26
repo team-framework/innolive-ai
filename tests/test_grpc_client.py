@@ -21,6 +21,7 @@ from grpc_client import (
 )
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.grpc_config import server_options
+from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_RESPONSE_BYTES
 
 
 def _jpeg(value: int) -> bytes:
@@ -163,6 +164,7 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 inference_batch_size=1,
                 server_total_ms=1.0,
             ),
+            mosaic_jpeg=_jpeg(224),
         )
 
     def _special_response(self, request):
@@ -175,6 +177,11 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             response.status_message = "failed"
             response.error_code = "INFERENCE_FAILED"
             response.error_message = "frame inference failed"
+            response.mosaic_jpeg = b""
+        elif self.mode == "missing_mosaic":
+            response.mosaic_jpeg = b""
+        elif self.mode == "invalid_mosaic":
+            response.mosaic_jpeg = b"not-a-complete-jpeg"
         else:
             raise AssertionError(f"unknown test mode: {self.mode}")
         return response
@@ -394,12 +401,71 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             [result.source_jpeg for result in results],
             jpegs,
         )
+        self.assertTrue(all(result.mosaic_jpeg == _jpeg(224) for result in results))
+        self.assertTrue(all(result.mosaic_jpeg != result.source_jpeg for result in results))
         self.assertTrue(all(result.response.timestamp > 0 for result in results))
         self.assertEqual(max_inflight, 5)
         self.assertTrue(all(result.response.data == b"" for result in results))
         self.assertTrue(
             all(request.session_id == "client-session" for request in loopback.servicer.requests)
         )
+        self.assertTrue(
+            all(
+                request.output_mode == ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
+                for request in loopback.servicer.requests
+            )
+        )
+
+    async def test_success_without_a_valid_server_mosaic_fails_closed(self):
+        for mode in ("missing_mosaic", "invalid_mosaic"):
+            with self.subTest(mode=mode):
+                async with (
+                    ClientLoopback(mode) as loopback,
+                    VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+                ):
+                    with self.assertRaises(VideoProtocolError):
+                        async for _ in client.process_jpegs(
+                            [_jpeg(3)],
+                            session_id="client-session",
+                        ):
+                            pass
+
+    def test_mosaic_response_uses_the_grpc_size_limit(self):
+        encoded, large_mosaic = cv2.imencode(
+            ".jpg",
+            np.random.default_rng(7).integers(
+                0,
+                256,
+                (640, 640, 3),
+                dtype=np.uint8,
+            ),
+            [cv2.IMWRITE_JPEG_QUALITY, 100],
+        )
+        self.assertTrue(encoded)
+        response = ai_processor_pb2.ProcessedVideoChunk(
+            timestamp=9,
+            status_message="success",
+            width=640,
+            height=640,
+            frame_id=4,
+            mosaic_jpeg=large_mosaic.tobytes(),
+        )
+        self.assertGreater(response.ByteSize(), MAX_RESPONSE_BYTES)
+        self.assertLess(response.ByteSize(), MAX_GRPC_RESPONSE_BYTES)
+
+        VideoProcessorClient._validate_response(
+            VideoFrame(_jpeg(1), timestamp=9, frame_id=4),
+            response,
+            raise_frame_errors=True,
+        )
+
+        response.error_message = "x" * MAX_GRPC_RESPONSE_BYTES
+        with self.assertRaisesRegex(VideoProtocolError, "gRPC response limit"):
+            VideoProcessorClient._validate_response(
+                VideoFrame(_jpeg(1), timestamp=9, frame_id=4),
+                response,
+                raise_frame_errors=True,
+            )
 
     async def test_server_frame_error_is_typed_and_cancels_the_stream(self):
         async with (

@@ -95,7 +95,8 @@ class GrpcSchemaContractTests(unittest.TestCase):
 
     def test_session_and_whitelist_fields_are_additive(self):
         expected = {
-            "VideoChunk": {"session_id": 5},
+            "VideoChunk": {"session_id": 5, "output_mode": 6},
+            "ProcessedVideoChunk": {"mosaic_jpeg": 13},
             "FaceMetadata": {"whitelisted": 10},
             "FrameStats": {
                 "adaface_calls": 9,
@@ -175,10 +176,16 @@ class GrpcSchemaContractTests(unittest.TestCase):
             1,
         )
 
+        output_modes = ai_processor_pb2.VideoOutputMode.DESCRIPTOR.values_by_name
+        self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_UNSPECIFIED"].number, 0)
+        self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_METADATA_ONLY"].number, 1)
+        self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_MOSAIC_JPEG"].number, 2)
+
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()
         current = ai_processor_pb2.ProcessedVideoChunk(
             data=b"legacy-pixel-field",
+            mosaic_jpeg=b"new-server-mosaic",
             timestamp=17,
             status_message="success",
             width=640,

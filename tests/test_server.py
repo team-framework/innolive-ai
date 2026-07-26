@@ -16,13 +16,13 @@ from starlette.websockets import WebSocketDisconnect
 from grpc_client import VideoResult, VideoRpcError
 from protos import ai_processor_pb2
 from server import ServerSettings, create_app, parse_args
-from service.protocol import decode_response, encode_request
+from service.protocol import VERSION, decode_response, decode_result, encode_request
 
 
-def jpeg(width: int = 64, height: int = 36) -> bytes:
+def jpeg(width: int = 64, height: int = 36, *, value: int = 0) -> bytes:
     success, encoded = cv2.imencode(
         ".jpg",
-        np.zeros((height, width, 3), dtype=np.uint8),
+        np.full((height, width, 3), value, dtype=np.uint8),
     )
     if not success:
         raise RuntimeError("test JPEG encoding failed")
@@ -43,6 +43,7 @@ class FakeGrpcClient:
         self.sessions: dict[str, int] = {}
         self.active_stream_counts: dict[str, int] = {}
         self.created_sessions = 0
+        self.mosaic_jpeg = jpeg(value=192)
 
     async def __aenter__(self):
         return self
@@ -194,6 +195,12 @@ class FakeGrpcClient:
                 error_code="INFERENCE_FAILED",
                 error_message="injected inference failure",
             )
+        if self.mode == "invalid_mosaic":
+            mosaic_jpeg = b"not-a-jpeg"
+        elif self.mode == "missing_mosaic":
+            mosaic_jpeg = b""
+        else:
+            mosaic_jpeg = self.mosaic_jpeg
         return ai_processor_pb2.ProcessedVideoChunk(
             timestamp=frame.timestamp,
             status_message="success",
@@ -220,12 +227,14 @@ class FakeGrpcClient:
                 decode_ms=0.2,
                 inference_ms=1.0,
                 tracking_ms=0.3,
+                blur_encode_ms=0.4,
                 serialize_ms=0.1,
                 server_total_ms=1.7,
                 runtime_total_ms=1.4,
                 inference_batch_size=1,
             ),
             stats=ai_processor_pb2.FrameStats(tracker_frame=frame.frame_id),
+            mosaic_jpeg=mosaic_jpeg,
         )
 
 
@@ -260,24 +269,29 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         )
         self.assertEqual(health.json()["grpc"]["target"], "test-grpc:50051")
         self.assertTrue(health.json()["grpc"]["serving"])
+        self.assertEqual(health.json()["protocol"], {"name": "ILF1", "version": VERSION})
         self.assertEqual(
             health.json()["enrollment_content_types"],
             ["image/jpeg", "image/png", "image/webp"],
         )
         self.assertTrue(fake.closed)
 
-    def test_result_passes_through_process_video_as_metadata_only(self):
+    def test_result_returns_server_processed_jpeg_in_a_binary_envelope(self):
         application, fake = app()
         with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
-            websocket.send_bytes(encode_request(7, jpeg()))
-            result = decode_response(websocket.receive_text())
+            source_jpeg = jpeg()
+            websocket.send_bytes(encode_request(7, source_jpeg))
+            result, result_jpeg = decode_result(websocket.receive_bytes())
 
         self.assertEqual((result["type"], result["seq"]), ("result", 7))
         self.assertEqual((result["width"], result["height"]), (64, 36))
         self.assertEqual(result["transport"], "grpc")
         self.assertIn("grpc_round_trip", result["timing_ms"])
+        self.assertEqual(result["timing_ms"]["blur_encode"], 0.4)
         self.assertNotIn("jpeg", result)
         self.assertNotIn("data", result)
+        self.assertEqual(result_jpeg, fake.mosaic_jpeg)
+        self.assertNotEqual(result_jpeg, source_jpeg)
         self.assertTrue(result["objects"][0]["whitelisted"])
         self.assertEqual(result["session_id"], "demo-session")
         self.assertEqual(fake.stream_options, ("demo-session", 5, False))
@@ -430,8 +444,8 @@ class GrpcDemoGatewayTests(unittest.TestCase):
             second = stack.enter_context(client.websocket_connect("/ws?session_id=session-b"))
             first.send_bytes(encode_request(1, jpeg()))
             second.send_bytes(encode_request(1, jpeg()))
-            first_result = decode_response(first.receive_text())
-            second_result = decode_response(second.receive_text())
+            first_result, _ = decode_result(first.receive_bytes())
+            second_result, _ = decode_result(second.receive_bytes())
 
         self.assertEqual(first_result["session_id"], "session-a")
         self.assertEqual(second_result["session_id"], "session-b")
@@ -444,19 +458,21 @@ class GrpcDemoGatewayTests(unittest.TestCase):
             websocket.send_bytes(encode_request(1, invalid))
             error = decode_response(websocket.receive_text())
             websocket.send_bytes(encode_request(2, jpeg()))
-            result = decode_response(websocket.receive_text())
+            result, result_jpeg = decode_result(websocket.receive_bytes())
 
         self.assertEqual(
             (error["type"], error["seq"], error["code"]),
             ("error", 1, "DECODE_FAILED"),
         )
         self.assertEqual((result["type"], result["seq"]), ("result", 2))
+        self.assertTrue(result_jpeg.startswith(b"\xff\xd8"))
 
     def test_duplicate_sequence_is_rejected_before_grpc(self):
         application, fake = app()
         with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
             websocket.send_bytes(encode_request(3, jpeg()))
-            self.assertEqual(decode_response(websocket.receive_text())["type"], "result")
+            result, _ = decode_result(websocket.receive_bytes())
+            self.assertEqual(result["type"], "result")
             websocket.send_bytes(encode_request(3, jpeg()))
             error = decode_response(websocket.receive_text())
 
@@ -484,13 +500,31 @@ class GrpcDemoGatewayTests(unittest.TestCase):
 
         self.assertEqual((error["seq"], error["code"]), (5, "INFERENCE_FAILED"))
 
+    def test_missing_or_invalid_server_mosaic_fails_closed(self):
+        for mode in ("missing_mosaic", "invalid_mosaic"):
+            with self.subTest(mode=mode):
+                application, _ = app(FakeGrpcClient(mode=mode))
+                with (
+                    TestClient(application) as client,
+                    client.websocket_connect("/ws") as websocket,
+                ):
+                    websocket.send_bytes(encode_request(6, jpeg()))
+                    error = decode_response(websocket.receive_text())
+                    with self.assertRaises(WebSocketDisconnect):
+                        websocket.receive_text()
+
+                self.assertEqual(
+                    (error["type"], error["seq"], error["code"]),
+                    ("error", 6, "GRPC_STREAM_FAILED"),
+                )
+
     def test_many_browser_streams_share_the_grpc_client_without_admission_limit(self):
         application, fake = app()
         with TestClient(application) as client, ExitStack() as stack:
             websockets = [stack.enter_context(client.websocket_connect("/ws")) for _ in range(8)]
             for websocket in websockets:
                 websocket.send_bytes(encode_request(1, jpeg()))
-            results = [decode_response(websocket.receive_text()) for websocket in websockets]
+            results = [decode_result(websocket.receive_bytes())[0] for websocket in websockets]
 
         self.assertTrue(all(result["type"] == "result" for result in results))
         self.assertEqual(len(fake.received), 8)
