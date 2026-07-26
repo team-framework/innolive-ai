@@ -2,9 +2,11 @@
 
 ## AdaFace
 
-`service/adaface_model.py` contains an adapted IR-18 network definition from
-[AdaFace](https://github.com/mk-minchul/AdaFace), commit
-`c60eaa786a42c03444f3df7096dbaf9d57ae010d`.
+`service/adaface_backbones.py` contains inference-only adaptations of the IR
+backbones from [AdaFace](https://github.com/mk-minchul/AdaFace), commit
+`c60eaa786a42c03444f3df7096dbaf9d57ae010d`, and the fixed ViT-Base KP-RPE
+backbone from [CVLFace](https://github.com/mk-minchul/CVLface), revision
+`daefd5012d369588bd214fbaf4cc6b1d286e7066` of the published model bundle.
 
 MIT License
 

@@ -52,7 +52,7 @@ python3 -m venv .venv
 
 Apple Silicon에서는 별도 옵션 없이 PyTorch와 MPS를 사용합니다.
 
-AdaFace IR-18 체크포인트와 YuNet landmark detector는 별도 runtime artifact입니다.
+AdaFace ViT-Base KP-RPE WebFace12M 체크포인트와 YuNet landmark detector는 별도 runtime artifact입니다.
 [models/README.md](models/README.md)의 공식 출처에서 내려받아 기본 경로에 둡니다. 파일이
 없거나 로드되지 않으면 영상 처리는 계속되지만 모든 얼굴을 보호하며 `AddWhitelist`는
 `FAILED_PRECONDITION`을 반환합니다.
@@ -125,12 +125,14 @@ stream 하나가 frame을 무한 적재하지 않습니다.
 --device auto|cpu|mps|CUDA_INDEX
 --warmup-runs N
 --inference-timeout SECONDS
+--adaface-architecture ir18|ir50|ir101|vit_base_kprpe
 --adaface-weights PATH
 --adaface-detector PATH
 --adaface-device auto|cpu|mps|CUDA_INDEX
 --adaface-threshold COSINE
 --adaface-min-face-size PIXELS
 --adaface-queue-capacity N
+--adaface-warmup-runs N
 --adaface-revalidate-frames N
 --adaface-max-pending-per-stream N
 --adaface-pending-timeout SECONDS
@@ -273,8 +275,10 @@ stream이 있는 세션은 `FAILED_PRECONDITION`입니다. 이 관리 RPC들과 
 
 등록은 YuNet score 0.9와 40px 기준으로 정확히 한 얼굴을 요구합니다. 이미 얼굴 track으로
 좁혀진 영상 crop은 score 0.6과 24px 기준을 사용하되 복수 얼굴이면 계속 fail-closed합니다.
-AdaFace는 정렬된 영상과 좌우 반전을 batch 2로 추론해 공식 평가 방식의 pre-norm feature를
-합성합니다. 첫 정렬 실패나 cosine 미달은 5 frame 간격으로 최대 두 번 빠르게 재검증한 뒤
+기본 AdaFace는 공식 CVLFace ViT-Base KP-RPE WebFace12M입니다. YuNet이 찾은 얼굴을 RGB
+112×112 crop과 정규화된 5점 landmark로 만들고 좌우 반전 feature를 합성합니다. IR18/50/101
+체크포인트도 같은 512차원 계약으로 선택할 수 있으며 legacy IR 계열은 BGR 5점 정렬을
+사용합니다. 첫 준비 실패나 cosine 미달은 5 frame 간격으로 최대 두 번 빠르게 재검증한 뒤
 기존 장기 재검증 주기로 돌아가며, 임계값 0.4는 낮추지 않습니다.
 기존 whitelist 판정의 주기 재검증 중에는 그 판정에 실제로 사용된 entry가 남아 있는 동안만
 모자이크 제외 상태를 유지합니다. 재검증 실패나 해당 entry 삭제는 즉시 fail-closed로
