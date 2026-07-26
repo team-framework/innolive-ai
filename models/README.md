@@ -21,5 +21,12 @@ official checkpoint page and save it as `models/adaface_ir18_casia.ckpt`.
 Alternative paths can be supplied with `--adaface-weights` and
 `--adaface-detector`.
 
+The default is a valid official IR-18 CASIA checkpoint, but it is the smallest
+backbone and training-set combination in the official model table. An official
+[IR-18 WebFace4M checkpoint](https://drive.google.com/file/d/1J17_QW1Oq00EhSWObISnhWEYr2NNrg2y/view)
+is architecture-compatible and can be evaluated through `--adaface-weights`.
+Recalibrate the cosine threshold on deployment data before changing the
+production default; do not lower it solely to improve apparent recall.
+
 The server stores only normalized embeddings in memory. Enrollment images and
 aligned face crops are not written to this directory.

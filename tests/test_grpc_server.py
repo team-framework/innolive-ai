@@ -161,6 +161,7 @@ class FakeAdaFace:
         self.error: Exception | None = None
         self.overflow = False
         self.calls = 0
+        self.enrollment_calls = 0
 
     def submit(self, _image: np.ndarray, *, owner: str):
         del owner
@@ -173,6 +174,10 @@ class FakeAdaFace:
         else:
             future.set_exception(self.error)
         return future
+
+    def submit_enrollment(self, image: np.ndarray, *, owner: str):
+        self.enrollment_calls += 1
+        return self.submit(image, owner=owner)
 
 
 class LoopbackServer:
@@ -472,6 +477,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((status_b.entry_count, status_b.whitelist_version), (1, 1))
         self.assertEqual((missing.entry_count, missing.whitelist_version), (0, 0))
         self.assertEqual(adaface.calls, 3)
+        self.assertEqual(adaface.enrollment_calls, 3)
 
     async def test_add_whitelist_accepts_png_and_webp(self):
         adaface = FakeAdaFace()

@@ -6,6 +6,7 @@ import asyncio
 import math
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -30,6 +31,8 @@ _REFERENCE_LANDMARKS = np.asarray(
     ],
     dtype=np.float32,
 )
+_ENROLLMENT_SCORE_THRESHOLD = 0.9
+_QUERY_SCORE_THRESHOLD = 0.6
 
 
 class AdaFaceUnavailable(RuntimeError):
@@ -54,6 +57,7 @@ class AdaFaceConfig:
     detector: Path = DEFAULT_FACE_DETECTOR
     device: str = "auto"
     min_face_size: int = 40
+    query_min_face_size: int = 24
     queue_capacity: int = 8
 
     def __post_init__(self) -> None:
@@ -62,6 +66,8 @@ class AdaFaceConfig:
             raise ValueError("AdaFace device must not be empty")
         if self.min_face_size < 16:
             raise ValueError("AdaFace min_face_size must be at least 16")
+        if self.query_min_face_size < 16:
+            raise ValueError("AdaFace query_min_face_size must be at least 16")
         if self.queue_capacity < 1:
             raise ValueError("AdaFace queue_capacity must be at least one")
         object.__setattr__(self, "weights", self.weights.expanduser().resolve())
@@ -120,12 +126,28 @@ class AdaFaceRuntime:
             str(self.config.detector),
             "",
             (320, 320),
-            score_threshold=0.9,
+            score_threshold=_QUERY_SCORE_THRESHOLD,
             nms_threshold=0.3,
             top_k=5_000,
         )
 
     def submit(self, image: np.ndarray, *, owner: str) -> asyncio.Future[np.ndarray] | None:
+        return self._submit(self._queued_embedding, image, owner)
+
+    def submit_enrollment(
+        self,
+        image: np.ndarray,
+        *,
+        owner: str,
+    ) -> asyncio.Future[np.ndarray] | None:
+        return self._submit(self._queued_enrollment_embedding, image, owner)
+
+    def _submit(
+        self,
+        worker: Callable[[np.ndarray, float], np.ndarray],
+        image: np.ndarray,
+        owner: str,
+    ) -> asyncio.Future[np.ndarray] | None:
         if not self.ready:
             return None
         with self._lock:
@@ -141,20 +163,37 @@ class AdaFaceRuntime:
             self._calls += 1
             self._max_inflight = max(self._max_inflight, self._inflight)
 
-        concurrent = self._executor.submit(
-            self._queued_embedding, image.copy(), time.perf_counter()
-        )
+        concurrent = self._executor.submit(worker, image.copy(), time.perf_counter())
         concurrent.add_done_callback(partial(self._completed, owner))
         wrapped = asyncio.wrap_future(concurrent)
         wrapped.add_done_callback(_observe_future)
         return wrapped
 
     def _queued_embedding(self, image: np.ndarray, submitted_at: float) -> np.ndarray:
+        self._record_queue_wait(submitted_at)
+        return self._embedding(
+            image,
+            score_threshold=_QUERY_SCORE_THRESHOLD,
+            min_face_size=min(self.config.min_face_size, self.config.query_min_face_size),
+        )
+
+    def _queued_enrollment_embedding(
+        self,
+        image: np.ndarray,
+        submitted_at: float,
+    ) -> np.ndarray:
+        self._record_queue_wait(submitted_at)
+        return self._embedding(
+            image,
+            score_threshold=_ENROLLMENT_SCORE_THRESHOLD,
+            min_face_size=self.config.min_face_size,
+        )
+
+    def _record_queue_wait(self, submitted_at: float) -> None:
         queue_wait_ms = (time.perf_counter() - submitted_at) * 1_000
         with self._lock:
             self._queue_wait_ms_total += queue_wait_ms
             self._queue_wait_ms_max = max(self._queue_wait_ms_max, queue_wait_ms)
-        return self._embedding(image)
 
     def _completed(self, owner: str, future: Future[np.ndarray]) -> None:
         failed = future.cancelled()
@@ -173,34 +212,53 @@ class AdaFaceRuntime:
             if failed:
                 self._failures += 1
 
-    def _embedding(self, image: np.ndarray) -> np.ndarray:
-        aligned = self._aligned_face(image)
+    def _embedding(
+        self,
+        image: np.ndarray,
+        *,
+        score_threshold: float = _ENROLLMENT_SCORE_THRESHOLD,
+        min_face_size: int | None = None,
+    ) -> np.ndarray:
+        aligned = self._aligned_face(
+            image,
+            score_threshold=score_threshold,
+            min_face_size=self.config.min_face_size if min_face_size is None else min_face_size,
+        )
         normalized = aligned.astype(np.float32) / 127.5 - 1.0
         tensor = torch.from_numpy(normalized.transpose(2, 0, 1).copy()).unsqueeze(0)
         tensor = tensor.to(self.device)
+        inputs = torch.cat((tensor, torch.flip(tensor, dims=(3,))), dim=0)
         with torch.inference_mode():
-            embedding, _ = self._model(tensor)
-        output = embedding[0].detach().to("cpu", dtype=torch.float32).numpy()
+            embeddings, norms = self._model(inputs)
+        fused = (embeddings * norms).sum(dim=0)
+        output = fused.detach().to("cpu", dtype=torch.float32).numpy()
         norm = float(np.linalg.norm(output))
         if not math.isfinite(norm) or norm <= 0:
             raise RuntimeError("AdaFace returned an invalid embedding")
         return output / norm
 
-    def _aligned_face(self, image: np.ndarray) -> np.ndarray:
+    def _aligned_face(
+        self,
+        image: np.ndarray,
+        *,
+        score_threshold: float = _ENROLLMENT_SCORE_THRESHOLD,
+        min_face_size: int | None = None,
+    ) -> np.ndarray:
         if image.ndim != 3 or image.shape[2] != 3:
             raise FaceAlignmentError("face image must be BGR HxWx3")
         height, width = image.shape[:2]
         self._detector.setInputSize((width, height))
         _, faces = self._detector.detect(image)
+        if faces is not None:
+            faces = faces[faces[:, 14] >= score_threshold]
         count = 0 if faces is None else len(faces)
         if count != 1:
             raise FaceCountError(f"expected exactly one face, found {count}")
 
         face = faces[0]
-        if min(float(face[2]), float(face[3])) < self.config.min_face_size:
-            raise FaceTooSmallError(
-                f"face must be at least {self.config.min_face_size}px on its short side"
-            )
+        required_size = self.config.min_face_size if min_face_size is None else min_face_size
+        if min(float(face[2]), float(face[3])) < required_size:
+            raise FaceTooSmallError(f"face must be at least {required_size}px on its short side")
         landmarks = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
         transform, _ = cv2.estimateAffinePartial2D(
             landmarks,
