@@ -405,6 +405,17 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             other = await server.stub.AddWhitelist(
                 ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-b")
             )
+            status_a, status_b, missing = await asyncio.gather(
+                server.stub.GetWhitelistStatus(
+                    ai_processor_pb2.GetWhitelistStatusRequest(session_id="session-a")
+                ),
+                server.stub.GetWhitelistStatus(
+                    ai_processor_pb2.GetWhitelistStatusRequest(session_id="session-b")
+                ),
+                server.stub.GetWhitelistStatus(
+                    ai_processor_pb2.GetWhitelistStatusRequest(session_id="session-c")
+                ),
+            )
             session_a = server.sessions.get_or_create("session-a").snapshot()
             session_b = server.sessions.get_or_create("session-b").snapshot()
 
@@ -412,7 +423,19 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({first.entry_id, second.entry_id, other.entry_id}), 3)
         self.assertEqual((len(session_a.entries), session_a.version), (2, 2))
         self.assertEqual((len(session_b.entries), session_b.version), (1, 1))
+        self.assertEqual((status_a.entry_count, status_a.whitelist_version), (2, 2))
+        self.assertEqual((status_b.entry_count, status_b.whitelist_version), (1, 1))
+        self.assertEqual((missing.entry_count, missing.whitelist_version), (0, 0))
         self.assertEqual(adaface.calls, 3)
+
+    async def test_whitelist_status_rejects_an_empty_session(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await server.stub.GetWhitelistStatus(
+                    ai_processor_pb2.GetWhitelistStatusRequest(session_id=" ")
+                )
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
     async def test_add_whitelist_rejects_decode_and_face_validation_failures(self):
         adaface = FakeAdaFace()

@@ -161,3 +161,19 @@ class WhitelistResponse(_message.Message):
     entry_count: int
     whitelist_version: int
     def __init__(self, status_message: _Optional[str] = ..., timestamp: _Optional[int] = ..., entry_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ...) -> None: ...
+
+class GetWhitelistStatusRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class GetWhitelistStatusResponse(_message.Message):
+    __slots__ = ("session_id", "entry_count", "whitelist_version")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    entry_count: int
+    whitelist_version: int
+    def __init__(self, session_id: _Optional[str] = ..., entry_count: _Optional[int] = ..., whitelist_version: _Optional[int] = ...) -> None: ...

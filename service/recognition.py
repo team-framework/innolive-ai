@@ -89,6 +89,14 @@ class SessionRegistry:
             self._sessions[validated] = created
             return created
 
+    def snapshot(self, session_id: str) -> WhitelistSnapshot:
+        validated = validate_session_id(session_id)
+        with self._lock:
+            session = self._sessions.get(validated)
+        if session is None:
+            return WhitelistSnapshot((), 0)
+        return session.snapshot()
+
 
 @dataclass(frozen=True, slots=True)
 class RecognitionConfig:

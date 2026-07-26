@@ -122,6 +122,16 @@ class GrpcSchemaContractTests(unittest.TestCase):
         add_whitelist = service.methods_by_name["AddWhitelist"]
         self.assertFalse(add_whitelist.client_streaming)
         self.assertFalse(add_whitelist.server_streaming)
+        get_status = service.methods_by_name["GetWhitelistStatus"]
+        self.assertFalse(get_status.client_streaming)
+        self.assertFalse(get_status.server_streaming)
+        self.assertEqual(
+            {
+                field.name: field.number
+                for field in ai_processor_pb2.GetWhitelistStatusResponse.DESCRIPTOR.fields
+            },
+            {"session_id": 1, "entry_count": 2, "whitelist_version": 3},
+        )
 
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()

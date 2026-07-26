@@ -37,6 +37,7 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.mode = mode
         self.requests: list[Any] = []
         self.whitelist_requests: list[Any] = []
+        self.whitelist_counts: dict[str, int] = {}
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator[Any]:
         if self.mode == "early_eof":
@@ -60,11 +61,22 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         if self.mode == "whitelist_error":
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "whitelist full")
         self.whitelist_requests.append(request)
+        count = self.whitelist_counts.get(request.session_id, 0) + 1
+        self.whitelist_counts[request.session_id] = count
         return ai_processor_pb2.WhitelistResponse(
             status_message="success",
-            entry_id="entry-1",
-            entry_count=1,
-            whitelist_version=1,
+            entry_id=f"entry-{len(self.whitelist_requests)}",
+            entry_count=count,
+            whitelist_version=count,
+        )
+
+    async def GetWhitelistStatus(self, request, context):
+        del context
+        count = self.whitelist_counts.get(request.session_id, 0)
+        return ai_processor_pb2.GetWhitelistStatusResponse(
+            session_id=request.session_id,
+            entry_count=count,
+            whitelist_version=count,
         )
 
     @staticmethod
@@ -160,6 +172,24 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(loopback.servicer.whitelist_requests[0].session_id, "bound-session")
         self.assertEqual(loopback.servicer.requests[0].session_id, "bound-session")
+
+    async def test_multiple_enrollments_and_status_remain_session_scoped(self):
+        faces = [_jpeg(10), _jpeg(20)]
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            session_a = client.for_session("session-a")
+            session_b = client.for_session("session-b")
+            added = await session_a.add_whitelist_many(faces)
+            status_a, status_b = await asyncio.gather(
+                session_a.get_whitelist_status(),
+                session_b.get_whitelist_status(),
+            )
+
+        self.assertEqual([response.entry_count for response in added], [1, 2])
+        self.assertEqual((status_a.session_id, status_a.entry_count), ("session-a", 2))
+        self.assertEqual((status_b.session_id, status_b.entry_count), ("session-b", 0))
 
     async def test_rpc_error_preserves_method_status_and_details(self):
         async with (
