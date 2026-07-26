@@ -133,7 +133,7 @@ stream 하나가 frame을 무한 적재하지 않습니다.
 --adaface-queue-capacity N
 --adaface-revalidate-frames N
 --adaface-max-pending-per-stream N
---max-sessions N
+--max-sessions N          1..1024
 --max-whitelist-entries N
 --ssl-certfile PATH --ssl-keyfile PATH
 ```
@@ -163,15 +163,17 @@ from grpc_client import VideoProcessorClient
 async def main() -> None:
     frames = [Path("frame-1.jpg").read_bytes(), Path("frame-2.jpg").read_bytes()]
     async with VideoProcessorClient("127.0.0.1:50051") as client:
-        session = client.for_session("authenticated-session-id")
+        created = await client.create_session()
+        session = client.for_session(created.session_id)
         await session.add_whitelist_many(
             [
                 Path("enrollment-face-1.jpg").read_bytes(),
-                Path("enrollment-face-2.jpg").read_bytes(),
+                Path("enrollment-face-2.png").read_bytes(),
             ]
         )
         status = await session.get_whitelist_status()
         print(status.entry_count, status.whitelist_version)
+        print([item.session_id for item in await client.list_sessions()])
         async for result in session.process_jpegs(frames):
             print(result.response.frame_id, result.response.faces)
             source_jpeg = result.source_jpeg
@@ -193,8 +195,10 @@ stream을 종료합니다. RPC 실패는 `VideoRpcError`의 `method`, gRPC `code
 ## gRPC 인터페이스 설계
 
 `ProcessVideo`의 bidirectional streaming은 한 RPC 안에서 요청·응답 순서를 유지하는
-장시간 영상 흐름에 맞는 표준 gRPC 형태입니다. `AddWhitelist`는 독립된 등록 작업이므로
-unary RPC가 자연스럽습니다. client는 gRPC 권장 방식대로 channel과 stub을 재사용합니다.
+장시간 영상 흐름에 맞는 표준 gRPC 형태입니다. `AddWhitelist`, `CreateSession`,
+`ListSessions`는 각각 독립된 등록·생성·조회 작업이므로 unary RPC로 분리했습니다. 세션
+registry는 최대 1024개로 제한되어 목록 응답도 bounded이므로 별도 pagination은 두지
+않았습니다. client는 gRPC 권장 방식대로 channel과 stub을 재사용합니다.
 
 - RPC 전체를 계속할 수 있는 frame decode 오류는 `ProcessedVideoChunk.error_code`로 돌려주고,
   잘못된 session, 자원 한도, 모델 미준비처럼 RPC를 수행할 수 없는 오류는 gRPC status를
@@ -239,17 +243,25 @@ tracking, serialization 실패는 terminal error 후 stream을 닫습니다. inf
 health를 `NOT_SERVING`으로 바꾸며, 이미 시작한 inference가 끝날 때까지 tracker와 stream
 admission을 보존합니다.
 
-Unary `/AiProcessor/AddWhitelist`는 `FaceData.session_id`와 한 장의 JPEG를 받습니다. 정확히
-한 얼굴을 YuNet 5점 landmark로 정렬해 AdaFace embedding만 메모리에 보관하며 원본이나
-crop은 저장하지 않습니다. 응답은 `entry_id`, 현재 `entry_count`, `whitelist_version`을
-포함합니다. 빈 세션, decode 실패, 0개·복수 얼굴, 작은 얼굴, 정렬 실패는
-`INVALID_ARGUMENT`; 세션·entry·queue 제한은 `RESOURCE_EXHAUSTED`입니다.
+Unary `/AiProcessor/AddWhitelist`는 `FaceData.session_id`와 한 장의 static JPEG, PNG 또는
+WebP를 받습니다. animated PNG/WebP는 거부합니다. 정확히 한 얼굴을 YuNet 5점 landmark로
+정렬해 AdaFace embedding만 메모리에 보관하며 원본이나 crop은 저장하지 않습니다. 응답은
+`entry_id`, 현재 `entry_count`, `whitelist_version`을 포함합니다. 빈 세션, decode 실패,
+0개·복수 얼굴, 작은 얼굴, 정렬 실패는 `INVALID_ARGUMENT`; 세션·entry·queue 제한은
+`RESOURCE_EXHAUSTED`입니다. 영상 `ProcessVideo.data`는 호환성을 위해 계속 완전한 JPEG만
+허용합니다.
 
 여러 장은 `AddWhitelist`를 이미지별로 호출하며 각 embedding이 독립 exemplar로 누적됩니다.
 Python client의 `add_whitelist_many()`는 queue overflow를 피하기 위해 순차 등록합니다. 기본
 한도는 세션당 32장입니다. Unary `/AiProcessor/GetWhitelistStatus`는 원본이나 embedding을
 노출하지 않고 해당 세션의 `entry_count`와 `whitelist_version`만 반환합니다. 존재하지 않는
 유효 세션은 registry slot을 생성하지 않고 0/0을 반환합니다.
+
+Unary `/AiProcessor/CreateSession`은 registry lock 안에서 충돌 없는 opaque UUID 기반 ID를
+생성하고 빈 `SessionInfo`를 반환합니다. `/AiProcessor/ListSessions`는 생성된 ID와
+`entry_count`, `whitelist_version`, 생성 시각만 반환합니다. 이 두 RPC와 브라우저의
+`GET/POST /api/sessions`는 로컬 시연·신뢰된 관리 경로용이며 인증을 구현하지 않습니다.
+운영 data-plane에 공개하지 말고 인증된 Go proxy 또는 private control network 뒤에 둡니다.
 
 proto를 수정한 경우 생성물을 함께 갱신합니다.
 
@@ -274,7 +286,10 @@ protoc -I. \
 
 Go 호출부는 모든 `VideoChunk`에 같은 `session_id`를 넣고, 등록 시
 `AddWhitelist(FaceData{session_id, data})`, 상태 확인 시 `GetWhitelistStatus`를 호출해야
-합니다. Python 서버는 인증을 하지 않으므로 앞단에서 검증한 세션 값만 전달해야 합니다.
+합니다. 시연용 자동 세션을 사용할 때는 `CreateSession`, 관리 목록은 `ListSessions` stub을
+추가로 생성합니다. 기존 field number와 RPC path는 바뀌지 않아 재생성 전 client도 기존
+기능을 계속 호출할 수 있습니다. Python 서버는 인증을 하지 않으므로 앞단에서 검증한 세션
+값만 전달해야 합니다.
 
 ## 브라우저 gRPC 시연
 
@@ -299,7 +314,6 @@ browser -> ILF1 WebSocket -> VideoProcessorClient -> gRPC ProcessVideo -> AI run
 .venv/bin/python server.py \
   --host 127.0.0.1 \
   --port 8002 \
-  --session-id local-demo-session \
   --grpc-target 127.0.0.1:50051
 ```
 
@@ -307,11 +321,14 @@ browser -> ILF1 WebSocket -> VideoProcessorClient -> gRPC ProcessVideo -> AI run
 `AiProcessor`가 `SERVING`일 때만 카메라 연결을 허용합니다. 모델과 tracker는
 `ai_processor_server.py` 프로세스에만 존재하므로 GPU memory도 중복되지 않습니다.
 
-상단 whitelist 패널에서 session ID와 얼굴 JPEG 여러 장을 선택해 등록할 수 있습니다.
-등록은 파일별로 계속 진행되므로 한 파일이 얼굴 수·정렬 검사에 실패해도 다음 파일을
-시도합니다. `두 세션 분리 확인`은 A/B의 count와 version을 서버에서 각각 조회합니다. A에만
-등록한 뒤 A session으로 카메라를 시작하면 일치 얼굴이 `whitelist`로 표시되고, 중지 후 B로
-바꿔 다시 시작하면 같은 얼굴도 blur되어 세션 분리를 확인할 수 있습니다.
+상단 whitelist 패널은 새 브라우저 탭마다 서버가 생성한 충돌 없는 세션을 자동 선택하고,
+같은 탭의 새로고침에는 `sessionStorage`의 세션을 재사용합니다. 생성된 세션 목록과 각
+count/version을 보면서 활성·비교 세션을 선택하거나 새 세션을 만들 수 있습니다. JPEG,
+PNG, WebP를 포함해 브라우저가 decode할 수 있는 raster 이미지는 긴 변 640 이하의 JPEG로
+정규화한 뒤 여러 장을 순차 등록합니다. HEIC/AVIF 지원 여부는 브라우저 codec에 따릅니다.
+한 파일이 decode·얼굴 수·정렬 검사에 실패해도 다음 파일을 계속 시도합니다. A에만 등록한
+뒤 A 세션으로 카메라를 시작하면 일치 얼굴이 `whitelist`로 표시되고, 중지 후 B로 바꿔 다시
+시작하면 같은 얼굴도 blur되어 세션 분리를 확인할 수 있습니다.
 
 브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v1과
 `ProcessVideo` gRPC 경로를 확인한 뒤 서버가 광고한 해상도, JPEG 품질, FPS, request window가
@@ -360,7 +377,7 @@ service/runtime.py              auto/TensorRT/PyTorch runtime와 backend 선택
 service/tracking.py             stream-local BoT-SORT와 1-frame mask hold
 service/adaface_model.py         공유 AdaFace/YuNet bounded worker
 service/recognition.py           세션 whitelist와 stream-local track cache
-service/frame.py                transport 공통 JPEG 검증/decode
+service/frame.py                영상 JPEG와 등록 JPEG/PNG/WebP 검증/decode
 service/protocol.py             ILF1 WebSocket codec와 payload limit
 service/grpc_config.py          gRPC message, keepalive, bind 설정
 protos/                         schema와 생성된 Python stub

@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 from collections.abc import AsyncIterator
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import cv2
 import grpc
@@ -13,7 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from grpc_client import VideoResult, VideoRpcError
 from protos import ai_processor_pb2
-from server import ServerSettings, create_app
+from server import ServerSettings, create_app, parse_args
 from service.protocol import decode_response, encode_request
 
 
@@ -36,6 +38,9 @@ class FakeGrpcClient:
         self.stream_sessions: list[str] = []
         self.whitelist_images: list[tuple[str, bytes]] = []
         self.whitelist_counts: dict[str, int] = {}
+        self.whitelist_versions: dict[str, int] = {}
+        self.sessions: dict[str, int] = {}
+        self.created_sessions = 0
 
     async def __aenter__(self):
         return self
@@ -72,12 +77,15 @@ class FakeGrpcClient:
                 "whitelist full",
             )
         self.whitelist_images.append((session_id, image))
+        self._ensure_session(session_id)
         count = self.whitelist_counts.get(session_id, 0) + 1
+        version = self.whitelist_versions.get(session_id, 0) + 1
         self.whitelist_counts[session_id] = count
+        self.whitelist_versions[session_id] = version
         return ai_processor_pb2.WhitelistResponse(
             entry_id=f"entry-{len(self.whitelist_images)}",
             entry_count=count,
-            whitelist_version=count,
+            whitelist_version=version,
         )
 
     async def get_whitelist_status(self, session_id: str):
@@ -85,7 +93,45 @@ class FakeGrpcClient:
         return ai_processor_pb2.GetWhitelistStatusResponse(
             session_id=session_id,
             entry_count=count,
-            whitelist_version=count,
+            whitelist_version=self.whitelist_versions.get(session_id, 0),
+        )
+
+    async def create_session(self):
+        if self.mode == "session_error":
+            raise VideoRpcError(
+                "CreateSession",
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "session registry full",
+            )
+        self.created_sessions += 1
+        session_id = f"session-generated-{self.created_sessions}"
+        self._ensure_session(session_id)
+        return self._session_info(session_id)
+
+    async def list_sessions(self):
+        if self.mode == "session_error":
+            raise VideoRpcError(
+                "ListSessions",
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "session registry full",
+            )
+        newest_first = sorted(
+            self.sessions,
+            key=lambda session_id: self.sessions[session_id],
+            reverse=True,
+        )
+        return tuple(self._session_info(session_id) for session_id in newest_first)
+
+    def _ensure_session(self, session_id: str) -> None:
+        if session_id not in self.sessions:
+            self.sessions[session_id] = 1_000 + len(self.sessions)
+
+    def _session_info(self, session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            session_id=session_id,
+            entry_count=self.whitelist_counts.get(session_id, 0),
+            whitelist_version=self.whitelist_versions.get(session_id, 0),
+            created_at_unix_ms=self.sessions[session_id],
         )
 
     def _response(self, frame):
@@ -154,6 +200,12 @@ def app(client: FakeGrpcClient | None = None):
 
 
 class GrpcDemoGatewayTests(unittest.TestCase):
+    def test_browser_gateway_no_longer_requires_a_manual_session_argument(self):
+        with patch("sys.argv", ["server.py", "--host", "127.0.0.1", "--port", "8002"]):
+            arguments = parse_args()
+
+        self.assertEqual(arguments.session_id, "demo-session")
+
     def test_health_identifies_the_real_grpc_route(self):
         application, fake = app()
         with TestClient(application) as client:
@@ -165,6 +217,10 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         )
         self.assertEqual(health.json()["grpc"]["target"], "test-grpc:50051")
         self.assertTrue(health.json()["grpc"]["serving"])
+        self.assertEqual(
+            health.json()["enrollment_content_types"],
+            ["image/jpeg", "image/png", "image/webp"],
+        )
         self.assertTrue(fake.closed)
 
     def test_result_passes_through_process_video_as_metadata_only(self):
@@ -207,6 +263,43 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(status_a.json()["entry_count"], 2)
         self.assertEqual(status_b.json()["entry_count"], 0)
         self.assertEqual(fake.whitelist_images, [("session-a", face), ("session-a", face)])
+
+    def test_session_api_creates_unique_sessions_and_lists_independent_state(self):
+        application, _ = app()
+        face = jpeg()
+        with TestClient(application) as client:
+            first = client.post("/api/sessions")
+            second = client.post("/api/sessions")
+            first_id = first.json()["session_id"]
+            second_id = second.json()["session_id"]
+            client.post(f"/api/whitelist?session_id={first_id}", content=face)
+            client.post(f"/api/whitelist?session_id={first_id}", content=face)
+            client.post(f"/api/whitelist?session_id={second_id}", content=face)
+            listed = client.get("/api/sessions")
+
+        self.assertEqual((first.status_code, second.status_code), (201, 201))
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(first.json()["entry_count"], 0)
+        self.assertEqual(first.json()["whitelist_version"], 0)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.headers["cache-control"], "no-store")
+        sessions = {item["session_id"]: item for item in listed.json()["sessions"]}
+        self.assertEqual(sessions[first_id]["entry_count"], 2)
+        self.assertEqual(sessions[first_id]["whitelist_version"], 2)
+        self.assertEqual(sessions[second_id]["entry_count"], 1)
+        self.assertEqual(sessions[second_id]["whitelist_version"], 1)
+        self.assertIsInstance(sessions[first_id]["created_at_unix_ms"], int)
+
+    def test_session_api_preserves_grpc_status(self):
+        application, _ = app(FakeGrpcClient(mode="session_error"))
+        with TestClient(application) as client:
+            created = client.post("/api/sessions")
+            listed = client.get("/api/sessions")
+
+        self.assertEqual(created.status_code, 429)
+        self.assertEqual(created.json()["error"]["code"], "RESOURCE_EXHAUSTED")
+        self.assertEqual(listed.status_code, 429)
+        self.assertEqual(listed.json()["error"]["code"], "RESOURCE_EXHAUSTED")
 
     def test_whitelist_api_validates_session_and_body_limit(self):
         application, _ = app()

@@ -4,12 +4,18 @@ import {
   BitmapLease,
   LatestRenderQueue,
   PROFILE,
+  TAB_SESSION_STORAGE_KEY,
   addWhitelistFiles,
   captureDeadline,
+  createSession,
+  enrollmentSize,
+  ensureTabSession,
   fitLongEdge,
   framePacket,
   getWhitelistStatus,
+  listSessions,
   negotiateServerProfile,
+  normalizeWhitelistImage,
   objectsToBlur,
   parseTerminal,
   percentile,
@@ -53,9 +59,138 @@ assert.throws(
   /does not match/,
 );
 
+const serverSessions = [
+  {
+    session_id: "session-existing",
+    entry_count: 2,
+    whitelist_version: 3,
+    created_at_unix_ms: 100,
+  },
+];
+const listedSessions = await listSessions(async (url, options) => {
+  assert.equal(url, "/api/sessions");
+  assert.equal(options.cache, "no-store");
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ sessions: serverSessions }),
+  };
+});
+assert.deepEqual(listedSessions, serverSessions);
+
+const createdSession = await createSession(async (url, options) => {
+  assert.equal(url, "/api/sessions");
+  assert.equal(options.method, "POST");
+  return {
+    ok: true,
+    status: 201,
+    json: async () => ({
+      session_id: "session-created",
+      entry_count: 0,
+      whitelist_version: 0,
+      created_at_unix_ms: 200,
+    }),
+  };
+});
+assert.equal(createdSession.session_id, "session-created");
+
+function memoryStorage() {
+  const values = new Map();
+  return {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  };
+}
+
+let createdTabs = 0;
+const createTabSession = async () => ({
+  session_id: `session-tab-${++createdTabs}`,
+  entry_count: 0,
+  whitelist_version: 0,
+  created_at_unix_ms: 200 + createdTabs,
+});
+const firstTabStorage = memoryStorage();
+const secondTabStorage = memoryStorage();
+const firstTab = await ensureTabSession(serverSessions, firstTabStorage, createTabSession);
+const secondTab = await ensureTabSession(serverSessions, secondTabStorage, createTabSession);
+assert.equal(firstTab.created, true);
+assert.equal(secondTab.created, true);
+assert.notEqual(firstTab.active.session_id, secondTab.active.session_id);
+assert.equal(
+  firstTabStorage.getItem(TAB_SESSION_STORAGE_KEY),
+  firstTab.active.session_id,
+);
+const reusedTab = await ensureTabSession(
+  firstTab.sessions,
+  firstTabStorage,
+  async () => { throw new Error("a refreshed tab must not create another session"); },
+);
+assert.equal(reusedTab.created, false);
+assert.equal(reusedTab.active.session_id, firstTab.active.session_id);
+
+assert.deepEqual(enrollmentSize(1600, 800), [640, 320]);
+assert.deepEqual(enrollmentSize(320, 240), [320, 240]);
+assert.throws(() => enrollmentSize(0, 100), /invalid dimensions/);
+
+const imageOperations = [];
+let enrollmentBitmapCloses = 0;
+let encodedQuality = null;
+const canvas = {
+  width: 0,
+  height: 0,
+  getContext: () => ({
+    fillStyle: null,
+    fillRect(x, y, width, height) {
+      imageOperations.push(["fill", this.fillStyle, x, y, width, height]);
+    },
+    drawImage(_bitmap, x, y, width, height) {
+      imageOperations.push(["draw", x, y, width, height]);
+    },
+  }),
+  toBlob(callback, type, quality) {
+    encodedQuality = quality;
+    callback(new Blob(["jpeg"], { type }));
+  },
+};
+const normalizedPng = await normalizeWhitelistImage(
+  { type: "image/png" },
+  {
+    decode: async () => ({
+      width: 1600,
+      height: 800,
+      close: () => { enrollmentBitmapCloses += 1; },
+    }),
+    createCanvas: () => canvas,
+  },
+);
+assert.equal(normalizedPng.type, "image/jpeg");
+assert.deepEqual([canvas.width, canvas.height], [640, 320]);
+assert.deepEqual(imageOperations[0], ["fill", "#fff", 0, 0, 640, 320]);
+assert.deepEqual(imageOperations[1], ["draw", 0, 0, 640, 320]);
+assert.equal(encodedQuality, PROFILE.jpegQuality);
+assert.equal(enrollmentBitmapCloses, 1, "normalized image bitmap must close once");
+
+let failedBitmapCloses = 0;
+await assert.rejects(
+  normalizeWhitelistImage(
+    { type: "image/webp" },
+    {
+      decode: async () => ({
+        width: 100,
+        height: 100,
+        close: () => { failedBitmapCloses += 1; },
+      }),
+      createCanvas: () => ({ getContext: () => null }),
+    },
+  ),
+  /could not create an image canvas/,
+);
+assert.equal(failedBitmapCloses, 1, "failed normalization must close its bitmap");
+
 let enrollmentInFlight = 0;
 let maxEnrollmentInFlight = 0;
 const enrollmentCalls = [];
+const normalizedTypes = [];
 const enrollmentRequest = async (url, options) => {
   enrollmentInFlight += 1;
   maxEnrollmentInFlight = Math.max(maxEnrollmentInFlight, enrollmentInFlight);
@@ -74,15 +209,48 @@ const enrollmentRequest = async (url, options) => {
 const enrollmentResults = await addWhitelistFiles(
   [
     { name: "first.jpg", type: "image/jpeg" },
-    { name: "invalid.jpg", type: "image/jpeg" },
-    { name: "third.jpg", type: "image/jpeg" },
+    { name: "invalid.png", type: "image/png" },
+    { name: "third.webp", type: "image/webp" },
   ],
   "session-a",
   enrollmentRequest,
+  async (file) => {
+    normalizedTypes.push(file.type);
+    return new Blob([file.name], { type: "image/jpeg" });
+  },
 );
 assert.equal(maxEnrollmentInFlight, 1, "enrollments must be submitted sequentially");
 assert.deepEqual(enrollmentResults.map((result) => result.ok), [true, false, true]);
 assert.equal(enrollmentCalls.length, 3, "one invalid face must not skip later files");
+assert.deepEqual(normalizedTypes, ["image/jpeg", "image/png", "image/webp"]);
+assert.ok(enrollmentCalls.every((call) => call.options.body.type === "image/jpeg"));
+
+let requestsAfterNormalizationFailure = 0;
+const isolatedResults = await addWhitelistFiles(
+  [
+    { name: "unsupported.heic", type: "image/heic" },
+    { name: "valid.png", type: "image/png" },
+  ],
+  "session-a",
+  async () => {
+    requestsAfterNormalizationFailure += 1;
+    return {
+      ok: true,
+      status: 201,
+      json: async () => ({
+        session_id: "session-a",
+        entry_count: 1,
+        whitelist_version: 1,
+      }),
+    };
+  },
+  async (file) => {
+    if (file.type === "image/heic") throw new Error("browser could not decode image");
+    return new Blob(["jpeg"], { type: "image/jpeg" });
+  },
+);
+assert.deepEqual(isolatedResults.map((result) => result.ok), [false, true]);
+assert.equal(requestsAfterNormalizationFailure, 1);
 
 const queriedStatus = await getWhitelistStatus("session-b", async (url) => ({
   ok: true,

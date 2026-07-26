@@ -40,8 +40,8 @@ button:disabled { opacity: .4; cursor: default; }
 .enrollment { padding-bottom: 13px; }
 .enrollment-grid { display: grid; grid-template-columns: 1fr 1fr 1.4fr; gap: 12px; padding: 13px; }
 .enrollment label { display: grid; gap: 7px; color: var(--muted); font-size: .72rem; }
-.enrollment input { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #0b1118; color: var(--text); }
-.enrollment input:disabled { opacity: .6; }
+.enrollment input, .enrollment select { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #0b1118; color: var(--text); }
+.enrollment input:disabled, .enrollment select:disabled { opacity: .6; }
 .enrollment-actions { display: flex; align-items: center; gap: 9px; padding: 0 13px; }
 .enrollment-actions strong { margin-left: auto; color: var(--safe); font: 700 .78rem ui-monospace, monospace; }
 .enrollment pre { min-height: 42px; margin: 13px 13px 0; padding: 11px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; color: #b8c7d5; background: #0b1118; font: .72rem/1.5 ui-monospace, monospace; white-space: pre-wrap; }
