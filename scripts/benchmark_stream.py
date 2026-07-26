@@ -29,8 +29,10 @@ from scripts.benchmark_utils import (
     sha256_file,
 )
 from service.protocol import (
-    MAX_RESPONSE_BYTES,
+    MAX_GRPC_RESPONSE_BYTES,
+    RESULT_HEADER,
     decode_response,
+    decode_result,
     encode_request,
 )
 
@@ -45,8 +47,9 @@ class Sample:
     sequence: int
     sent_at: float
     received_at: float
-    jpeg_bytes: int
-    metadata_bytes: int
+    input_jpeg_bytes: int
+    mosaic_jpeg_bytes: int
+    response_bytes: int
     server_total_ms: float
 
     @property
@@ -63,7 +66,7 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
 
     async with websockets.connect(
         url,
-        max_size=MAX_RESPONSE_BYTES,
+        max_size=MAX_GRPC_RESPONSE_BYTES + RESULT_HEADER.size,
         max_queue=WINDOW,
         compression=None,
     ) as websocket:
@@ -79,9 +82,13 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
 
             raw = await websocket.recv()
             received_at = time.perf_counter()
-            if not isinstance(raw, str):
-                raise TypeError("server returned binary data; metadata JSON is required")
-            metadata = decode_response(raw)
+            if isinstance(raw, str):
+                error = decode_response(raw)
+                raise RuntimeError(
+                    f"server error seq={error['seq']} code={error.get('code')}: "
+                    f"{error.get('message')}"
+                )
+            metadata, mosaic_jpeg = decode_result(raw)
             sequence = metadata["seq"]
             if sequence not in pending:
                 raise RuntimeError(f"unknown or duplicate terminal sequence: {sequence}")
@@ -89,11 +96,6 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
                 raise RuntimeError(f"terminal sequence regressed: {sequence}")
             last_terminal = sequence
             sent_at, jpeg_bytes = pending.pop(sequence)
-            if metadata["type"] == "error":
-                raise RuntimeError(
-                    f"server error seq={sequence} code={metadata.get('code')}: "
-                    f"{metadata.get('message')}"
-                )
             if _contains_pixels(metadata):
                 raise RuntimeError("result contains forbidden JPEG/raw pixel fields")
             server_total = float(metadata.get("timing_ms", {}).get("server_total", 0))
@@ -103,7 +105,8 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
                     sent_at,
                     received_at,
                     jpeg_bytes,
-                    len(raw.encode("utf-8")),
+                    len(mosaic_jpeg),
+                    len(raw),
                     server_total,
                 )
             )
@@ -136,6 +139,7 @@ def summarize(
         "max_inflight_at_most_5": max_inflight <= WINDOW,
         "terminal_sequence_complete": [sample.sequence for sample in samples]
         == list(range(1, len(samples) + 1)),
+        "server_mosaic_jpeg": all(sample.mosaic_jpeg_bytes > 0 for sample in samples),
         "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
@@ -149,8 +153,9 @@ def summarize(
             "rtt_ms": distribution(rtt),
             "server_total_ms": distribution(server),
             "latency_growth_ms": round(latency_growth_ms, 2),
-            "jpeg_bytes": distribution([sample.jpeg_bytes for sample in samples]),
-            "metadata_bytes": distribution([sample.metadata_bytes for sample in samples]),
+            "input_jpeg_bytes": distribution([sample.input_jpeg_bytes for sample in samples]),
+            "mosaic_jpeg_bytes": distribution([sample.mosaic_jpeg_bytes for sample in samples]),
+            "response_bytes": distribution([sample.response_bytes for sample in samples]),
         },
         "provenance": {
             "input": str(input_path),
