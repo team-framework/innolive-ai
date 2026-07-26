@@ -37,6 +37,7 @@ class FakeGrpcClient:
         self.received: list[Any] = []
         self.stream_sessions: list[str] = []
         self.whitelist_images: list[tuple[str, bytes]] = []
+        self.whitelist_entry_ids: dict[str, list[str]] = {}
         self.whitelist_counts: dict[str, int] = {}
         self.whitelist_versions: dict[str, int] = {}
         self.sessions: dict[str, int] = {}
@@ -79,12 +80,15 @@ class FakeGrpcClient:
             )
         self.whitelist_images.append((session_id, image))
         self._ensure_session(session_id)
-        count = self.whitelist_counts.get(session_id, 0) + 1
+        entry_id = f"entry-{len(self.whitelist_images)}"
+        entry_ids = self.whitelist_entry_ids.setdefault(session_id, [])
+        entry_ids.append(entry_id)
+        count = len(entry_ids)
         version = self.whitelist_versions.get(session_id, 0) + 1
         self.whitelist_counts[session_id] = count
         self.whitelist_versions[session_id] = version
         return ai_processor_pb2.WhitelistResponse(
-            entry_id=f"entry-{len(self.whitelist_images)}",
+            entry_id=entry_id,
             entry_count=count,
             whitelist_version=version,
         )
@@ -95,6 +99,25 @@ class FakeGrpcClient:
             session_id=session_id,
             entry_count=count,
             whitelist_version=self.whitelist_versions.get(session_id, 0),
+            entry_ids=self.whitelist_entry_ids.get(session_id, ()),
+        )
+
+    async def delete_whitelist(self, entry_id: str, *, session_id: str):
+        entry_ids = self.whitelist_entry_ids.get(session_id, [])
+        if entry_id not in entry_ids:
+            raise VideoRpcError(
+                "DeleteWhitelist",
+                grpc.StatusCode.NOT_FOUND,
+                "whitelist entry does not exist",
+            )
+        entry_ids.remove(entry_id)
+        version = self.whitelist_versions.get(session_id, 0) + 1
+        self.whitelist_counts[session_id] = len(entry_ids)
+        self.whitelist_versions[session_id] = version
+        return ai_processor_pb2.WhitelistResponse(
+            entry_id=entry_id,
+            entry_count=len(entry_ids),
+            whitelist_version=version,
         )
 
     async def create_session(self):
@@ -137,6 +160,7 @@ class FakeGrpcClient:
                 "session has active video streams",
             )
         del self.sessions[session_id]
+        self.whitelist_entry_ids.pop(session_id, None)
         self.whitelist_counts.pop(session_id, None)
         self.whitelist_versions.pop(session_id, None)
 
@@ -280,8 +304,34 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(first.json()["entry_count"], 1)
         self.assertEqual(second.json()["entry_count"], 2)
         self.assertEqual(status_a.json()["entry_count"], 2)
+        self.assertEqual(status_a.json()["entry_ids"], ["entry-1", "entry-2"])
+        self.assertEqual(status_a.headers["cache-control"], "no-store")
         self.assertEqual(status_b.json()["entry_count"], 0)
+        self.assertEqual(status_b.json()["entry_ids"], [])
         self.assertEqual(fake.whitelist_images, [("session-a", face), ("session-a", face)])
+
+    def test_whitelist_api_deletes_one_entry_and_preserves_grpc_status(self):
+        application, fake = app()
+        face = jpeg()
+        with TestClient(application) as client:
+            first = client.post("/api/whitelist?session_id=session-a", content=face)
+            second = client.post("/api/whitelist?session_id=session-a", content=face)
+            fake.active_stream_counts["session-a"] = 1
+            deleted = client.delete("/api/whitelist?session_id=session-a&entry_id=entry-1")
+            status = client.get("/api/whitelist?session_id=session-a")
+            missing = client.delete("/api/whitelist?session_id=session-a&entry_id=entry-1")
+            invalid = client.delete("/api/whitelist?session_id=session-a")
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(status.json()["entry_count"], 1)
+        self.assertEqual(status.json()["whitelist_version"], 3)
+        self.assertEqual(status.json()["entry_ids"], ["entry-2"])
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["code"], "NOT_FOUND")
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.json()["error"]["code"], "INVALID_ARGUMENT")
 
     def test_session_api_creates_unique_sessions_and_lists_independent_state(self):
         application, _ = app()
