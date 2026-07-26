@@ -65,7 +65,6 @@ class ServerSettings:
     grpc_connect_timeout_seconds: float = 10.0
     grpc_health_timeout_seconds: float = 2.0
     max_jpeg_bytes: int = MAX_JPEG_BYTES
-    max_streams: int = 4
 
     def __post_init__(self) -> None:
         target = self.grpc_target.strip()
@@ -82,31 +81,11 @@ class ServerSettings:
             raise ValueError("grpc_health_timeout_seconds must be positive")
         if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
             raise ValueError(f"max_jpeg_bytes must be in 1..{MAX_JPEG_BYTES}")
-        if self.max_streams < 1:
-            raise ValueError("max_streams must be at least one")
         object.__setattr__(self, "grpc_target", target)
 
     @property
     def max_message_bytes(self) -> int:
         return HEADER.size + self.max_jpeg_bytes
-
-
-class ConnectionLimiter:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.active = 0
-        self._lock = asyncio.Lock()
-
-    async def enter(self) -> bool:
-        async with self._lock:
-            if self.active >= self.capacity:
-                return False
-            self.active += 1
-            return True
-
-    async def leave(self) -> None:
-        async with self._lock:
-            self.active = max(0, self.active - 1)
 
 
 class ServerMetrics:
@@ -156,7 +135,7 @@ class GrpcDemoGateway:
     ) -> None:
         self.settings = settings
         self.client_factory = client_factory
-        self.limiter = ConnectionLimiter(settings.max_streams)
+        self.active_streams = 0
         self.metrics = ServerMetrics()
 
     @asynccontextmanager
@@ -218,12 +197,9 @@ class GrpcDemoGateway:
         if not serving or client is None:
             await self._reject(websocket, "gRPC backend is not serving")
             return
-        if not await self.limiter.enter():
-            await self._reject(websocket, "demo stream capacity reached")
-            return
-
-        await websocket.accept()
+        self.active_streams += 1
         try:
+            await websocket.accept()
             await GrpcWebSocketSession(
                 websocket,
                 client,
@@ -237,7 +213,7 @@ class GrpcDemoGateway:
             with suppress(RuntimeError):
                 await websocket.close(code=1011, reason="gRPC demo stream failed")
         finally:
-            await self.limiter.leave()
+            self.active_streams = max(0, self.active_streams - 1)
 
     async def _grpc_serving(self, app: FastAPI) -> tuple[bool, str | None]:
         client = getattr(app.state, "grpc_client", None)
@@ -270,9 +246,8 @@ class GrpcDemoGateway:
                 "jpeg_quality": JPEG_QUALITY,
                 "client_window": REQUEST_WINDOW,
                 "target_fps": TARGET_FPS,
-                "max_streams": self.settings.max_streams,
             },
-            "active_streams": self.limiter.active,
+            "active_streams": self.active_streams,
             "metrics": self.metrics.snapshot(),
         }
 
@@ -540,7 +515,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--grpc-connect-timeout", type=float, default=10.0)
     parser.add_argument("--grpc-health-timeout", type=float, default=2.0)
-    parser.add_argument("--max-streams", type=int, default=4)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
     parser.add_argument(
@@ -562,7 +536,6 @@ def main() -> None:
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,
         grpc_health_timeout_seconds=args.grpc_health_timeout,
-        max_streams=args.max_streams,
     )
     uvicorn.run(
         create_app(settings),

@@ -68,7 +68,6 @@ class GrpcServerSettings:
     tracker_config: Path = DEFAULT_TRACKER
     host: str = "127.0.0.1"
     port: int = 50_051
-    max_streams: int = 4
     max_sessions: int = 1_024
     max_whitelist_entries: int = 32
     max_jpeg_bytes: int = MAX_JPEG_BYTES
@@ -82,8 +81,6 @@ class GrpcServerSettings:
             raise ValueError("host must not be empty")
         if not 0 <= self.port <= 65_535:
             raise ValueError("port must be between 0 and 65535")
-        if self.max_streams < 1:
-            raise ValueError("max_streams must be at least one")
         if self.max_sessions < 1:
             raise ValueError("max_sessions must be at least one")
         if self.max_whitelist_entries < 1:
@@ -96,24 +93,6 @@ class GrpcServerSettings:
             raise ValueError("shutdown_grace_seconds cannot be negative")
         if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
             raise ValueError("ssl_certfile and ssl_keyfile must be provided together")
-
-
-class StreamAdmission:
-    """Limit only ProcessVideo streams so health remains independently available."""
-
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.active = 0
-
-    def enter(self) -> bool:
-        # Every RPC runs on the server event loop and this method never yields.
-        if self.active >= self.capacity:
-            return False
-        self.active += 1
-        return True
-
-    def leave(self) -> None:
-        self.active = max(0, self.active - 1)
 
 
 @dataclass(slots=True)
@@ -142,7 +121,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.adaface = adaface
         self.tracker_factory = tracker_factory
         self.mark_unhealthy = mark_unhealthy
-        self.admission = StreamAdmission(settings.max_streams)
+        self.active_streams = 0
         self.frame_limits = FrameLimits(max_jpeg_bytes=settings.max_jpeg_bytes)
         self._inference_tasks: set[asyncio.Task] = set()
         self._accepting = False
@@ -150,11 +129,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
         if not self._accepting or not self.runtime.ready:
             await context.abort(grpc.StatusCode.UNAVAILABLE, "runtime is not ready")
-        if not self.admission.enter():
-            await context.abort(
-                grpc.StatusCode.RESOURCE_EXHAUSTED,
-                "ProcessVideo stream capacity reached",
-            )
+        self.active_streams += 1
 
         tracker = None
         recognition = None
@@ -220,7 +195,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     tracker.reset()
                 except Exception:
                     LOGGER.exception("tracker reset failed")
-            self.admission.leave()
+            self.active_streams = max(0, self.active_streams - 1)
 
     async def _process_request(
         self,
@@ -689,13 +664,12 @@ async def serve(settings: GrpcServerSettings) -> None:
         await bundle.set_serving(True)
         await bundle.server.start()
         LOGGER.info(
-            "gRPC %s listening on %s:%d (backend=%s device=%s streams=%d)",
+            "gRPC %s listening on %s:%d (backend=%s device=%s)",
             PROFILE,
             settings.host,
             bundle.bound_port,
             runtime.backend,
             runtime.device,
-            settings.max_streams,
         )
         if adaface.ready:
             LOGGER.info("AdaFace ready: %s", adaface.health())
@@ -751,11 +725,6 @@ def parse_args() -> argparse.Namespace:
         "--warmup-runs",
         type=positive_int,
         default=positive_int(os.getenv("AI_WARMUP_RUNS", "2")),
-    )
-    parser.add_argument(
-        "--max-streams",
-        type=positive_int,
-        default=positive_int(os.getenv("GRPC_MAX_STREAMS", "4")),
     )
     parser.add_argument(
         "--adaface-weights",
@@ -855,7 +824,6 @@ def main() -> None:
         tracker_config=arguments.tracker_config,
         host=arguments.host,
         port=arguments.port,
-        max_streams=arguments.max_streams,
         max_sessions=arguments.max_sessions,
         max_whitelist_entries=arguments.max_whitelist_entries,
         inference_timeout_seconds=arguments.inference_timeout,

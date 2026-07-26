@@ -104,10 +104,11 @@ TensorRT만 허용하는 배포에서는 다음처럼 실행합니다.
 
 ## gRPC 서버
 
-기본 bind는 `127.0.0.1:50051`, 기본 동시 stream 수는 4입니다. YOLO와 AdaFace 모델은
-프로세스마다 한 번만 로드되고, Tracker와 track 판정 cache는 `ProcessVideo` RPC마다
-분리됩니다. AdaFace는 단일 bounded worker를 사용하며 기본 queue에서는 한 세션이 용량의
-절반까지만 동시에 점유할 수 있습니다.
+기본 bind는 `127.0.0.1:50051`이며 `ProcessVideo` 동시 stream 수에는 애플리케이션 admission
+제한을 두지 않습니다. YOLO와 AdaFace 모델은 프로세스마다 한 번만 로드되고, Tracker와
+track 판정 cache는 RPC마다 분리됩니다. 각 stream의 W5 window, 직렬 YOLO 실행 lane,
+AdaFace bounded queue는 유지되므로 연결 수가 늘어도 frame 추론이 무한히 병렬 실행되거나
+stream 하나가 frame을 무한 적재하지 않습니다.
 
 ```bash
 .venv/bin/python ai_processor_server.py \
@@ -123,7 +124,6 @@ TensorRT만 허용하는 배포에서는 다음처럼 실행합니다.
 --backend auto|tensorrt|pytorch
 --device auto|cpu|mps|CUDA_INDEX
 --warmup-runs N
---max-streams N
 --inference-timeout SECONDS
 --adaface-weights PATH
 --adaface-detector PATH
@@ -296,8 +296,8 @@ browser -> ILF1 WebSocket -> VideoProcessorClient -> gRPC ProcessVideo -> AI run
 
 브라우저는 profile 문자열이나 동시 stream 수를 고정값으로 비교하지 않습니다. ILF1 v1과
 `ProcessVideo` gRPC 경로를 확인한 뒤 서버가 광고한 해상도, JPEG 품질, FPS, request window가
-더 작은 경우 해당 한도에 맞춥니다. `--max-streams`는 gateway 전체 동시 접속 한도이며
-`B1` inference batch나 `W5` stream별 request window와 별개입니다.
+더 작은 경우 해당 한도에 맞춥니다. gateway도 WebSocket stream에 별도 admission 제한을
+두지 않으며 모든 연결이 공유 gRPC channel을 사용합니다.
 
 ## 검사
 

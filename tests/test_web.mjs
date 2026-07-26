@@ -67,10 +67,17 @@ assert.throws(
   () => negotiateServerProfile({ ...health, protocol: { name: "ILF1", version: 2 } }),
   /ILF1 v1 is required/,
 );
+assert.deepEqual(
+  negotiateServerProfile({
+    ...health,
+    serving_profile: { ...health.serving_profile, max_streams: 0 },
+  }).maxStreams,
+  null,
+);
 assert.throws(
   () => negotiateServerProfile({
     ...health,
-    serving_profile: { ...health.serving_profile, max_streams: 0 },
+    serving_profile: { ...health.serving_profile, max_streams: -1 },
   }),
   /max_streams must be a positive integer/,
 );
