@@ -7,6 +7,7 @@ import {
   captureDeadline,
   fitLongEdge,
   framePacket,
+  objectsToBlur,
   parseTerminal,
   percentile,
 } from "../web/app.js";
@@ -40,6 +41,20 @@ assert.throws(() => parseTerminal('{"v":1,"type":"result"}'));
 assert.equal(percentile([1, 2, 3, 4], 0.50), 2);
 assert.equal(percentile([1, 2, 3, 4], 0.95), 4);
 assert.equal(percentile([], 0.95), null);
+
+const whitelistedFace = {
+  whitelisted: true,
+  mask_polygon: [[10, 10], [50, 10], [50, 50], [10, 50]],
+};
+const protectedFace = {
+  whitelisted: false,
+  mask_polygon: [[30, 30], [70, 30], [70, 70], [30, 70]],
+};
+assert.deepEqual(
+  objectsToBlur([whitelistedFace, protectedFace]),
+  [protectedFace],
+  "the non-whitelisted mask must remain in the blur union across overlap",
+);
 
 let deadline = null;
 let dueFrames = 0;

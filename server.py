@@ -30,6 +30,7 @@ from service.protocol import (
     encode_response,
     recover_sequence,
 )
+from service.recognition import validate_session_id
 
 LOGGER = logging.getLogger("innolive.demo")
 ROOT = Path(__file__).resolve().parent
@@ -40,7 +41,6 @@ REQUEST_WINDOW = 5
 TARGET_FPS = 30
 IMAGE_SIZE = 640
 JPEG_QUALITY = 90
-MAX_STREAMS = 1
 RECOVERABLE_GRPC_ERRORS = frozenset({"DECODE_FAILED", "INVALID_BATCH_SIZE"})
 STAT_FIELDS = (
     "detections",
@@ -51,19 +51,25 @@ STAT_FIELDS = (
     "held_tracks",
     "tracks",
     "tracker_frame",
+    "adaface_calls",
+    "adaface_queue_overflow",
+    "whitelisted_tracks",
 )
 _END_OF_FRAMES = object()
 
 
 @dataclass(frozen=True, slots=True)
 class ServerSettings:
+    session_id: str
     grpc_target: str = "127.0.0.1:50051"
     grpc_connect_timeout_seconds: float = 10.0
     grpc_health_timeout_seconds: float = 2.0
     max_jpeg_bytes: int = MAX_JPEG_BYTES
+    max_streams: int = 4
 
     def __post_init__(self) -> None:
         target = self.grpc_target.strip()
+        validate_session_id(self.session_id)
         if not target:
             raise ValueError("grpc_target must not be empty")
         if not math.isfinite(self.grpc_connect_timeout_seconds):
@@ -76,6 +82,8 @@ class ServerSettings:
             raise ValueError("grpc_health_timeout_seconds must be positive")
         if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
             raise ValueError(f"max_jpeg_bytes must be in 1..{MAX_JPEG_BYTES}")
+        if self.max_streams < 1:
+            raise ValueError("max_streams must be at least one")
         object.__setattr__(self, "grpc_target", target)
 
     @property
@@ -84,13 +92,14 @@ class ServerSettings:
 
 
 class ConnectionLimiter:
-    def __init__(self) -> None:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
         self.active = 0
         self._lock = asyncio.Lock()
 
     async def enter(self) -> bool:
         async with self._lock:
-            if self.active >= MAX_STREAMS:
+            if self.active >= self.capacity:
                 return False
             self.active += 1
             return True
@@ -147,7 +156,7 @@ class GrpcDemoGateway:
     ) -> None:
         self.settings = settings
         self.client_factory = client_factory
-        self.limiter = ConnectionLimiter()
+        self.limiter = ConnectionLimiter(settings.max_streams)
         self.metrics = ServerMetrics()
 
     @asynccontextmanager
@@ -261,7 +270,7 @@ class GrpcDemoGateway:
                 "jpeg_quality": JPEG_QUALITY,
                 "client_window": REQUEST_WINDOW,
                 "target_fps": TARGET_FPS,
-                "max_streams": MAX_STREAMS,
+                "max_streams": self.settings.max_streams,
             },
             "active_streams": self.limiter.active,
             "metrics": self.metrics.snapshot(),
@@ -299,6 +308,7 @@ class GrpcWebSocketSession:
             async with aclosing(
                 self.client.process_video(
                     self._frame_source(),
+                    session_id=self.settings.session_id,
                     window=REQUEST_WINDOW,
                     raise_frame_errors=False,
                 )
@@ -489,6 +499,7 @@ def _face_object(face: Any) -> dict[str, Any]:
         "source": str(face.source),
         "held": bool(face.held),
         "hold_frames": int(face.hold_frames),
+        "whitelisted": bool(face.whitelisted),
     }
     if face.HasField("track_id"):
         item["track_id"] = int(face.track_id)
@@ -526,8 +537,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--grpc-target", default="127.0.0.1:50051")
+    parser.add_argument("--session-id", required=True)
     parser.add_argument("--grpc-connect-timeout", type=float, default=10.0)
     parser.add_argument("--grpc-health-timeout", type=float, default=2.0)
+    parser.add_argument("--max-streams", type=int, default=4)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
     parser.add_argument(
@@ -545,9 +558,11 @@ def main() -> None:
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         raise SystemExit("--ssl-certfile and --ssl-keyfile must be supplied together")
     settings = ServerSettings(
+        session_id=args.session_id,
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,
         grpc_health_timeout_seconds=args.grpc_health_timeout,
+        max_streams=args.max_streams,
     )
     uvicorn.run(
         create_app(settings),

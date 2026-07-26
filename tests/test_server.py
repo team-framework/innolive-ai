@@ -46,10 +46,11 @@ class FakeGrpcClient:
         self,
         frames,
         *,
+        session_id: str,
         window: int,
         raise_frame_errors: bool,
     ) -> AsyncIterator[VideoResult]:
-        self.stream_options = (window, raise_frame_errors)
+        self.stream_options = (session_id, window, raise_frame_errors)
         async for frame in frames:
             self.received.append(frame)
             response = self._response(frame)
@@ -80,6 +81,21 @@ class FakeGrpcClient:
             width=64,
             height=36,
             frame_id=frame.frame_id,
+            faces=[
+                ai_processor_pb2.FaceMetadata(
+                    bbox=ai_processor_pb2.BoundingBox(x1=1, y1=2, x2=30, y2=32),
+                    confidence=0.9,
+                    polygon=[
+                        ai_processor_pb2.Point(x=1, y=2),
+                        ai_processor_pb2.Point(x=30, y=2),
+                        ai_processor_pb2.Point(x=30, y=32),
+                    ],
+                    track_id=1,
+                    source="detected",
+                    class_name="face",
+                    whitelisted=True,
+                )
+            ],
             timing=ai_processor_pb2.ProcessingTiming(
                 queue_ms=0.1,
                 decode_ms=0.2,
@@ -94,10 +110,15 @@ class FakeGrpcClient:
         )
 
 
-def app(client: FakeGrpcClient | None = None):
+def app(client: FakeGrpcClient | None = None, *, max_streams: int = 4):
     fake = client or FakeGrpcClient()
     application = create_app(
-        ServerSettings(grpc_target="test-grpc:50051", max_jpeg_bytes=4096),
+        ServerSettings(
+            session_id="demo-session",
+            grpc_target="test-grpc:50051",
+            max_jpeg_bytes=4096,
+            max_streams=max_streams,
+        ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
     return application, fake
@@ -129,7 +150,8 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertIn("grpc_round_trip", result["timing_ms"])
         self.assertNotIn("jpeg", result)
         self.assertNotIn("data", result)
-        self.assertEqual(fake.stream_options, (5, False))
+        self.assertTrue(result["objects"][0]["whitelisted"])
+        self.assertEqual(fake.stream_options, ("demo-session", 5, False))
         self.assertEqual(fake.received[0].frame_id, 7)
 
     def test_grpc_decode_error_is_forwarded_and_stream_can_continue(self):
@@ -180,7 +202,7 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual((error["seq"], error["code"]), (5, "INFERENCE_FAILED"))
 
     def test_second_browser_stream_is_rejected(self):
-        application, _ = app()
+        application, _ = app(max_streams=1)
         with (
             TestClient(application) as client,
             client.websocket_connect("/ws"),
