@@ -11,7 +11,6 @@
       <div>
         <p class="eyebrow">INNOLIVE · GRPC LIVE DEMO</p>
         <h1>실시간 얼굴 비식별화</h1>
-        <p class="header-description">세션별로 등록한 얼굴만 보호 영상에서 자동으로 제외합니다.</p>
       </div>
       <strong id="status" data-online="false">보호 결과 대기 중</strong>
     </header>
@@ -20,9 +19,7 @@
       <section class="panel enrollment">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">WHITELIST</p>
-            <h2>모자이크에서 제외할 얼굴 등록</h2>
-            <p>정면 얼굴이 하나만 보이는 사진을 선택하면 현재 세션에 순차적으로 등록합니다.</p>
+            <h2>화이트리스트 얼굴 등록</h2>
           </div>
           <label class="active-session-control">
             <span>현재 세션</span>
@@ -35,69 +32,50 @@
         <input id="whitelist-files" class="visually-hidden" type="file" accept="image/*" multiple />
         <div id="whitelist-dropzone" class="upload-zone" role="button" tabindex="0" aria-controls="whitelist-files">
           <span class="upload-icon" aria-hidden="true">↑</span>
-          <div>
-            <strong>얼굴 사진을 여기에 놓으세요</strong>
-            <p>또는 클릭해 여러 장을 한 번에 선택하세요</p>
-          </div>
-          <span class="file-picker-label">파일 선택</span>
-        </div>
-        <div class="upload-help">
-          <span>JPEG · PNG · WebP 등 브라우저가 열 수 있는 이미지</span>
-          <span>·</span>
-          <span>장변 640px, JPEG Q90으로 자동 변환</span>
+          <strong>얼굴 사진 선택 또는 드롭</strong>
         </div>
         <div class="selection-summary">
-          <strong id="selected-file-summary">선택한 파일이 없습니다.</strong>
+          <strong id="selected-file-summary">선택 파일 없음</strong>
           <span id="whitelist-status">서버 세션 준비 중</span>
         </div>
-        <ul id="enrollment-results" class="file-results" aria-live="polite">
-          <li class="empty-result">등록할 사진을 선택하면 파일별 진행 상태가 표시됩니다.</li>
-        </ul>
+        <div class="whitelist-entries-wrap">
+          <strong>등록된 얼굴</strong>
+          <div id="whitelist-entries" class="whitelist-entries" aria-live="polite">
+            <span class="empty-entry">없음</span>
+          </div>
+        </div>
+        <ul id="enrollment-results" class="file-results" aria-live="polite" hidden></ul>
         <div class="enrollment-actions">
-          <button id="add-whitelist" class="primary" disabled>현재 세션에 얼굴 등록</button>
+          <button id="add-whitelist" class="primary" disabled>얼굴 등록</button>
         </div>
       </section>
 
       <section class="controls panel">
         <button id="start" disabled>카메라 시작</button>
         <button id="stop" disabled>중지</button>
-        <span>세션 변경은 stream 중지 후 · gRPC bidi · long edge 640 · JPEG Q90 · window 5</span>
       </section>
 
       <section class="viewers">
         <article class="panel danger">
-          <h2>개발용 원본 preview <em>보호 출력 아님</em></h2>
+          <h2>원본 <em>보호되지 않음</em></h2>
           <video id="source" autoplay muted playsinline></video>
         </article>
         <article class="panel protected">
-          <h2>Fail-closed 보호 출력</h2>
+          <h2>보호 출력</h2>
           <canvas id="output" width="640" height="360"></canvas>
         </article>
       </section>
 
       <section class="metrics panel" aria-label="pipeline metrics">
-        <div><span>Capture / encoded FPS</span><strong id="capture-fps">0 / 0</strong></div>
-        <div><span>Sent FPS</span><strong id="sent-fps">0</strong></div>
+        <div><span>Capture FPS</span><strong id="capture-fps">0</strong></div>
         <div><span>Result FPS</span><strong id="result-fps">0</strong></div>
         <div><span>Displayed FPS</span><strong id="display-fps">0</strong></div>
-        <div><span>Browser RTT / p95</span><strong id="round-trip">—</strong></div>
-        <div><span>gRPC round trip</span><strong id="grpc-round-trip">—</strong></div>
-        <div><span>gRPC server total</span><strong id="server-time">—</strong></div>
-        <div><span>Pending / in-flight</span><strong id="queue">0 / 0</strong></div>
-        <div><span>Dropped capture / result</span><strong id="dropped">0 / 0</strong></div>
-      </section>
-
-      <section class="panel diagnostics">
-        <h2>현재 terminal metadata와 분리 metric</h2>
-        <pre id="diagnostics">아직 유효한 보호 결과가 없습니다.</pre>
       </section>
 
       <section class="panel session-management">
         <div class="section-heading session-heading">
           <div>
-            <p class="eyebrow">SESSIONS</p>
             <h2>세션 관리</h2>
-            <p>현재 사용할 세션을 확인하고, 스트림이 없는 세션을 삭제할 수 있습니다.</p>
           </div>
           <div class="session-actions">
             <button id="refresh-whitelist" disabled>새로고침</button>
