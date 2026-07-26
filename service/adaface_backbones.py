@@ -262,7 +262,9 @@ def _piecewise_index(relative_positions: torch.Tensor) -> torch.Tensor:
     values = relative_positions[outside]
     magnitudes = absolute[outside]
     mapped_magnitude = (
-        alpha + torch.log(magnitudes / alpha) / math.log(gamma / alpha) * (beta - alpha)
-    ).round().clip(max=beta)
+        (alpha + torch.log(magnitudes / alpha) / math.log(gamma / alpha) * (beta - alpha))
+        .round()
+        .clip(max=beta)
+    )
     output[outside] = (torch.sign(values) * mapped_magnitude).to(output.dtype)
     return output
