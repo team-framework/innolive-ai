@@ -1,4 +1,4 @@
-"""Bounded AdaFace IR-18 inference with YuNet five-point alignment."""
+"""Bounded AdaFace inference with YuNet five-point face preparation."""
 
 from __future__ import annotations
 
@@ -16,10 +16,16 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from torch import nn
+
+from service.adaface_backbones import (
+    ADAFACE_ARCHITECTURES,
+    build_adaface_backbone,
+    checkpoint_backbone_state,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ADAFACE_WEIGHTS = ROOT / "models" / "adaface_ir18_casia.ckpt"
+DEFAULT_ADAFACE_ARCHITECTURE = "vit_base_kprpe"
+DEFAULT_ADAFACE_WEIGHTS = ROOT / "models" / "adaface_vit_base_kprpe_webface12m.ckpt"
 DEFAULT_FACE_DETECTOR = ROOT / "models" / "face_detection_yunet_2023mar.onnx"
 _REFERENCE_LANDMARKS = np.asarray(
     [
@@ -33,6 +39,8 @@ _REFERENCE_LANDMARKS = np.asarray(
 )
 _ENROLLMENT_SCORE_THRESHOLD = 0.9
 _QUERY_SCORE_THRESHOLD = 0.6
+_FLIPPED_LANDMARK_ORDER = (1, 0, 2, 4, 3)
+_VIT_FACE_MARGIN = 0.25
 
 
 class AdaFaceUnavailable(RuntimeError):
@@ -53,15 +61,21 @@ class FaceAlignmentError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class AdaFaceConfig:
+    architecture: str = DEFAULT_ADAFACE_ARCHITECTURE
     weights: Path = DEFAULT_ADAFACE_WEIGHTS
     detector: Path = DEFAULT_FACE_DETECTOR
     device: str = "auto"
     min_face_size: int = 40
     query_min_face_size: int = 24
     queue_capacity: int = 8
+    warmup_runs: int = 1
 
     def __post_init__(self) -> None:
+        architecture = self.architecture.strip().casefold()
         device = self.device.strip().casefold()
+        if architecture not in ADAFACE_ARCHITECTURES:
+            choices = ", ".join(ADAFACE_ARCHITECTURES)
+            raise ValueError(f"AdaFace architecture must be one of: {choices}")
         if not device:
             raise ValueError("AdaFace device must not be empty")
         if self.min_face_size < 16:
@@ -70,6 +84,9 @@ class AdaFaceConfig:
             raise ValueError("AdaFace query_min_face_size must be at least 16")
         if self.queue_capacity < 1:
             raise ValueError("AdaFace queue_capacity must be at least one")
+        if self.warmup_runs < 0:
+            raise ValueError("AdaFace warmup_runs must not be negative")
+        object.__setattr__(self, "architecture", architecture)
         object.__setattr__(self, "weights", self.weights.expanduser().resolve())
         object.__setattr__(self, "detector", self.detector.expanduser().resolve())
         object.__setattr__(self, "device", device)
@@ -110,16 +127,16 @@ class AdaFaceRuntime:
         if not self.config.detector.is_file():
             raise AdaFaceUnavailable(f"YuNet detector not found: {self.config.detector}")
 
-        model = AdaFaceIR18()
-        checkpoint = torch.load(self.config.weights, map_location="cpu", weights_only=True)
+        model = build_adaface_backbone(self.config.architecture)
+        checkpoint = _load_checkpoint(self.config.weights)
         state = checkpoint.get("state_dict", checkpoint)
-        model_state = {
-            key.removeprefix("model."): value
-            for key, value in state.items()
-            if key.startswith("model.")
-        }
+        if not isinstance(state, dict):
+            raise AdaFaceUnavailable("AdaFace checkpoint does not contain a state dictionary")
+        model_state = checkpoint_backbone_state(self.config.architecture, state)
         if not model_state:
-            model_state = dict(state)
+            raise AdaFaceUnavailable(
+                f"AdaFace checkpoint does not match {self.config.architecture}"
+            )
         model.load_state_dict(model_state, strict=True)
         self._model = model.to(self.device).eval()
         self._detector = cv2.FaceDetectorYN.create(
@@ -130,6 +147,18 @@ class AdaFaceRuntime:
             nms_threshold=0.3,
             top_k=5_000,
         )
+        self._warmup()
+
+    def _warmup(self) -> None:
+        if self.config.warmup_runs == 0:
+            return
+        inputs = torch.zeros((2, 3, 112, 112), dtype=torch.float32, device=self.device)
+        keypoints = torch.from_numpy((_REFERENCE_LANDMARKS / 112.0).copy())
+        keypoints = keypoints.unsqueeze(0).repeat(2, 1, 1).to(self.device)
+        with torch.inference_mode():
+            for _ in range(self.config.warmup_runs):
+                self._model(inputs, keypoints)
+        _synchronize(self.device)
 
     def submit(self, image: np.ndarray, *, owner: str) -> asyncio.Future[np.ndarray] | None:
         return self._submit(self._queued_embedding, image, owner)
@@ -219,17 +248,25 @@ class AdaFaceRuntime:
         score_threshold: float = _ENROLLMENT_SCORE_THRESHOLD,
         min_face_size: int | None = None,
     ) -> np.ndarray:
-        aligned = self._aligned_face(
+        prepared, keypoints = self._prepared_face(
             image,
             score_threshold=score_threshold,
             min_face_size=self.config.min_face_size if min_face_size is None else min_face_size,
         )
-        normalized = aligned.astype(np.float32) / 127.5 - 1.0
+        if self.config.architecture == "vit_base_kprpe":
+            prepared = cv2.cvtColor(prepared, cv2.COLOR_BGR2RGB)
+        normalized = prepared.astype(np.float32) / 127.5 - 1.0
         tensor = torch.from_numpy(normalized.transpose(2, 0, 1).copy()).unsqueeze(0)
         tensor = tensor.to(self.device)
         inputs = torch.cat((tensor, torch.flip(tensor, dims=(3,))), dim=0)
+        keypoint_inputs = None
+        if keypoints is not None:
+            mirrored = keypoints[np.asarray(_FLIPPED_LANDMARK_ORDER)].copy()
+            mirrored[:, 0] = 1.0 - mirrored[:, 0]
+            keypoint_inputs = torch.from_numpy(np.stack((keypoints, mirrored)))
+            keypoint_inputs = keypoint_inputs.to(self.device)
         with torch.inference_mode():
-            embeddings, norms = self._model(inputs)
+            embeddings, norms = self._model(inputs, keypoint_inputs)
         fused = (embeddings * norms).sum(dim=0)
         output = fused.detach().to("cpu", dtype=torch.float32).numpy()
         norm = float(np.linalg.norm(output))
@@ -237,12 +274,42 @@ class AdaFaceRuntime:
             raise RuntimeError("AdaFace returned an invalid embedding")
         return output / norm
 
+    def _prepared_face(
+        self,
+        image: np.ndarray,
+        *,
+        score_threshold: float,
+        min_face_size: int,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        face = self._detected_face(
+            image,
+            score_threshold=score_threshold,
+            min_face_size=min_face_size,
+        )
+        if self.config.architecture == "vit_base_kprpe":
+            return _square_face_crop(image, face)
+        return _align_face(image, face), None
+
     def _aligned_face(
         self,
         image: np.ndarray,
         *,
         score_threshold: float = _ENROLLMENT_SCORE_THRESHOLD,
         min_face_size: int | None = None,
+    ) -> np.ndarray:
+        face = self._detected_face(
+            image,
+            score_threshold=score_threshold,
+            min_face_size=self.config.min_face_size if min_face_size is None else min_face_size,
+        )
+        return _align_face(image, face)
+
+    def _detected_face(
+        self,
+        image: np.ndarray,
+        *,
+        score_threshold: float,
+        min_face_size: int,
     ) -> np.ndarray:
         if image.ndim != 3 or image.shape[2] != 3:
             raise FaceAlignmentError("face image must be BGR HxWx3")
@@ -256,33 +323,16 @@ class AdaFaceRuntime:
             raise FaceCountError(f"expected exactly one face, found {count}")
 
         face = faces[0]
-        required_size = self.config.min_face_size if min_face_size is None else min_face_size
-        if min(float(face[2]), float(face[3])) < required_size:
-            raise FaceTooSmallError(f"face must be at least {required_size}px on its short side")
-        landmarks = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
-        transform, _ = cv2.estimateAffinePartial2D(
-            landmarks,
-            _REFERENCE_LANDMARKS,
-            method=cv2.LMEDS,
-        )
-        if transform is None or not np.isfinite(transform).all():
-            raise FaceAlignmentError("five-point alignment transform failed")
-        aligned = cv2.warpAffine(
-            image,
-            transform,
-            (112, 112),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
-        if aligned.shape != (112, 112, 3):
-            raise FaceAlignmentError("aligned face has an invalid shape")
-        return aligned
+        if min(float(face[2]), float(face[3])) < min_face_size:
+            raise FaceTooSmallError(f"face must be at least {min_face_size}px on its short side")
+        return face
 
     def health(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "ready": self.ready,
                 "device": str(self.device),
+                "architecture": self.config.architecture,
                 "weights": self.config.weights.name,
                 "detector": self.config.detector.name,
                 "load_ms": round(self.load_ms, 2) if self.load_ms is not None else None,
@@ -307,64 +357,6 @@ class AdaFaceRuntime:
             del self._detector
 
 
-class AdaFaceIR18(nn.Module):
-    """IR-18 backbone compatible with the official AdaFace checkpoint."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.input_layer = nn.Sequential(
-            nn.Conv2d(3, 64, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.PReLU(64),
-        )
-        blocks = (
-            (64, 64, 2),
-            (64, 128, 2),
-            (128, 256, 2),
-            (256, 512, 2),
-        )
-        body = []
-        for input_channels, output_channels, units in blocks:
-            body.append(BasicBlockIR(input_channels, output_channels, 2))
-            body.extend(BasicBlockIR(output_channels, output_channels, 1) for _ in range(units - 1))
-        self.body = nn.Sequential(*body)
-        self.output_layer = nn.Sequential(
-            nn.BatchNorm2d(512),
-            nn.Dropout(0.4),
-            nn.Flatten(),
-            nn.Linear(512 * 7 * 7, 512),
-            nn.BatchNorm1d(512, affine=False),
-        )
-
-    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self.output_layer(self.body(self.input_layer(inputs)))
-        norms = torch.linalg.vector_norm(features, dim=1, keepdim=True)
-        return features / norms, norms
-
-
-class BasicBlockIR(nn.Module):
-    def __init__(self, input_channels: int, output_channels: int, stride: int) -> None:
-        super().__init__()
-        if input_channels == output_channels:
-            self.shortcut_layer = nn.MaxPool2d(1, stride)
-        else:
-            self.shortcut_layer = nn.Sequential(
-                nn.Conv2d(input_channels, output_channels, 1, stride, bias=False),
-                nn.BatchNorm2d(output_channels),
-            )
-        self.res_layer = nn.Sequential(
-            nn.BatchNorm2d(input_channels),
-            nn.Conv2d(input_channels, output_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(output_channels),
-            nn.PReLU(output_channels),
-            nn.Conv2d(output_channels, output_channels, 3, stride, 1, bias=False),
-            nn.BatchNorm2d(output_channels),
-        )
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.res_layer(inputs) + self.shortcut_layer(inputs)
-
-
 def _resolve_device(requested: str, fallback: str) -> torch.device:
     value = fallback if requested == "auto" else requested
     if value.isdigit():
@@ -386,3 +378,67 @@ def _observe_future(future: asyncio.Future[np.ndarray]) -> None:
         future.exception()
     except BaseException:
         return
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    except RuntimeError:
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _align_face(image: np.ndarray, face: np.ndarray) -> np.ndarray:
+    landmarks = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
+    transform, _ = cv2.estimateAffinePartial2D(
+        landmarks,
+        _REFERENCE_LANDMARKS,
+        method=cv2.LMEDS,
+    )
+    if transform is None or not np.isfinite(transform).all():
+        raise FaceAlignmentError("five-point alignment transform failed")
+    aligned = cv2.warpAffine(
+        image,
+        transform,
+        (112, 112),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    if aligned.shape != (112, 112, 3):
+        raise FaceAlignmentError("aligned face has an invalid shape")
+    return aligned
+
+
+def _square_face_crop(image: np.ndarray, face: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x, y, width, height = (float(value) for value in face[:4])
+    side = max(width, height) * (1.0 + _VIT_FACE_MARGIN * 2.0)
+    if not math.isfinite(side) or side <= 0:
+        raise FaceAlignmentError("face crop has invalid dimensions")
+    center_x = x + width / 2.0
+    center_y = y + height / 2.0
+    scale = 112.0 / side
+    transform = np.asarray(
+        [
+            [scale, 0.0, 56.0 - center_x * scale],
+            [0.0, scale, 56.0 - center_y * scale],
+        ],
+        dtype=np.float32,
+    )
+    cropped = cv2.warpAffine(
+        image,
+        transform,
+        (112, 112),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    landmarks = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
+    landmarks = cv2.transform(landmarks[None], transform)[0] / 112.0
+    if cropped.shape != (112, 112, 3) or not np.isfinite(landmarks).all():
+        raise FaceAlignmentError("ViT face preparation failed")
+    return cropped, np.clip(landmarks, 0.0, 1.0).astype(np.float32)
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()

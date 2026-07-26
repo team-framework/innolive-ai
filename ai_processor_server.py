@@ -22,7 +22,9 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from protos import ai_processor_pb2 as messages
 from protos import ai_processor_pb2_grpc
+from service.adaface_backbones import ADAFACE_ARCHITECTURES
 from service.adaface_model import (
+    DEFAULT_ADAFACE_ARCHITECTURE,
     DEFAULT_ADAFACE_WEIGHTS,
     DEFAULT_FACE_DETECTOR,
     AdaFaceConfig,
@@ -791,7 +793,7 @@ def port_number(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="InnoLive B1-640 metadata-only gRPC server")
+    parser = argparse.ArgumentParser(description="InnoLive B1-640 protected-video gRPC server")
     parser.add_argument("--host", default=os.getenv("GRPC_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port",
@@ -811,6 +813,11 @@ def parse_args() -> argparse.Namespace:
         "--warmup-runs",
         type=positive_int,
         default=positive_int(os.getenv("AI_WARMUP_RUNS", "2")),
+    )
+    parser.add_argument(
+        "--adaface-architecture",
+        choices=ADAFACE_ARCHITECTURES,
+        default=os.getenv("ADAFACE_ARCHITECTURE", DEFAULT_ADAFACE_ARCHITECTURE).casefold(),
     )
     parser.add_argument(
         "--adaface-weights",
@@ -837,6 +844,11 @@ def parse_args() -> argparse.Namespace:
         "--adaface-queue-capacity",
         type=positive_int,
         default=positive_int(os.getenv("ADAFACE_QUEUE_CAPACITY", "8")),
+    )
+    parser.add_argument(
+        "--adaface-warmup-runs",
+        type=positive_int,
+        default=positive_int(os.getenv("ADAFACE_WARMUP_RUNS", "1")),
     )
     parser.add_argument(
         "--adaface-revalidate-frames",
@@ -899,11 +911,13 @@ def main() -> None:
             warmup_runs=arguments.warmup_runs,
         ),
         adaface=AdaFaceConfig(
+            architecture=arguments.adaface_architecture,
             weights=arguments.adaface_weights,
             detector=arguments.adaface_detector,
             device=arguments.adaface_device,
             min_face_size=arguments.adaface_min_face_size,
             queue_capacity=arguments.adaface_queue_capacity,
+            warmup_runs=arguments.adaface_warmup_runs,
         ),
         recognition=RecognitionConfig(
             cosine_threshold=arguments.adaface_threshold,
