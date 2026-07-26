@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production gRPC entry point for the B1-640 face metadata pipeline."""
+"""Production gRPC entry point for the B1-640 face video pipeline."""
 
 from __future__ import annotations
 
@@ -10,8 +10,10 @@ import math
 import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +38,8 @@ from service.adaface_model import (
 )
 from service.frame import FrameLimits, decode_image, decode_jpeg
 from service.grpc_config import listen_address, server_options
-from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.mosaic import mosaic_jpeg
+from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
 from service.recognition import (
     RecognitionConfig,
     SessionInUseError,
@@ -68,6 +71,17 @@ DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
 SERVICE_NAME = "AiProcessor"
 PROFILE = "B1-640-Q90-W5"
 MAX_SESSIONS = 1_024
+
+
+def _output_mode(value: int) -> int:
+    if value == messages.VIDEO_OUTPUT_MODE_UNSPECIFIED:
+        return messages.VIDEO_OUTPUT_MODE_METADATA_ONLY
+    if value in {
+        messages.VIDEO_OUTPUT_MODE_METADATA_ONLY,
+        messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+    }:
+        return value
+    raise ValueError("output_mode is not supported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +129,7 @@ class FrameOutcome:
 @dataclass(slots=True)
 class StreamState:
     session_id: str
+    output_mode: int
     recognition: StreamRecognition
     session: SessionState | None = None
 
@@ -141,6 +156,10 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.active_streams = 0
         self.frame_limits = FrameLimits(max_jpeg_bytes=settings.max_jpeg_bytes)
         self._inference_tasks: set[asyncio.Task] = set()
+        self._mosaic_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="frame-mosaic",
+        )
         self._accepting = False
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
@@ -171,9 +190,14 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     request_session_id = validate_session_id(request.session_id)
                 except ValueError as error:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+                try:
+                    output_mode = _output_mode(request.output_mode)
+                except ValueError as error:
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
                 if stream is None:
                     stream = StreamState(
                         session_id=request_session_id,
+                        output_mode=output_mode,
                         recognition=StreamRecognition(
                             self.adaface,
                             self.settings.recognition,
@@ -184,6 +208,11 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     await context.abort(
                         grpc.StatusCode.INVALID_ARGUMENT,
                         "session_id cannot change within a ProcessVideo stream",
+                    )
+                elif output_mode != stream.output_mode:
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        "output_mode cannot change within a ProcessVideo stream",
                     )
                 frame_sequence += 1
                 try:
@@ -268,14 +297,62 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     frame_sequence,
                 )
             )
+        except (TypeError, ValueError, OverflowError):
+            LOGGER.exception("frame %d recognition result failed validation", request.frame_id)
+            return FrameOutcome(
+                self._error_response(
+                    request,
+                    "SERIALIZATION_FAILED",
+                    "result metadata exceeded the serialization contract",
+                    received_at,
+                    inference_batch_size=1,
+                ),
+                fatal=True,
+            )
+
+        mosaic = b""
+        blur_encode_ms = 0.0
+        if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
+            mosaic_started = time.perf_counter()
+            try:
+                if any(item.get("whitelisted") is not True for item in objects):
+                    loop = asyncio.get_running_loop()
+                    mosaic = await loop.run_in_executor(
+                        self._mosaic_executor,
+                        partial(
+                            mosaic_jpeg,
+                            image,
+                            objects,
+                            max_bytes=self.settings.max_jpeg_bytes,
+                        ),
+                    )
+                else:
+                    mosaic = bytes(request.data)
+            except Exception:
+                LOGGER.exception("frame %d mosaic composition failed", request.frame_id)
+                return FrameOutcome(
+                    self._error_response(
+                        request,
+                        "MOSAIC_FAILED",
+                        "server-side mosaic composition failed",
+                        received_at,
+                        inference_batch_size=1,
+                    ),
+                    fatal=True,
+                )
+            blur_encode_ms = (time.perf_counter() - mosaic_started) * 1_000
+
+        try:
             response = self._success_response(
                 request,
                 image,
                 result,
                 received_at,
                 decoded_at,
+                mosaic,
+                blur_encode_ms,
             )
-            if response.ByteSize() > MAX_RESPONSE_BYTES:
+            if response.ByteSize() > MAX_GRPC_RESPONSE_BYTES:
                 raise ValueError("protobuf response exceeds the byte limit")
             return FrameOutcome(response)
         except (TypeError, ValueError, OverflowError):
@@ -510,6 +587,11 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         tasks = tuple(self._inference_tasks)
         for task in tasks:
             await self._settle_inference(task)
+        await asyncio.to_thread(
+            self._mosaic_executor.shutdown,
+            wait=True,
+            cancel_futures=True,
+        )
 
     def set_accepting(self, accepting: bool) -> None:
         self._accepting = accepting
@@ -543,6 +625,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         result: dict[str, Any],
         received_at: float,
         decoded_at: float,
+        mosaic: bytes,
+        blur_encode_ms: float,
     ):
         serialize_started = time.perf_counter()
         objects = result.get("objects", [])
@@ -550,6 +634,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         timing = result.get("timing_ms", {})
         response = messages.ProcessedVideoChunk(
             data=b"",
+            mosaic_jpeg=mosaic,
             timestamp=request.timestamp,
             status_message="success",
             faces=faces,
@@ -561,7 +646,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 decode_ms=(decoded_at - received_at) * 1_000,
                 inference_ms=float(timing.get("inference", 0.0)),
                 tracking_ms=float(timing.get("tracking", 0.0)),
-                blur_encode_ms=0.0,
+                blur_encode_ms=blur_encode_ms,
                 inference_batch_size=1,
                 runtime_total_ms=float(timing.get("runtime_total", 0.0)),
             ),

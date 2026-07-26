@@ -31,6 +31,14 @@ message VideoChunk {
   uint32 batch_size = 4 [deprecated = true];
   // Authenticated caller session; fixed for the lifetime of one ProcessVideo RPC.
   string session_id = 5;
+  // Response payload requested for this stream. Unspecified preserves metadata-only clients.
+  VideoOutputMode output_mode = 6;
+}
+
+enum VideoOutputMode {
+  VIDEO_OUTPUT_MODE_UNSPECIFIED = 0;
+  VIDEO_OUTPUT_MODE_METADATA_ONLY = 1;
+  VIDEO_OUTPUT_MODE_MOSAIC_JPEG = 2;
 }
 
 message ProcessedVideoChunk {
@@ -47,6 +55,8 @@ message ProcessedVideoChunk {
   string error_code = 10;
   string error_message = 11;
   FrameStats stats = 12;
+  // Server-composited JPEG. Present only when MOSAIC_JPEG was requested and processing succeeded.
+  bytes mosaic_jpeg = 13;
 }
 
 message ProcessingTiming {
@@ -54,7 +64,7 @@ message ProcessingTiming {
   double decode_ms = 2;
   double inference_ms = 3;
   double tracking_ms = 4;
-  // Legacy server-side JPEG blur/encode stage; zero for metadata-only responses.
+  // Server-side mask union, Gaussian blur, composition, and JPEG encoding.
   double blur_encode_ms = 5;
   uint32 inference_batch_size = 6;
   double serialize_ms = 7;

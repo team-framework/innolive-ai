@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import {
-  BitmapLease,
   LatestRenderQueue,
   PROFILE,
   TAB_SESSION_STORAGE_KEY,
   addWhitelistFiles,
   captureDeadline,
   createSession,
+  decodeMosaicJpeg,
   deleteSession,
   deleteWhitelistEntry,
   enrollmentSize,
@@ -19,10 +19,11 @@ import {
   listSessions,
   negotiateServerProfile,
   normalizeWhitelistImage,
-  objectsToBlur,
-  parseTerminal,
+  parseErrorTerminal,
+  parseMosaicResult,
   requireResultSession,
   validateSessionId,
+  validateMosaicBitmap,
   websocketUrl,
   whitelistUrl,
 } from "../web/app.js";
@@ -43,9 +44,15 @@ assert.doesNotMatch(
   browserScript,
   /__INNOLIVE_METRICS__|__INNOLIVE_METRIC_HISTORY__|__INNOLIVE_BITMAP_OWNERS__|보호 결과 seq|fillText\(/,
 );
+assert.doesNotMatch(
+  browserScript,
+  /objectsToBlur|blurCanvas|blurContext|bitmapLease|createBitmapLease|mask_polygon/,
+);
+assert.match(browserScript, /socket\.binaryType = "arraybuffer"/);
+assert.doesNotMatch(browserScript, /createImageBitmap\(frame\.jpeg\)|request\.jpeg/);
 
 assert.deepEqual(PROFILE, {
-  protocolVersion: 1,
+  protocolVersion: 2,
   longEdge: 640,
   jpegQuality: 0.90,
   targetFps: 30,
@@ -370,7 +377,7 @@ await assert.rejects(
 const health = {
   status: "ok",
   profile: "a-newer-profile-name",
-  protocol: { name: "ILF1", version: 1 },
+  protocol: { name: "ILF1", version: 2 },
   transport_path: ["browser-websocket", "metrics", "grpc-bidi-ProcessVideo"],
   grpc: { service: "AiProcessor", serving: true },
   serving_profile: {
@@ -404,8 +411,8 @@ assert.deepEqual(negotiateServerProfile({
   maxStreams: null,
 });
 assert.throws(
-  () => negotiateServerProfile({ ...health, protocol: { name: "ILF1", version: 2 } }),
-  /ILF1 v1 is required/,
+  () => negotiateServerProfile({ ...health, protocol: { name: "ILF1", version: 1 } }),
+  /ILF1 v2 is required/,
 );
 assert.deepEqual(
   negotiateServerProfile({
@@ -427,25 +434,94 @@ const packet = new Uint8Array(await framePacket(0x01020304, jpeg).arrayBuffer())
 assert.deepEqual([...packet.slice(0, 8)], [0x49, 0x4c, 0x46, 0x31, 1, 2, 3, 4]);
 assert.deepEqual([...packet.slice(8)], [0xff, 0xd8, 0xff, 0xd9]);
 
-assert.deepEqual(
-  parseTerminal('{"v":1,"type":"result","seq":7,"objects":[]}'),
-  { v: 1, type: "result", seq: 7, objects: [] },
-);
-assert.throws(() => parseTerminal('{"v":1,"type":"frame","seq":7}'));
-assert.throws(() => parseTerminal('{"v":1,"type":"result"}'));
+function mosaicPacket(sequence, metadata, jpegBytes = [0xff, 0xd8, 0xff, 0xd9]) {
+  const encodedMetadata = new TextEncoder().encode(JSON.stringify(metadata));
+  const result = new Uint8Array(12 + encodedMetadata.length + jpegBytes.length);
+  result.set([0x49, 0x4c, 0x52, 0x31]);
+  const header = new DataView(result.buffer);
+  header.setUint32(4, sequence, false);
+  header.setUint32(8, encodedMetadata.length, false);
+  result.set(encodedMetadata, 12);
+  result.set(jpegBytes, 12 + encodedMetadata.length);
+  return result;
+}
 
-const whitelistedFace = {
-  whitelisted: true,
-  mask_polygon: [[10, 10], [50, 10], [50, 50], [10, 50]],
+const resultMetadata = {
+  v: 2,
+  type: "result",
+  seq: 7,
+  width: 640,
+  height: 360,
+  session_id: "session-a",
 };
-const protectedFace = {
-  whitelisted: false,
-  mask_polygon: [[30, 30], [70, 30], [70, 70], [30, 70]],
-};
+const resultPacket = mosaicPacket(7, resultMetadata);
+const parsedResult = parseMosaicResult(resultPacket);
+assert.equal(parsedResult.sequence, 7);
+assert.deepEqual(parsedResult.metadata, resultMetadata);
+assert.equal(parsedResult.jpeg.type, "image/jpeg");
 assert.deepEqual(
-  objectsToBlur([whitelistedFace, protectedFace]),
-  [protectedFace],
-  "the non-whitelisted mask must remain in the blur union across overlap",
+  [...new Uint8Array(await parsedResult.jpeg.arrayBuffer())],
+  [0xff, 0xd8, 0xff, 0xd9],
+);
+assert.equal(
+  validateMosaicBitmap({ width: 640, height: 360 }, resultMetadata).width,
+  640,
+);
+assert.throws(
+  () => validateMosaicBitmap({ width: 320, height: 360 }, resultMetadata),
+  /dimensions do not match/,
+);
+let mismatchedBitmapCloses = 0;
+await assert.rejects(
+  decodeMosaicJpeg(
+    parsedResult.jpeg,
+    resultMetadata,
+    async () => ({
+      width: 320,
+      height: 360,
+      close: () => { mismatchedBitmapCloses += 1; },
+    }),
+  ),
+  /dimensions do not match/,
+);
+assert.equal(mismatchedBitmapCloses, 1, "a mismatched decoded mosaic must close");
+await assert.rejects(
+  decodeMosaicJpeg(
+    parsedResult.jpeg,
+    resultMetadata,
+    async () => { throw new Error("corrupt JPEG"); },
+  ),
+  /corrupt JPEG/,
+);
+
+assert.deepEqual(
+  parseErrorTerminal('{"v":2,"type":"error","seq":7,"code":"DECODE_FAILED","message":"bad JPEG"}'),
+  { v: 2, type: "error", seq: 7, code: "DECODE_FAILED", message: "bad JPEG" },
+);
+assert.throws(
+  () => parseErrorTerminal('{"v":2,"type":"result","seq":7}'),
+  /invalid error response metadata/,
+);
+assert.throws(
+  () => parseMosaicResult(mosaicPacket(8, resultMetadata)),
+  /sequences do not match/,
+);
+assert.throws(
+  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, v: 1 })),
+  /invalid result response metadata/,
+);
+const invalidMagic = resultPacket.slice();
+invalidMagic[0] = 0;
+assert.throws(() => parseMosaicResult(invalidMagic), /invalid magic/);
+assert.throws(
+  () => parseMosaicResult(mosaicPacket(7, resultMetadata, [0, 0, 0, 0])),
+  /not one complete JPEG/,
+);
+const missingJpeg = resultPacket.slice(0, resultPacket.length - 4);
+assert.throws(() => parseMosaicResult(missingJpeg), /missing its JPEG/);
+assert.throws(
+  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, width: 641 })),
+  /dimensions are invalid/,
 );
 
 let deadline = null;
@@ -460,30 +536,6 @@ assert.equal(dueFrames, 60, "normal 32.x ms jitter must not halve capture cadenc
 const delayed = captureDeadline(100, 240);
 assert.equal(delayed.due, true);
 assert.ok(delayed.nextDeadline > 242, "missed deadlines must not create a catch-up burst");
-
-let normalCloses = 0;
-let normalReleases = 0;
-const normalLease = new BitmapLease(
-  jpeg,
-  () => Promise.resolve({ close: () => { normalCloses += 1; } }),
-  () => { normalReleases += 1; },
-);
-assert.ok(await normalLease.promise);
-assert.equal(normalLease.release(), true);
-assert.equal(normalLease.release(), false);
-assert.equal(normalCloses, 1, "a rendered bitmap must close exactly once");
-assert.equal(normalReleases, 1, "a bitmap ownership lease must release exactly once");
-
-let resolveLateBitmap;
-let lateCloses = 0;
-const lateLease = new BitmapLease(
-  jpeg,
-  () => new Promise((resolve) => { resolveLateBitmap = resolve; }),
-);
-assert.equal(lateLease.release(), true);
-resolveLateBitmap({ close: () => { lateCloses += 1; } });
-assert.equal(await lateLease.promise, null);
-assert.equal(lateCloses, 1, "a decode-late-resolve bitmap must close exactly once");
 
 const renderQueue = new LatestRenderQueue();
 const frame1 = { sequence: 1 };
@@ -502,4 +554,4 @@ renderQueue.finish(frame3);
 assert.equal(renderQueue.lastCommittedSequence, 3);
 assert.equal(renderQueue.enqueue(frame2).accepted, false, "commit sequence must be monotonic");
 
-console.log("ILF1 browser compatibility contract passed");
+console.log("ILF1/ILR1 v2 browser compatibility contract passed");

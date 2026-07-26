@@ -49,6 +49,7 @@ def _request(
     frame_id: int = 0,
     batch_size: int = 1,
     session_id: str = "session-a",
+    output_mode: int = ai_processor_pb2.VIDEO_OUTPUT_MODE_UNSPECIFIED,
 ):
     return ai_processor_pb2.VideoChunk(
         data=_jpeg() if data is None else data,
@@ -56,6 +57,7 @@ def _request(
         frame_id=frame_id,
         batch_size=batch_size,
         session_id=session_id,
+        output_mode=output_mode,
     )
 
 
@@ -149,6 +151,17 @@ class FaceRuntime(FakeRuntime):
             detections=1,
             tracks=1,
         )
+        return result
+
+
+class InvalidMaskRuntime(FaceRuntime):
+    async def infer(
+        self,
+        image: np.ndarray,
+        tracker: FakeTracker,
+    ) -> dict[str, Any]:
+        result = await super().infer(image, tracker)
+        result["objects"][0]["mask_polygon"] = [[1.0, 1.0], [2.0, 2.0]]
         return result
 
 
@@ -312,6 +325,86 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.stats.tracker_frame for item in responses], [1, 2])
         self.assertEqual(len(runtime.calls), 2)
         self.assertIs(runtime.calls[0][1], runtime.calls[1][1])
+
+    async def test_mosaic_mode_returns_server_processed_jpeg(self):
+        source = _jpeg()
+        async with LoopbackServer(FaceRuntime()) as server:
+            response = await server.stub.ProcessVideo(
+                _requests(
+                    _request(
+                        data=source,
+                        output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                    )
+                )
+            ).read()
+
+        self.assertEqual(response.status_message, "success")
+        self.assertEqual(response.data, b"")
+        self.assertTrue(response.mosaic_jpeg.startswith(b"\xff\xd8"))
+        self.assertTrue(response.mosaic_jpeg.endswith(b"\xff\xd9"))
+        self.assertGreater(response.timing.blur_encode_ms, 0)
+
+    async def test_metadata_mode_does_not_return_pixels(self):
+        async with LoopbackServer(FaceRuntime()) as server:
+            response = await server.stub.ProcessVideo(
+                _requests(
+                    _request(
+                        output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY,
+                    )
+                )
+            ).read()
+
+        self.assertEqual(response.status_message, "success")
+        self.assertEqual(response.data, b"")
+        self.assertEqual(response.mosaic_jpeg, b"")
+
+    async def test_mosaic_mode_reuses_source_when_no_face_needs_protection(self):
+        source = _jpeg()
+        async with LoopbackServer(FakeRuntime()) as server:
+            response = await server.stub.ProcessVideo(
+                _requests(
+                    _request(
+                        data=source,
+                        output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                    )
+                )
+            ).read()
+
+        self.assertEqual(response.mosaic_jpeg, source)
+
+    async def test_invalid_protected_mask_never_returns_source_pixels(self):
+        async with LoopbackServer(InvalidMaskRuntime()) as server:
+            call = server.stub.ProcessVideo(
+                _requests(_request(output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG))
+            )
+            response = await call.read()
+
+            self.assertEqual(response.status_message, "failed")
+            self.assertEqual(response.error_code, "MOSAIC_FAILED")
+            self.assertEqual(response.data, b"")
+            self.assertEqual(response.mosaic_jpeg, b"")
+            self.assertIs(await call.read(), grpc.aio.EOF)
+
+    async def test_unknown_output_mode_is_rejected_before_inference(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime) as server:
+            call = server.stub.ProcessVideo(_requests(_request(output_mode=99)))
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await call.read()
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_output_mode_cannot_change_within_a_stream(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            call = server.stub.ProcessVideo()
+            await call.write(_request(output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY))
+            self.assertEqual((await call.read()).status_message, "success")
+            await call.write(_request(output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG))
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await call.read()
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
     async def test_session_id_cannot_change_within_a_stream(self):
         runtime = FakeRuntime()
@@ -740,6 +833,30 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(response.status_message == "success" for response in responses))
         self.assertEqual(len(server.trackers), 2)
         self.assertIsNot(server.trackers[0], server.trackers[1])
+
+    async def test_concurrent_mosaic_streams_share_bounded_compositor_safely(self):
+        runtime = FaceRuntime()
+        async with LoopbackServer(runtime) as server:
+            calls = [server.stub.ProcessVideo() for _ in range(8)]
+            await asyncio.gather(
+                *(
+                    call.write(
+                        _request(
+                            frame_id=index,
+                            session_id=f"mosaic-{index}",
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                        )
+                    )
+                    for index, call in enumerate(calls, start=1)
+                )
+            )
+            responses = await asyncio.gather(*(call.read() for call in calls))
+            await asyncio.gather(*(call.done_writing() for call in calls))
+            await asyncio.gather(*(call.read() for call in calls))
+
+        self.assertTrue(all(response.status_message == "success" for response in responses))
+        self.assertTrue(all(response.mosaic_jpeg.startswith(b"\xff\xd8") for response in responses))
+        self.assertEqual(len(server.trackers), 8)
 
     async def test_cancellation_settles_inference_before_reset_and_release(self):
         runtime = BlockingRuntime()

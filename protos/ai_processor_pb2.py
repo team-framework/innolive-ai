@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x19protos/ai_processor.proto\x1a\x1bgoogle/protobuf/empty.proto\"k\n\nVideoChunk\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x10\n\x08\x66rame_id\x18\x03 \x01(\x03\x12\x16\n\nbatch_size\x18\x04 \x01(\rB\x02\x18\x01\x12\x12\n\nsession_id\x18\x05 \x01(\t\"\xa2\x02\n\x13ProcessedVideoChunk\x12\x10\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x42\x02\x18\x01\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x16\n\x0estatus_message\x18\x03 \x01(\t\x12\x1c\n\x05\x66\x61\x63\x65s\x18\x04 \x03(\x0b\x32\r.FaceMetadata\x12\r\n\x05width\x18\x05 \x01(\x05\x12\x0e\n\x06height\x18\x06 \x01(\x05\x12\x10\n\x08\x66rame_id\x18\x07 \x01(\x03\x12\x15\n\rprocessing_ms\x18\x08 \x01(\x01\x12!\n\x06timing\x18\t \x01(\x0b\x32\x11.ProcessingTiming\x12\x12\n\nerror_code\x18\n \x01(\t\x12\x15\n\rerror_message\x18\x0b \x01(\t\x12\x1a\n\x05stats\x18\x0c \x01(\x0b\x32\x0b.FrameStats\"\xe1\x01\n\x10ProcessingTiming\x12\x10\n\x08queue_ms\x18\x01 \x01(\x01\x12\x11\n\tdecode_ms\x18\x02 \x01(\x01\x12\x14\n\x0cinference_ms\x18\x03 \x01(\x01\x12\x13\n\x0btracking_ms\x18\x04 \x01(\x01\x12\x16\n\x0e\x62lur_encode_ms\x18\x05 \x01(\x01\x12\x1c\n\x14inference_batch_size\x18\x06 \x01(\r\x12\x14\n\x0cserialize_ms\x18\x07 \x01(\x01\x12\x17\n\x0fserver_total_ms\x18\x08 \x01(\x01\x12\x18\n\x10runtime_total_ms\x18\t \x01(\x01\"\x1d\n\x05Point\x12\t\n\x01x\x18\x01 \x01(\x02\x12\t\n\x01y\x18\x02 \x01(\x02\"=\n\x0b\x42oundingBox\x12\n\n\x02x1\x18\x01 \x01(\x02\x12\n\n\x02y1\x18\x02 \x01(\x02\x12\n\n\x02x2\x18\x03 \x01(\x02\x12\n\n\x02y2\x18\x04 \x01(\x02\"\xed\x01\n\x0c\x46\x61\x63\x65Metadata\x12\x1a\n\x04\x62\x62ox\x18\x01 \x01(\x0b\x32\x0c.BoundingBox\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x12\x17\n\x07polygon\x18\x03 \x03(\x0b\x32\x06.Point\x12\x15\n\x08track_id\x18\x04 \x01(\x03H\x00\x88\x01\x01\x12\x0e\n\x06source\x18\x05 \x01(\t\x12\x0c\n\x04held\x18\x06 \x01(\x08\x12\x13\n\x0bhold_frames\x18\x07 \x01(\r\x12\x12\n\nclass_name\x18\x08 \x01(\t\x12\x14\n\x0cmask_area_px\x18\t \x01(\x02\x12\x13\n\x0bwhitelisted\x18\n \x01(\x08\x42\x0b\n\t_track_id\"\xae\x02\n\nFrameStats\x12\x12\n\ndetections\x18\x01 \x01(\r\x12\x16\n\x0eraw_detections\x18\x02 \x01(\r\x12\x1f\n\x17\x63ontinuation_candidates\x18\x03 \x01(\r\x12\x1e\n\x16\x64\x65tector_backed_tracks\x18\x04 \x01(\r\x12$\n\x1clow_confidence_continuations\x18\x05 \x01(\r\x12\x13\n\x0bheld_tracks\x18\x06 \x01(\r\x12\x0e\n\x06tracks\x18\x07 \x01(\r\x12\x15\n\rtracker_frame\x18\x08 \x01(\x04\x12\x15\n\radaface_calls\x18\t \x01(\r\x12\x1e\n\x16\x61\x64\x61\x66\x61\x63\x65_queue_overflow\x18\n \x01(\r\x12\x1a\n\x12whitelisted_tracks\x18\x0b \x01(\r\",\n\x08\x46\x61\x63\x65\x44\x61ta\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\"\x80\x01\n\x11WhitelistResponse\x12\x16\n\x0estatus_message\x18\x01 \x01(\t\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x10\n\x08\x65ntry_id\x18\x03 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x04 \x01(\r\x12\x19\n\x11whitelist_version\x18\x05 \x01(\x04\"/\n\x19GetWhitelistStatusRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"s\n\x1aGetWhitelistStatusResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x02 \x01(\r\x12\x19\n\x11whitelist_version\x18\x03 \x01(\x04\x12\x11\n\tentry_ids\x18\x04 \x03(\t\">\n\x16\x44\x65leteWhitelistRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x10\n\x08\x65ntry_id\x18\x02 \x01(\t\"\x16\n\x14\x43reateSessionRequest\"\x15\n\x13ListSessionsRequest\"*\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"\x8a\x01\n\x0bSessionInfo\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x02 \x01(\r\x12\x19\n\x11whitelist_version\x18\x03 \x01(\x04\x12\x1a\n\x12\x63reated_at_unix_ms\x18\x04 \x01(\x03\x12\x1b\n\x13\x61\x63tive_stream_count\x18\x05 \x01(\r\"6\n\x14ListSessionsResponse\x12\x1e\n\x08sessions\x18\x01 \x03(\x0b\x32\x0c.SessionInfo2\xb5\x03\n\x0b\x41iProcessor\x12\x35\n\x0cProcessVideo\x12\x0b.VideoChunk\x1a\x14.ProcessedVideoChunk(\x01\x30\x01\x12-\n\x0c\x41\x64\x64Whitelist\x12\t.FaceData\x1a\x12.WhitelistResponse\x12>\n\x0f\x44\x65leteWhitelist\x12\x17.DeleteWhitelistRequest\x1a\x12.WhitelistResponse\x12M\n\x12GetWhitelistStatus\x12\x1a.GetWhitelistStatusRequest\x1a\x1b.GetWhitelistStatusResponse\x12\x34\n\rCreateSession\x12\x15.CreateSessionRequest\x1a\x0c.SessionInfo\x12;\n\x0cListSessions\x12\x14.ListSessionsRequest\x1a\x15.ListSessionsResponse\x12>\n\rDeleteSession\x12\x15.DeleteSessionRequest\x1a\x16.google.protobuf.Emptyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x19protos/ai_processor.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x92\x01\n\nVideoChunk\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x10\n\x08\x66rame_id\x18\x03 \x01(\x03\x12\x16\n\nbatch_size\x18\x04 \x01(\rB\x02\x18\x01\x12\x12\n\nsession_id\x18\x05 \x01(\t\x12%\n\x0boutput_mode\x18\x06 \x01(\x0e\x32\x10.VideoOutputMode\"\xb7\x02\n\x13ProcessedVideoChunk\x12\x10\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x42\x02\x18\x01\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x16\n\x0estatus_message\x18\x03 \x01(\t\x12\x1c\n\x05\x66\x61\x63\x65s\x18\x04 \x03(\x0b\x32\r.FaceMetadata\x12\r\n\x05width\x18\x05 \x01(\x05\x12\x0e\n\x06height\x18\x06 \x01(\x05\x12\x10\n\x08\x66rame_id\x18\x07 \x01(\x03\x12\x15\n\rprocessing_ms\x18\x08 \x01(\x01\x12!\n\x06timing\x18\t \x01(\x0b\x32\x11.ProcessingTiming\x12\x12\n\nerror_code\x18\n \x01(\t\x12\x15\n\rerror_message\x18\x0b \x01(\t\x12\x1a\n\x05stats\x18\x0c \x01(\x0b\x32\x0b.FrameStats\x12\x13\n\x0bmosaic_jpeg\x18\r \x01(\x0c\"\xe1\x01\n\x10ProcessingTiming\x12\x10\n\x08queue_ms\x18\x01 \x01(\x01\x12\x11\n\tdecode_ms\x18\x02 \x01(\x01\x12\x14\n\x0cinference_ms\x18\x03 \x01(\x01\x12\x13\n\x0btracking_ms\x18\x04 \x01(\x01\x12\x16\n\x0e\x62lur_encode_ms\x18\x05 \x01(\x01\x12\x1c\n\x14inference_batch_size\x18\x06 \x01(\r\x12\x14\n\x0cserialize_ms\x18\x07 \x01(\x01\x12\x17\n\x0fserver_total_ms\x18\x08 \x01(\x01\x12\x18\n\x10runtime_total_ms\x18\t \x01(\x01\"\x1d\n\x05Point\x12\t\n\x01x\x18\x01 \x01(\x02\x12\t\n\x01y\x18\x02 \x01(\x02\"=\n\x0b\x42oundingBox\x12\n\n\x02x1\x18\x01 \x01(\x02\x12\n\n\x02y1\x18\x02 \x01(\x02\x12\n\n\x02x2\x18\x03 \x01(\x02\x12\n\n\x02y2\x18\x04 \x01(\x02\"\xed\x01\n\x0c\x46\x61\x63\x65Metadata\x12\x1a\n\x04\x62\x62ox\x18\x01 \x01(\x0b\x32\x0c.BoundingBox\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x12\x17\n\x07polygon\x18\x03 \x03(\x0b\x32\x06.Point\x12\x15\n\x08track_id\x18\x04 \x01(\x03H\x00\x88\x01\x01\x12\x0e\n\x06source\x18\x05 \x01(\t\x12\x0c\n\x04held\x18\x06 \x01(\x08\x12\x13\n\x0bhold_frames\x18\x07 \x01(\r\x12\x12\n\nclass_name\x18\x08 \x01(\t\x12\x14\n\x0cmask_area_px\x18\t \x01(\x02\x12\x13\n\x0bwhitelisted\x18\n \x01(\x08\x42\x0b\n\t_track_id\"\xae\x02\n\nFrameStats\x12\x12\n\ndetections\x18\x01 \x01(\r\x12\x16\n\x0eraw_detections\x18\x02 \x01(\r\x12\x1f\n\x17\x63ontinuation_candidates\x18\x03 \x01(\r\x12\x1e\n\x16\x64\x65tector_backed_tracks\x18\x04 \x01(\r\x12$\n\x1clow_confidence_continuations\x18\x05 \x01(\r\x12\x13\n\x0bheld_tracks\x18\x06 \x01(\r\x12\x0e\n\x06tracks\x18\x07 \x01(\r\x12\x15\n\rtracker_frame\x18\x08 \x01(\x04\x12\x15\n\radaface_calls\x18\t \x01(\r\x12\x1e\n\x16\x61\x64\x61\x66\x61\x63\x65_queue_overflow\x18\n \x01(\r\x12\x1a\n\x12whitelisted_tracks\x18\x0b \x01(\r\",\n\x08\x46\x61\x63\x65\x44\x61ta\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\"\x80\x01\n\x11WhitelistResponse\x12\x16\n\x0estatus_message\x18\x01 \x01(\t\x12\x11\n\ttimestamp\x18\x02 \x01(\x03\x12\x10\n\x08\x65ntry_id\x18\x03 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x04 \x01(\r\x12\x19\n\x11whitelist_version\x18\x05 \x01(\x04\"/\n\x19GetWhitelistStatusRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"s\n\x1aGetWhitelistStatusResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x02 \x01(\r\x12\x19\n\x11whitelist_version\x18\x03 \x01(\x04\x12\x11\n\tentry_ids\x18\x04 \x03(\t\">\n\x16\x44\x65leteWhitelistRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x10\n\x08\x65ntry_id\x18\x02 \x01(\t\"\x16\n\x14\x43reateSessionRequest\"\x15\n\x13ListSessionsRequest\"*\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"\x8a\x01\n\x0bSessionInfo\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65ntry_count\x18\x02 \x01(\r\x12\x19\n\x11whitelist_version\x18\x03 \x01(\x04\x12\x1a\n\x12\x63reated_at_unix_ms\x18\x04 \x01(\x03\x12\x1b\n\x13\x61\x63tive_stream_count\x18\x05 \x01(\r\"6\n\x14ListSessionsResponse\x12\x1e\n\x08sessions\x18\x01 \x03(\x0b\x32\x0c.SessionInfo*|\n\x0fVideoOutputMode\x12!\n\x1dVIDEO_OUTPUT_MODE_UNSPECIFIED\x10\x00\x12#\n\x1fVIDEO_OUTPUT_MODE_METADATA_ONLY\x10\x01\x12!\n\x1dVIDEO_OUTPUT_MODE_MOSAIC_JPEG\x10\x02\x32\xb5\x03\n\x0b\x41iProcessor\x12\x35\n\x0cProcessVideo\x12\x0b.VideoChunk\x1a\x14.ProcessedVideoChunk(\x01\x30\x01\x12-\n\x0c\x41\x64\x64Whitelist\x12\t.FaceData\x1a\x12.WhitelistResponse\x12>\n\x0f\x44\x65leteWhitelist\x12\x17.DeleteWhitelistRequest\x1a\x12.WhitelistResponse\x12M\n\x12GetWhitelistStatus\x12\x1a.GetWhitelistStatusRequest\x1a\x1b.GetWhitelistStatusResponse\x12\x34\n\rCreateSession\x12\x15.CreateSessionRequest\x1a\x0c.SessionInfo\x12;\n\x0cListSessions\x12\x14.ListSessionsRequest\x1a\x15.ListSessionsResponse\x12>\n\rDeleteSession\x12\x15.DeleteSessionRequest\x1a\x16.google.protobuf.Emptyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,40 +36,42 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_VIDEOCHUNK'].fields_by_name['batch_size']._serialized_options = b'\030\001'
   _globals['_PROCESSEDVIDEOCHUNK'].fields_by_name['data']._loaded_options = None
   _globals['_PROCESSEDVIDEOCHUNK'].fields_by_name['data']._serialized_options = b'\030\001'
-  _globals['_VIDEOCHUNK']._serialized_start=58
-  _globals['_VIDEOCHUNK']._serialized_end=165
-  _globals['_PROCESSEDVIDEOCHUNK']._serialized_start=168
-  _globals['_PROCESSEDVIDEOCHUNK']._serialized_end=458
-  _globals['_PROCESSINGTIMING']._serialized_start=461
-  _globals['_PROCESSINGTIMING']._serialized_end=686
-  _globals['_POINT']._serialized_start=688
-  _globals['_POINT']._serialized_end=717
-  _globals['_BOUNDINGBOX']._serialized_start=719
-  _globals['_BOUNDINGBOX']._serialized_end=780
-  _globals['_FACEMETADATA']._serialized_start=783
-  _globals['_FACEMETADATA']._serialized_end=1020
-  _globals['_FRAMESTATS']._serialized_start=1023
-  _globals['_FRAMESTATS']._serialized_end=1325
-  _globals['_FACEDATA']._serialized_start=1327
-  _globals['_FACEDATA']._serialized_end=1371
-  _globals['_WHITELISTRESPONSE']._serialized_start=1374
-  _globals['_WHITELISTRESPONSE']._serialized_end=1502
-  _globals['_GETWHITELISTSTATUSREQUEST']._serialized_start=1504
-  _globals['_GETWHITELISTSTATUSREQUEST']._serialized_end=1551
-  _globals['_GETWHITELISTSTATUSRESPONSE']._serialized_start=1553
-  _globals['_GETWHITELISTSTATUSRESPONSE']._serialized_end=1668
-  _globals['_DELETEWHITELISTREQUEST']._serialized_start=1670
-  _globals['_DELETEWHITELISTREQUEST']._serialized_end=1732
-  _globals['_CREATESESSIONREQUEST']._serialized_start=1734
-  _globals['_CREATESESSIONREQUEST']._serialized_end=1756
-  _globals['_LISTSESSIONSREQUEST']._serialized_start=1758
-  _globals['_LISTSESSIONSREQUEST']._serialized_end=1779
-  _globals['_DELETESESSIONREQUEST']._serialized_start=1781
-  _globals['_DELETESESSIONREQUEST']._serialized_end=1823
-  _globals['_SESSIONINFO']._serialized_start=1826
-  _globals['_SESSIONINFO']._serialized_end=1964
-  _globals['_LISTSESSIONSRESPONSE']._serialized_start=1966
-  _globals['_LISTSESSIONSRESPONSE']._serialized_end=2020
-  _globals['_AIPROCESSOR']._serialized_start=2023
-  _globals['_AIPROCESSOR']._serialized_end=2460
+  _globals['_VIDEOOUTPUTMODE']._serialized_start=2083
+  _globals['_VIDEOOUTPUTMODE']._serialized_end=2207
+  _globals['_VIDEOCHUNK']._serialized_start=59
+  _globals['_VIDEOCHUNK']._serialized_end=205
+  _globals['_PROCESSEDVIDEOCHUNK']._serialized_start=208
+  _globals['_PROCESSEDVIDEOCHUNK']._serialized_end=519
+  _globals['_PROCESSINGTIMING']._serialized_start=522
+  _globals['_PROCESSINGTIMING']._serialized_end=747
+  _globals['_POINT']._serialized_start=749
+  _globals['_POINT']._serialized_end=778
+  _globals['_BOUNDINGBOX']._serialized_start=780
+  _globals['_BOUNDINGBOX']._serialized_end=841
+  _globals['_FACEMETADATA']._serialized_start=844
+  _globals['_FACEMETADATA']._serialized_end=1081
+  _globals['_FRAMESTATS']._serialized_start=1084
+  _globals['_FRAMESTATS']._serialized_end=1386
+  _globals['_FACEDATA']._serialized_start=1388
+  _globals['_FACEDATA']._serialized_end=1432
+  _globals['_WHITELISTRESPONSE']._serialized_start=1435
+  _globals['_WHITELISTRESPONSE']._serialized_end=1563
+  _globals['_GETWHITELISTSTATUSREQUEST']._serialized_start=1565
+  _globals['_GETWHITELISTSTATUSREQUEST']._serialized_end=1612
+  _globals['_GETWHITELISTSTATUSRESPONSE']._serialized_start=1614
+  _globals['_GETWHITELISTSTATUSRESPONSE']._serialized_end=1729
+  _globals['_DELETEWHITELISTREQUEST']._serialized_start=1731
+  _globals['_DELETEWHITELISTREQUEST']._serialized_end=1793
+  _globals['_CREATESESSIONREQUEST']._serialized_start=1795
+  _globals['_CREATESESSIONREQUEST']._serialized_end=1817
+  _globals['_LISTSESSIONSREQUEST']._serialized_start=1819
+  _globals['_LISTSESSIONSREQUEST']._serialized_end=1840
+  _globals['_DELETESESSIONREQUEST']._serialized_start=1842
+  _globals['_DELETESESSIONREQUEST']._serialized_end=1884
+  _globals['_SESSIONINFO']._serialized_start=1887
+  _globals['_SESSIONINFO']._serialized_end=2025
+  _globals['_LISTSESSIONSRESPONSE']._serialized_start=2027
+  _globals['_LISTSESSIONSRESPONSE']._serialized_end=2081
+  _globals['_AIPROCESSOR']._serialized_start=2210
+  _globals['_AIPROCESSOR']._serialized_end=2647
 # @@protoc_insertion_point(module_scope)

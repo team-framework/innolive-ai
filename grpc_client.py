@@ -15,7 +15,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.grpc_config import channel_options
-from service.protocol import MAX_JPEG_BYTES, MAX_RESPONSE_BYTES
+from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
 from service.recognition import validate_entry_id, validate_session_id
 
 MAX_WINDOW = 5
@@ -61,10 +61,16 @@ class VideoFrame:
 
 @dataclass(frozen=True, slots=True)
 class VideoResult:
-    """Metadata response paired with the exact JPEG sent for that frame."""
+    """One ordered response with its server-composited mosaic JPEG."""
 
     source_jpeg: bytes
     response: ai_processor_pb2.ProcessedVideoChunk
+
+    @property
+    def mosaic_jpeg(self) -> bytes:
+        """Return only server-processed pixels; never substitute the source frame."""
+
+        return bytes(self.response.mosaic_jpeg)
 
 
 FrameSource = Iterable[VideoFrame] | AsyncIterable[VideoFrame]
@@ -625,6 +631,7 @@ class VideoProcessorClient:
                         frame_id=normalized.frame_id,
                         batch_size=1,
                         session_id=session_id,
+                        output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
                     )
                 )
             await call.done_writing()
@@ -639,9 +646,9 @@ class VideoProcessorClient:
         *,
         raise_frame_errors: bool,
     ) -> None:
-        if int(response.ByteSize()) > MAX_RESPONSE_BYTES:
+        if int(response.ByteSize()) > MAX_GRPC_RESPONSE_BYTES:
             raise VideoProtocolError(
-                f"frame {source.frame_id} response exceeded the metadata limit"
+                f"frame {source.frame_id} response exceeded the gRPC response limit"
             )
         if bytes(response.data):
             raise VideoProtocolError(
@@ -660,11 +667,21 @@ class VideoProcessorClient:
 
         status, detail = _response_status(response)
         if status == "error":
+            if bytes(response.mosaic_jpeg):
+                raise VideoProtocolError(
+                    f"frame {source.frame_id} error response contained mosaic pixels"
+                )
             if raise_frame_errors:
                 raise VideoFrameError(source.frame_id, detail)
             return
         if response.error_code or response.error_message:
             raise VideoProtocolError(f"frame {source.frame_id} success response contained an error")
+        try:
+            _validate_jpeg(response.mosaic_jpeg)
+        except (TypeError, ValueError) as error:
+            raise VideoProtocolError(
+                f"frame {source.frame_id} returned an invalid mosaic JPEG: {error}"
+            ) from error
 
 
 async def _iterate_frames(frames: FrameSource) -> AsyncIterator[VideoFrame]:

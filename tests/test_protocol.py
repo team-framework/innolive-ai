@@ -9,10 +9,15 @@ from service.protocol import (
     MAGIC,
     MAX_JPEG_BYTES,
     MAX_RESPONSE_BYTES,
+    RESULT_HEADER,
+    RESULT_MAGIC,
+    VERSION,
     decode_request,
     decode_response,
+    decode_result,
     encode_request,
     encode_response,
+    encode_result,
     recover_sequence,
 )
 
@@ -44,23 +49,69 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "byte limit"):
             decode_request(HEADER.pack(MAGIC, 1) + JPEG, max_jpeg_bytes=4)
 
-    def test_metadata_terminal_round_trip(self):
-        expected = {"type": "result", "seq": 4, "objects": [{"track_id": 2}]}
-        self.assertEqual(decode_response(encode_response(expected)), {"v": 1, **expected})
+    def test_result_round_trip_is_binary_and_keeps_the_jpeg_separate(self):
+        expected = {"type": "result", "seq": 0x01020304, "objects": [{"track_id": 2}]}
+        payload = encode_result(expected, JPEG)
+
+        magic, sequence, metadata_length = RESULT_HEADER.unpack_from(payload)
+        metadata, result_jpeg = decode_result(payload)
+
+        self.assertEqual((magic, sequence), (RESULT_MAGIC, 0x01020304))
+        self.assertGreater(metadata_length, 0)
+        self.assertEqual(metadata, {**expected, "v": VERSION})
+        self.assertEqual(result_jpeg, JPEG)
+
+    def test_error_terminal_round_trip_remains_json_text(self):
+        expected = {"type": "error", "seq": 4, "code": "FAILED"}
+        encoded = encode_response(expected)
+
+        self.assertIsInstance(encoded, str)
+        self.assertEqual(decode_response(encoded), {**expected, "v": VERSION})
 
     def test_response_requires_terminal_type_and_sequence(self):
         with self.assertRaisesRegex(ValueError, "type"):
             encode_response({"type": "frame", "seq": 1})
+        with self.assertRaisesRegex(ValueError, "type"):
+            encode_response({"type": "result", "seq": 1})
+        with self.assertRaisesRegex(ValueError, "type"):
+            encode_result({"type": "error", "seq": 1}, JPEG)
         with self.assertRaisesRegex(ValueError, "seq"):
             encode_response({"type": "error", "code": "FAILED"})
         with self.assertRaisesRegex(ValueError, "invalid seq"):
-            decode_response(json.dumps({"v": 1, "type": "result"}))
+            decode_response(json.dumps({"v": VERSION, "type": "error"}))
 
     def test_response_size_is_bounded(self):
         with self.assertRaisesRegex(ValueError, "byte limit"):
-            encode_response({"type": "result", "seq": 1, "value": "x" * MAX_RESPONSE_BYTES})
+            encode_response({"type": "error", "seq": 1, "value": "x" * MAX_RESPONSE_BYTES})
+
+    def test_result_rejects_invalid_envelopes(self):
+        metadata = json.dumps(
+            {"v": VERSION, "type": "result", "seq": 7},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "header"):
+            decode_result(b"ILR1")
+        with self.assertRaisesRegex(ValueError, "magic"):
+            decode_result(RESULT_HEADER.pack(b"OLD1", 7, len(metadata)) + metadata + JPEG)
+        with self.assertRaisesRegex(ValueError, "metadata.*byte limit"):
+            decode_result(RESULT_HEADER.pack(RESULT_MAGIC, 7, MAX_RESPONSE_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            decode_result(RESULT_HEADER.pack(RESULT_MAGIC, 7, len(metadata)) + metadata[:-1])
+
+    def test_result_rejects_mismatched_sequence_and_invalid_jpeg(self):
+        metadata = json.dumps(
+            {"v": VERSION, "type": "result", "seq": 8},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            decode_result(RESULT_HEADER.pack(RESULT_MAGIC, 7, len(metadata)) + metadata + JPEG)
+        with self.assertRaisesRegex(ValueError, "complete JPEG"):
+            encode_result({"type": "result", "seq": 7}, b"not-a-jpeg")
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            decode_result(encode_result({"type": "result", "seq": 7}, JPEG), max_jpeg_bytes=4)
 
     def test_public_limits_are_fixed(self):
+        self.assertEqual(VERSION, 2)
         self.assertEqual(MAX_JPEG_BYTES, 4 * 1024 * 1024)
         self.assertEqual(MAX_RESPONSE_BYTES, 512 * 1024)
 

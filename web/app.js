@@ -1,7 +1,7 @@
 "use strict";
 
 export const PROFILE = Object.freeze({
-  protocolVersion: 1,
+  protocolVersion: 2,
   longEdge: 640,
   jpegQuality: 0.90,
   targetFps: 30,
@@ -10,7 +10,11 @@ export const PROFILE = Object.freeze({
   upscaleSmallInputs: false,
 });
 
-const MAGIC = [0x49, 0x4c, 0x46, 0x31]; // ILF1
+const REQUEST_MAGIC = [0x49, 0x4c, 0x46, 0x31]; // ILF1
+const RESULT_MAGIC = [0x49, 0x4c, 0x52, 0x31]; // ILR1
+const RESULT_HEADER_BYTES = 12;
+const MAX_RESULT_METADATA_BYTES = 512 * 1024;
+const MAX_RESULT_JPEG_BYTES = 4 * 1024 * 1024;
 const MAX_SEQUENCE = 0xffffffff;
 const MAX_SESSION_ID_BYTES = 256;
 export const TAB_SESSION_STORAGE_KEY = "innolive.demo.session-id";
@@ -33,27 +37,139 @@ export function framePacket(sequence, jpeg) {
   }
   const header = new ArrayBuffer(8);
   const bytes = new Uint8Array(header);
-  bytes.set(MAGIC, 0);
+  bytes.set(REQUEST_MAGIC, 0);
   new DataView(header).setUint32(4, sequence, false);
   return new Blob([header, jpeg], { type: "application/octet-stream" });
 }
 
-export function parseTerminal(text) {
-  const metadata = JSON.parse(text);
+export function parseErrorTerminal(text) {
+  if (typeof text !== "string") throw new Error("error response must be JSON text");
+  const metadata = parseMetadata(text, "error");
   if (
-    metadata?.v !== PROFILE.protocolVersion
-    || !["result", "error"].includes(metadata?.type)
-    || !Number.isInteger(metadata?.seq)
-    || metadata.seq < 0
-    || metadata.seq > MAX_SEQUENCE
+    typeof metadata.code !== "string"
+    || !metadata.code
+    || typeof metadata.message !== "string"
+    || !metadata.message
   ) {
-    throw new Error("invalid ILF1 terminal response");
+    throw new Error("invalid ILF1 error response");
   }
   return metadata;
 }
 
-export function objectsToBlur(objects) {
-  return objects.filter((object) => object.whitelisted !== true);
+export function parseMosaicResult(payload) {
+  const bytes = binaryBytes(payload);
+  if (bytes.byteLength < RESULT_HEADER_BYTES + 4) {
+    throw new Error("ILR1 response is truncated");
+  }
+  if (!RESULT_MAGIC.every((value, index) => bytes[index] === value)) {
+    throw new Error("ILR1 response has invalid magic");
+  }
+
+  const header = new DataView(bytes.buffer, bytes.byteOffset, RESULT_HEADER_BYTES);
+  const sequence = header.getUint32(4, false);
+  const metadataLength = header.getUint32(8, false);
+  if (!metadataLength || metadataLength > MAX_RESULT_METADATA_BYTES) {
+    throw new Error("ILR1 metadata length is invalid");
+  }
+  const metadataEnd = RESULT_HEADER_BYTES + metadataLength;
+  if (metadataEnd + 4 > bytes.byteLength) {
+    throw new Error("ILR1 response is missing its JPEG payload");
+  }
+  const jpegLength = bytes.byteLength - metadataEnd;
+  if (jpegLength > MAX_RESULT_JPEG_BYTES) {
+    throw new Error("ILR1 JPEG exceeds the browser limit");
+  }
+
+  let metadataText;
+  try {
+    metadataText = new TextDecoder("utf-8", { fatal: true }).decode(
+      bytes.subarray(RESULT_HEADER_BYTES, metadataEnd),
+    );
+  } catch {
+    throw new Error("ILR1 metadata is not valid UTF-8");
+  }
+  const metadata = parseMetadata(metadataText, "result");
+  if (metadata.seq !== sequence) {
+    throw new Error("ILR1 header and metadata sequences do not match");
+  }
+  if (
+    !Number.isInteger(metadata.width)
+    || !Number.isInteger(metadata.height)
+    || metadata.width < 1
+    || metadata.height < 1
+    || metadata.width > PROFILE.longEdge
+    || metadata.height > PROFILE.longEdge
+  ) {
+    throw new Error("ILR1 result dimensions are invalid");
+  }
+
+  const jpeg = bytes.subarray(metadataEnd);
+  if (
+    jpeg[0] !== 0xff
+    || jpeg[1] !== 0xd8
+    || jpeg[jpeg.length - 2] !== 0xff
+    || jpeg[jpeg.length - 1] !== 0xd9
+  ) {
+    throw new Error("ILR1 payload is not one complete JPEG");
+  }
+  return {
+    sequence,
+    metadata,
+    jpeg: new Blob([jpeg.slice()], { type: "image/jpeg" }),
+  };
+}
+
+export function validateMosaicBitmap(bitmap, metadata) {
+  if (
+    !bitmap
+    || bitmap.width !== metadata.width
+    || bitmap.height !== metadata.height
+  ) {
+    throw new Error("decoded mosaic dimensions do not match the result metadata");
+  }
+  return bitmap;
+}
+
+export async function decodeMosaicJpeg(
+  jpeg,
+  metadata,
+  decode = (source) => createImageBitmap(source),
+) {
+  let bitmap = null;
+  try {
+    bitmap = await decode(jpeg);
+    return validateMosaicBitmap(bitmap, metadata);
+  } catch (error) {
+    bitmap?.close?.();
+    throw error;
+  }
+}
+
+function binaryBytes(payload) {
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  if (ArrayBuffer.isView(payload)) {
+    return new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  }
+  throw new Error("successful response must be a binary ILR1 packet");
+}
+
+function parseMetadata(text, expectedType) {
+  let metadata;
+  try {
+    metadata = JSON.parse(text);
+  } catch {
+    throw new Error(`invalid ${expectedType} response metadata`);
+  }
+  if (
+    metadata?.v !== PROFILE.protocolVersion
+    || metadata?.type !== expectedType
+    || !Number.isInteger(metadata?.seq)
+    || metadata.seq < 0
+    || metadata.seq > MAX_SEQUENCE
+  ) {
+    throw new Error(`invalid ${expectedType} response metadata`);
+  }
+  return metadata;
 }
 
 export function validateSessionId(value) {
@@ -488,48 +604,6 @@ export function captureDeadline(
   return { due: true, nextDeadline };
 }
 
-export class BitmapLease {
-  constructor(jpeg, decode, onRelease = () => {}) {
-    this.bitmap = null;
-    this.released = false;
-    this.onRelease = onRelease;
-    let decoding;
-    try {
-      decoding = Promise.resolve(decode(jpeg));
-    } catch (error) {
-      decoding = Promise.reject(error);
-    }
-    this.promise = decoding.then(
-      (bitmap) => {
-        if (this.released) {
-          bitmap.close();
-          return null;
-        }
-        this.bitmap = bitmap;
-        return bitmap;
-      },
-      (error) => {
-        if (this.released) return null;
-        throw error;
-      },
-    );
-    // Decode can finish before its terminal result arrives. Mark the promise handled
-    // while retaining the rejection for the renderer's fail-closed path.
-    this.promise.catch(() => {});
-  }
-
-  release() {
-    if (this.released) return false;
-    this.released = true;
-    this.onRelease();
-    if (this.bitmap) {
-      this.bitmap.close();
-      this.bitmap = null;
-    }
-    return true;
-  }
-}
-
 export class LatestRenderQueue {
   constructor() {
     this.active = null;
@@ -588,8 +662,6 @@ class App {
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
     this.outputContext = this.elements.output.getContext("2d", { alpha: false });
-    this.blurCanvas = document.createElement("canvas");
-    this.blurContext = this.blurCanvas.getContext("2d", { alpha: false });
     this.elements.start.addEventListener("click", () => this.start());
     this.elements.stop.addEventListener("click", () => this.stop());
     this.elements["add-whitelist"].addEventListener("click", () => this.enrollWhitelist());
@@ -742,7 +814,6 @@ class App {
     this.localStreamCounted = false;
     this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
-    this.bitmapOwners = 0;
     this.rates = {
       capture: [],
       result: [],
@@ -793,6 +864,7 @@ class App {
       }
 
       const socket = new WebSocket(websocketUrl(location, this.streamSessionId));
+      socket.binaryType = "arraybuffer";
       this.socket = socket;
       socket.onopen = () => {
         if (generation !== this.generation || socket !== this.socket) return;
@@ -1270,15 +1342,14 @@ class App {
       this.activeProfile.timeoutMs,
     );
     const request = {
-      ...frame,
+      width: frame.width,
+      height: frame.height,
       timeout,
       generation: this.generation,
-      bitmapLease: null,
     };
     this.inFlight.set(sequence, request);
     try {
       this.socket.send(framePacket(sequence, frame.jpeg));
-      request.bitmapLease = this.createBitmapLease(frame.jpeg);
     } catch (error) {
       this.failClosed(error.message);
     }
@@ -1287,9 +1358,11 @@ class App {
   receive(event) {
     let request = null;
     try {
-      if (typeof event.data !== "string") throw new Error("response must be JSON text");
-      const metadata = parseTerminal(event.data);
-      const sequence = metadata.seq;
+      const result = typeof event.data === "string"
+        ? { metadata: parseErrorTerminal(event.data), jpeg: null }
+        : parseMosaicResult(event.data);
+      const { metadata } = result;
+      const sequence = result.sequence ?? metadata.seq;
       request = this.inFlight.get(sequence);
       if (!request) throw new Error(`terminal seq ${sequence} is not in flight`);
       if (sequence <= this.lastTerminalSequence) {
@@ -1306,9 +1379,8 @@ class App {
       if (
         metadata.width !== request.width
         || metadata.height !== request.height
-        || !Array.isArray(metadata.objects)
       ) {
-        throw new Error("result metadata does not match the retained local frame");
+        throw new Error("result dimensions do not match the requested frame");
       }
       this.pump();
       const receivedAt = performance.now();
@@ -1317,38 +1389,18 @@ class App {
         sequence,
         generation: request.generation,
         metadata,
-        request,
+        jpeg: result.jpeg,
       };
       const queued = this.renderQueue.enqueue(item);
       if (!queued.accepted) {
-        request.bitmapLease?.release();
         request = null;
         return;
       }
-      if (queued.dropped) {
-        queued.dropped.request.bitmapLease?.release();
-      }
-      request = null; // Ownership moved from in-flight to the render queue.
+      request = null;
       this.scheduleRender();
     } catch (error) {
-      request?.bitmapLease?.release();
       this.failClosed(error.message);
     }
-  }
-
-  createBitmapLease(jpeg) {
-    this.bitmapOwners += 1;
-    if (this.bitmapOwners > this.activeProfile.requestWindow + 2) {
-      this.bitmapOwners -= 1;
-      throw new Error("bitmap ownership exceeded the negotiated window bound");
-    }
-    return new BitmapLease(
-      jpeg,
-      (blob) => createImageBitmap(blob),
-      () => {
-        this.bitmapOwners -= 1;
-      },
-    );
   }
 
   scheduleRender() {
@@ -1368,17 +1420,17 @@ class App {
     if (!this.running) return;
     const item = this.renderQueue.begin();
     if (!item) return;
+    let bitmap = null;
     try {
-      const bitmap = await item.request.bitmapLease.promise;
+      bitmap = await decodeMosaicJpeg(item.jpeg, item.metadata);
       if (
-        !bitmap
-        || !this.running
+        !this.running
         || item.generation !== this.generation
         || !this.renderQueue.canCommit(item)
       ) {
         return;
       }
-      this.drawProtected(bitmap, item.metadata);
+      this.drawMosaic(bitmap, item.metadata);
       if (!this.renderQueue.commit(item)) throw new Error("render commit regressed");
       const displayedAt = performance.now();
       this.mark(this.rates.display, displayedAt);
@@ -1389,60 +1441,19 @@ class App {
         this.failClosed(`render failed: ${error.message}`);
       }
     } finally {
-      item.request.bitmapLease?.release();
+      bitmap?.close();
       this.renderQueue.finish(item);
       this.scheduleRender();
     }
   }
 
-  drawProtected(bitmap, metadata) {
+  drawMosaic(bitmap, metadata) {
     const { width, height } = metadata;
     this.elements.output.width = width;
     this.elements.output.height = height;
-    this.blurCanvas.width = width;
-    this.blurCanvas.height = height;
     this.outputContext.fillStyle = "#000";
     this.outputContext.fillRect(0, 0, width, height);
     this.outputContext.drawImage(bitmap, 0, 0, width, height);
-
-    const objects = metadata.objects;
-    if (objects.length > 100) throw new Error("result exceeds the object limit");
-    for (const object of objects) {
-      const polygon = object.mask_polygon;
-      if (!Array.isArray(polygon) || polygon.length < 3 || polygon.length > 64) {
-        throw new Error("tracked object has no bounded mask polygon");
-      }
-      for (const [x, y] of polygon) {
-        if (!Number.isFinite(x) || !Number.isFinite(y)) {
-          throw new Error("mask polygon contains a non-finite point");
-        }
-      }
-    }
-    const blurredObjects = objectsToBlur(objects);
-    if (blurredObjects.length) {
-      this.blurContext.fillStyle = "#000";
-      this.blurContext.fillRect(0, 0, width, height);
-      this.blurContext.filter = "blur(24px)";
-      if (this.blurContext.filter !== "blur(24px)") {
-        throw new Error("browser does not support the required blur filter");
-      }
-      this.blurContext.drawImage(bitmap, 0, 0, width, height);
-      this.blurContext.filter = "none";
-      this.outputContext.save();
-      this.outputContext.beginPath();
-      for (const object of blurredObjects) {
-        const polygon = object.mask_polygon;
-        polygon.forEach(([x, y], index) => {
-          if (index) this.outputContext.lineTo(x, y);
-          else this.outputContext.moveTo(x, y);
-        });
-        this.outputContext.closePath();
-      }
-      this.outputContext.clip();
-      this.outputContext.drawImage(this.blurCanvas, 0, 0);
-      this.outputContext.restore();
-    }
-
   }
 
   updateFps(now) {
@@ -1477,13 +1488,12 @@ class App {
   clearInFlight() {
     for (const request of this.inFlight.values()) {
       clearTimeout(request.timeout);
-      request.bitmapLease?.release();
     }
     this.inFlight.clear();
     this.pendingLatest = null;
     if (this.renderRequest !== null) cancelAnimationFrame(this.renderRequest);
     this.renderRequest = null;
-    for (const item of this.renderQueue.drain()) item.request.bitmapLease?.release();
+    this.renderQueue.drain();
   }
 
   failClosed(message, closeSocket = true) {
