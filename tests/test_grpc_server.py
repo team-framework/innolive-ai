@@ -321,7 +321,8 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             [(item.status_message, item.frame_id, item.timestamp) for item in responses],
             [("success", 0, 11), ("success", 0, 12)],
         )
-        self.assertTrue(all(item.data == b"" for item in responses))
+        self.assertTrue(all(item.data.startswith(b"\xff\xd8") for item in responses))
+        self.assertTrue(all(item.mosaic_jpeg == b"" for item in responses))
         self.assertEqual([item.stats.tracker_frame for item in responses], [1, 2])
         self.assertEqual(len(runtime.calls), 2)
         self.assertIs(runtime.calls[0][1], runtime.calls[1][1])
@@ -339,10 +340,19 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ).read()
 
         self.assertEqual(response.status_message, "success")
-        self.assertEqual(response.data, b"")
-        self.assertTrue(response.mosaic_jpeg.startswith(b"\xff\xd8"))
-        self.assertTrue(response.mosaic_jpeg.endswith(b"\xff\xd9"))
+        self.assertTrue(response.data.startswith(b"\xff\xd8"))
+        self.assertTrue(response.data.endswith(b"\xff\xd9"))
+        self.assertEqual(response.mosaic_jpeg, b"")
         self.assertGreater(response.timing.blur_encode_ms, 0)
+
+    async def test_unspecified_mode_returns_data_for_legacy_clients(self):
+        source = _jpeg()
+        async with LoopbackServer(FakeRuntime()) as server:
+            response = await server.stub.ProcessVideo(_requests(_request(data=source))).read()
+
+        self.assertEqual(response.status_message, "success")
+        self.assertEqual(response.data, source)
+        self.assertEqual(response.mosaic_jpeg, b"")
 
     async def test_metadata_mode_does_not_return_pixels(self):
         async with LoopbackServer(FaceRuntime()) as server:
@@ -370,7 +380,8 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).read()
 
-        self.assertEqual(response.mosaic_jpeg, source)
+        self.assertEqual(response.data, source)
+        self.assertEqual(response.mosaic_jpeg, b"")
 
     async def test_invalid_protected_mask_never_returns_source_pixels(self):
         async with LoopbackServer(InvalidMaskRuntime()) as server:
@@ -855,7 +866,8 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*(call.read() for call in calls))
 
         self.assertTrue(all(response.status_message == "success" for response in responses))
-        self.assertTrue(all(response.mosaic_jpeg.startswith(b"\xff\xd8") for response in responses))
+        self.assertTrue(all(response.data.startswith(b"\xff\xd8") for response in responses))
+        self.assertTrue(all(response.mosaic_jpeg == b"" for response in responses))
         self.assertEqual(len(server.trackers), 8)
 
     async def test_cancellation_settles_inference_before_reset_and_release(self):

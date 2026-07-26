@@ -31,7 +31,7 @@ message VideoChunk {
   uint32 batch_size = 4 [deprecated = true];
   // Authenticated caller session; fixed for the lifetime of one ProcessVideo RPC.
   string session_id = 5;
-  // Response payload requested for this stream. Unspecified preserves metadata-only clients.
+  // Response payload requested for this stream. Unspecified returns a server-processed JPEG.
   VideoOutputMode output_mode = 6;
 }
 
@@ -42,8 +42,8 @@ enum VideoOutputMode {
 }
 
 message ProcessedVideoChunk {
-  // Legacy processed-JPEG response. Metadata-only serving leaves this empty.
-  bytes data = 1 [deprecated = true];
+  // Server-composited JPEG. Empty only for metadata-only mode or failed frames.
+  bytes data = 1;
   int64 timestamp = 2;
   string status_message = 3;
   repeated FaceMetadata faces = 4;
@@ -55,8 +55,8 @@ message ProcessedVideoChunk {
   string error_code = 10;
   string error_message = 11;
   FrameStats stats = 12;
-  // Server-composited JPEG. Present only when MOSAIC_JPEG was requested and processing succeeded.
-  bytes mosaic_jpeg = 13;
+  // Transitional alias retained for wire compatibility. Servers leave this empty.
+  bytes mosaic_jpeg = 13 [deprecated = true];
 }
 
 message ProcessingTiming {

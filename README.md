@@ -6,9 +6,9 @@ YOLO face segmentation과 stream-local BoT-SORT를 이용해 얼굴을 추적하
 `/AiProcessor/ProcessVideo`입니다. `server.py`는 브라우저 화면을 실제 gRPC 서버에 연결하는
 시연용 WebSocket-to-gRPC gateway이며 자체적으로 모델을 실행하지 않습니다.
 
-기존 생성 클라이언트는 `output_mode` 기본값에 따라 metadata-only로 계속 동작합니다. 새
-클라이언트는 `MOSAIC_JPEG`를 요청하고 `mosaic_jpeg`만 화면에 사용합니다. 합성이나 전송에
-실패하면 원본으로 되돌아가지 않습니다.
+기존 생성 클라이언트가 `output_mode`를 보내지 않아도 성공 응답의 `data`에 처리된 JPEG가
+돌아옵니다. 새 클라이언트는 `MOSAIC_JPEG`를 명시하고 같은 `data`만 화면에 사용합니다.
+합성이나 전송에 실패하면 원본으로 되돌아가지 않습니다.
 
 ## 추론 backend
 
@@ -179,7 +179,7 @@ async def main() -> None:
         print([item.session_id for item in await client.list_sessions()])
         async for result in session.process_jpegs(frames):
             print(result.response.frame_id, result.response.faces)
-            protected_jpeg = result.mosaic_jpeg
+            protected_jpeg = result.response.data
         await session.delete_whitelist(entries[0].entry_id)
         await session.delete()
 
@@ -193,8 +193,10 @@ asyncio.run(main())
 여러 session의 `ProcessVideo`를 동시에 실행할 수 있으며, client 종료 시 열려 있는 RPC를
 모두 취소합니다. client는 JPEG 크기/형식, frame ID 단조 증가,
 응답 순서, timestamp echo, payload 크기와 완전한 서버 JPEG를 검증하고 위반 시 fail-closed로
-stream을 종료합니다. `source_jpeg`는 요청-응답 상관관계와 기존 호출부 호환을 위해 남아
-있지만 출력 fallback으로 사용하지 않습니다. RPC 실패는 `VideoRpcError`의 `method`, gRPC `code`, `details`로
+stream을 종료합니다. `VideoResult.processed_jpeg`도 canonical `response.data`를 반환하며
+`mosaic_jpeg`는 Python 호출부 호환용 별칭입니다. `source_jpeg`는 요청-응답 상관관계와 기존
+호출부 호환을 위해 남아 있지만 출력 fallback으로 사용하지 않습니다. RPC 실패는
+`VideoRpcError`의 `method`, gRPC `code`, `details`로
 구분할 수 있습니다. `AddWhitelist`의 기본 deadline은 10초이고, 수명이 정해지지 않은
 영상 stream의 deadline은 호출자가 `timeout`으로 지정합니다.
 
@@ -236,12 +238,13 @@ Request `VideoChunk`:
 - `frame_id`: 그대로 돌려주는 signed int64
 - `batch_size`: legacy field이며 0 또는 1만 허용
 - `session_id`: 비어 있지 않은 세션 식별자. 첫 메시지 값으로 stream이 고정됨
-- `output_mode`: `METADATA_ONLY` 또는 `MOSAIC_JPEG`. stream 도중 변경할 수 없음
+- `output_mode`: `METADATA_ONLY` 또는 `MOSAIC_JPEG`. 생략하면 `MOSAIC_JPEG`이며 stream 도중
+  변경할 수 없음
 
 Response `ProcessedVideoChunk`:
 
-- `data`: 항상 empty
-- `mosaic_jpeg`: `MOSAIC_JPEG` 성공 응답에만 존재하는 Q90 서버 합성 JPEG
+- `data`: `MOSAIC_JPEG` 성공 응답의 Q90 서버 합성 JPEG
+- `mosaic_jpeg`: wire 호환을 위해 남겨 둔 deprecated alias이며 항상 empty
 - `status_message`: `success` 또는 `failed`
 - `faces`: bbox, polygon, confidence, track ID, hold 상태, `whitelisted` 판정
 - `timing`, `stats`: 단계별 시간과 detection/tracking 통계
@@ -250,9 +253,9 @@ Response `ProcessedVideoChunk`:
 모자이크할 mask만 union한 뒤 유효 시그마를 유지한 축소 ROI에서 Gaussian Blur를 한 번
 계산하고 JPEG를 인코딩합니다. whitelist mask와 보호 mask가 겹치면 보호 mask가 우선합니다.
 invalid JPEG와 invalid batch는 해당 frame만 실패하고 stream을 유지합니다. inference,
-tracking, mosaic, serialization 실패는 pixel 없는 terminal error 후 stream을 닫습니다. inference timeout은
-health를 `NOT_SERVING`으로 바꾸며, 이미 시작한 inference가 끝날 때까지 tracker와 stream
-admission을 보존합니다.
+tracking, mosaic, serialization 실패는 pixel 없는 terminal error 후 stream을 닫습니다.
+inference timeout은 health를 `NOT_SERVING`으로 바꾸며, 이미 시작한 inference가 끝날 때까지
+tracker와 stream admission을 보존합니다.
 
 Unary `/AiProcessor/AddWhitelist`는 `FaceData.session_id`와 한 장의 static JPEG, PNG 또는
 WebP를 받습니다. animated PNG/WebP는 거부합니다. 정확히 한 얼굴을 YuNet 5점 landmark로
@@ -310,19 +313,20 @@ protoc -I. \
   protos/ai_processor.proto
 ```
 
-Go 호출부는 모든 `VideoChunk`에 같은 `session_id`와
-`VIDEO_OUTPUT_MODE_MOSAIC_JPEG`를 넣고 `ProcessedVideoChunk.mosaic_jpeg`를 downstream으로
-전달해야 합니다. 최악 조건의 JPEG와 metadata를 받을 수 있도록 channel에는 최소 5 MiB의
-receive limit도 설정합니다. `data`는 deprecated이며 계속 비어 있습니다. 등록 시
-`AddWhitelist(FaceData{session_id, data})`, 상태 확인 시 `GetWhitelistStatus`를 호출해야
-합니다. exemplar 삭제에는 `DeleteWhitelistRequest{session_id, entry_id}`를 사용합니다.
+Go 호출부는 모든 `VideoChunk`에 같은 `session_id`와 가능하면
+`VIDEO_OUTPUT_MODE_MOSAIC_JPEG`를 넣고 `ProcessedVideoChunk.data`를 downstream으로
+전달해야 합니다. 기존 생성 코드처럼 `output_mode`를 보내지 않아도 `data`가 반환됩니다.
+최악 조건의 JPEG와 metadata를 받을 수 있도록 channel에는 최소 5 MiB의 receive limit도
+설정합니다. 등록 시 `AddWhitelist(FaceData{session_id, data})`, 상태 확인 시
+`GetWhitelistStatus`를 호출해야 합니다. exemplar 삭제에는
+`DeleteWhitelistRequest{session_id, entry_id}`를 사용합니다.
 시연용 자동 세션을 사용할 때는 `CreateSession`, 관리 목록은 `ListSessions` stub을 추가로
 생성하고 유휴 세션 정리에는 `DeleteSession`을 사용합니다. `DeleteWhitelist` RPC와
 `GetWhitelistStatusResponse.entry_ids = 4`, `VideoChunk.output_mode = 6`,
 `ProcessedVideoChunk.mosaic_jpeg = 13`은 additive 변경이며 기존 field number와 RPC
-path는 바뀌지 않습니다. 재생성 전 client는 새 JPEG를 읽을 수 없지만 기본 metadata-only
-요청은 계속 유효합니다. Python 서버는
-인증을 하지 않으므로 앞단에서 검증한 세션 값만 전달해야 합니다.
+path는 바뀌지 않습니다. 처리 영상은 기존 field 1인 `data`에 있으므로 재생성 전 client도
+읽을 수 있습니다. Python 서버는 인증을 하지 않으므로 앞단에서 검증한 세션 값만 전달해야
+합니다.
 
 ## 브라우저 gRPC 시연
 

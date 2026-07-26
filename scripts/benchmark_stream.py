@@ -48,7 +48,7 @@ class Sample:
     sent_at: float
     received_at: float
     input_jpeg_bytes: int
-    mosaic_jpeg_bytes: int
+    processed_jpeg_bytes: int
     response_bytes: int
     server_total_ms: float
 
@@ -88,7 +88,7 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
                     f"server error seq={error['seq']} code={error.get('code')}: "
                     f"{error.get('message')}"
                 )
-            metadata, mosaic_jpeg = decode_result(raw)
+            metadata, processed_jpeg = decode_result(raw)
             sequence = metadata["seq"]
             if sequence not in pending:
                 raise RuntimeError(f"unknown or duplicate terminal sequence: {sequence}")
@@ -105,7 +105,7 @@ async def run_stream(url: str, jpegs: list[bytes]) -> tuple[list[Sample], int]:
                     sent_at,
                     received_at,
                     jpeg_bytes,
-                    len(mosaic_jpeg),
+                    len(processed_jpeg),
                     len(raw),
                     server_total,
                 )
@@ -139,7 +139,7 @@ def summarize(
         "max_inflight_at_most_5": max_inflight <= WINDOW,
         "terminal_sequence_complete": [sample.sequence for sample in samples]
         == list(range(1, len(samples) + 1)),
-        "server_mosaic_jpeg": all(sample.mosaic_jpeg_bytes > 0 for sample in samples),
+        "server_processed_jpeg": all(sample.processed_jpeg_bytes > 0 for sample in samples),
         "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
@@ -154,7 +154,9 @@ def summarize(
             "server_total_ms": distribution(server),
             "latency_growth_ms": round(latency_growth_ms, 2),
             "input_jpeg_bytes": distribution([sample.input_jpeg_bytes for sample in samples]),
-            "mosaic_jpeg_bytes": distribution([sample.mosaic_jpeg_bytes for sample in samples]),
+            "processed_jpeg_bytes": distribution(
+                [sample.processed_jpeg_bytes for sample in samples]
+            ),
             "response_bytes": distribution([sample.response_bytes for sample in samples]),
         },
         "provenance": {

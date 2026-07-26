@@ -529,10 +529,10 @@ class GrpcWebSocketSession:
 
         payload = self._result_payload(response, round_trip_ms)
         try:
-            encoded = encode_result(payload, bytes(response.mosaic_jpeg))
+            encoded = encode_result(payload, bytes(response.data))
         except (AttributeError, TypeError, ValueError) as error:
             raise VideoClientError(
-                f"gRPC result for frame {sequence} has no valid mosaic JPEG"
+                f"gRPC result for frame {sequence} has no valid processed JPEG"
             ) from error
         self._complete_frame(sequence)
         await self._send_bytes(encoded)

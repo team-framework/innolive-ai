@@ -67,10 +67,16 @@ class VideoResult:
     response: ai_processor_pb2.ProcessedVideoChunk
 
     @property
-    def mosaic_jpeg(self) -> bytes:
-        """Return only server-processed pixels; never substitute the source frame."""
+    def processed_jpeg(self) -> bytes:
+        """Return the canonical server-processed JPEG from ``response.data``."""
 
-        return bytes(self.response.mosaic_jpeg)
+        return bytes(self.response.data)
+
+    @property
+    def mosaic_jpeg(self) -> bytes:
+        """Compatibility name for :attr:`processed_jpeg`."""
+
+        return self.processed_jpeg
 
 
 FrameSource = Iterable[VideoFrame] | AsyncIterable[VideoFrame]
@@ -650,10 +656,6 @@ class VideoProcessorClient:
             raise VideoProtocolError(
                 f"frame {source.frame_id} response exceeded the gRPC response limit"
             )
-        if bytes(response.data):
-            raise VideoProtocolError(
-                f"frame {source.frame_id} response echoed forbidden pixel data"
-            )
         response_frame_id = int(response.frame_id)
         if response_frame_id != source.frame_id:
             raise VideoProtocolError(
@@ -667,20 +669,24 @@ class VideoProcessorClient:
 
         status, detail = _response_status(response)
         if status == "error":
-            if bytes(response.mosaic_jpeg):
+            if bytes(response.data) or bytes(response.mosaic_jpeg):
                 raise VideoProtocolError(
-                    f"frame {source.frame_id} error response contained mosaic pixels"
+                    f"frame {source.frame_id} error response contained pixel data"
                 )
             if raise_frame_errors:
                 raise VideoFrameError(source.frame_id, detail)
             return
         if response.error_code or response.error_message:
             raise VideoProtocolError(f"frame {source.frame_id} success response contained an error")
+        if bytes(response.mosaic_jpeg):
+            raise VideoProtocolError(
+                f"frame {source.frame_id} response used deprecated mosaic_jpeg data"
+            )
         try:
-            _validate_jpeg(response.mosaic_jpeg)
+            _validate_jpeg(response.data)
         except (TypeError, ValueError) as error:
             raise VideoProtocolError(
-                f"frame {source.frame_id} returned an invalid mosaic JPEG: {error}"
+                f"frame {source.frame_id} returned invalid processed data: {error}"
             ) from error
 
 

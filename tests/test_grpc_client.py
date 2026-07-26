@@ -164,24 +164,27 @@ class ClientContractServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 inference_batch_size=1,
                 server_total_ms=1.0,
             ),
-            mosaic_jpeg=_jpeg(224),
+            data=_jpeg(224),
         )
 
     def _special_response(self, request):
         response = self._success(request)
-        if self.mode == "pixel_echo":
-            response.data = request.data
+        if self.mode == "deprecated_alias":
+            response.mosaic_jpeg = request.data
         elif self.mode == "reorder":
             response.frame_id += 1
-        elif self.mode == "frame_error":
+        elif self.mode in {"frame_error", "frame_error_data", "frame_error_alias"}:
             response.status_message = "failed"
             response.error_code = "INFERENCE_FAILED"
             response.error_message = "frame inference failed"
-            response.mosaic_jpeg = b""
-        elif self.mode == "missing_mosaic":
-            response.mosaic_jpeg = b""
-        elif self.mode == "invalid_mosaic":
-            response.mosaic_jpeg = b"not-a-complete-jpeg"
+            if self.mode != "frame_error_data":
+                response.data = b""
+            if self.mode == "frame_error_alias":
+                response.mosaic_jpeg = request.data
+        elif self.mode == "missing_data":
+            response.data = b""
+        elif self.mode == "invalid_data":
+            response.data = b"not-a-complete-jpeg"
         else:
             raise AssertionError(f"unknown test mode: {self.mode}")
         return response
@@ -401,11 +404,13 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             [result.source_jpeg for result in results],
             jpegs,
         )
-        self.assertTrue(all(result.mosaic_jpeg == _jpeg(224) for result in results))
-        self.assertTrue(all(result.mosaic_jpeg != result.source_jpeg for result in results))
+        self.assertTrue(all(result.processed_jpeg == _jpeg(224) for result in results))
+        self.assertTrue(all(result.mosaic_jpeg == result.processed_jpeg for result in results))
+        self.assertTrue(all(result.processed_jpeg != result.source_jpeg for result in results))
         self.assertTrue(all(result.response.timestamp > 0 for result in results))
         self.assertEqual(max_inflight, 5)
-        self.assertTrue(all(result.response.data == b"" for result in results))
+        self.assertTrue(all(result.response.data == result.processed_jpeg for result in results))
+        self.assertTrue(all(result.response.mosaic_jpeg == b"" for result in results))
         self.assertTrue(
             all(request.session_id == "client-session" for request in loopback.servicer.requests)
         )
@@ -416,8 +421,8 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_success_without_a_valid_server_mosaic_fails_closed(self):
-        for mode in ("missing_mosaic", "invalid_mosaic"):
+    async def test_success_without_valid_processed_data_fails_closed(self):
+        for mode in ("missing_data", "invalid_data"):
             with self.subTest(mode=mode):
                 async with (
                     ClientLoopback(mode) as loopback,
@@ -448,7 +453,7 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             width=640,
             height=640,
             frame_id=4,
-            mosaic_jpeg=large_mosaic.tobytes(),
+            data=large_mosaic.tobytes(),
         )
         self.assertGreater(response.ByteSize(), MAX_RESPONSE_BYTES)
         self.assertLess(response.ByteSize(), MAX_GRPC_RESPONSE_BYTES)
@@ -498,8 +503,23 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].response.error_code, "INFERENCE_FAILED")
 
-    async def test_pixel_echo_and_reordered_response_fail_closed(self):
-        for mode in ("pixel_echo", "reorder"):
+    async def test_error_responses_with_any_pixels_fail_closed(self):
+        for mode in ("frame_error_data", "frame_error_alias"):
+            with self.subTest(mode=mode):
+                async with (
+                    ClientLoopback(mode) as loopback,
+                    VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+                ):
+                    with self.assertRaises(VideoProtocolError):
+                        async for _ in client.process_jpegs(
+                            [_jpeg(2)],
+                            session_id="client-session",
+                            raise_frame_errors=False,
+                        ):
+                            pass
+
+    async def test_deprecated_alias_and_reordered_response_fail_closed(self):
+        for mode in ("deprecated_alias", "reorder"):
             with self.subTest(mode=mode):
                 async with ClientLoopback(mode) as loopback:
                     async with VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client:

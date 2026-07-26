@@ -43,7 +43,7 @@ class FakeGrpcClient:
         self.sessions: dict[str, int] = {}
         self.active_stream_counts: dict[str, int] = {}
         self.created_sessions = 0
-        self.mosaic_jpeg = jpeg(value=192)
+        self.processed_jpeg = jpeg(value=192)
 
     async def __aenter__(self):
         return self
@@ -195,13 +195,14 @@ class FakeGrpcClient:
                 error_code="INFERENCE_FAILED",
                 error_message="injected inference failure",
             )
-        if self.mode == "invalid_mosaic":
-            mosaic_jpeg = b"not-a-jpeg"
-        elif self.mode == "missing_mosaic":
-            mosaic_jpeg = b""
+        if self.mode == "invalid_data":
+            processed_jpeg = b"not-a-jpeg"
+        elif self.mode == "missing_data":
+            processed_jpeg = b""
         else:
-            mosaic_jpeg = self.mosaic_jpeg
+            processed_jpeg = self.processed_jpeg
         return ai_processor_pb2.ProcessedVideoChunk(
+            data=processed_jpeg,
             timestamp=frame.timestamp,
             status_message="success",
             width=64,
@@ -234,7 +235,6 @@ class FakeGrpcClient:
                 inference_batch_size=1,
             ),
             stats=ai_processor_pb2.FrameStats(tracker_frame=frame.frame_id),
-            mosaic_jpeg=mosaic_jpeg,
         )
 
 
@@ -290,7 +290,7 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(result["timing_ms"]["blur_encode"], 0.4)
         self.assertNotIn("jpeg", result)
         self.assertNotIn("data", result)
-        self.assertEqual(result_jpeg, fake.mosaic_jpeg)
+        self.assertEqual(result_jpeg, fake.processed_jpeg)
         self.assertNotEqual(result_jpeg, source_jpeg)
         self.assertTrue(result["objects"][0]["whitelisted"])
         self.assertEqual(result["session_id"], "demo-session")
@@ -500,8 +500,8 @@ class GrpcDemoGatewayTests(unittest.TestCase):
 
         self.assertEqual((error["seq"], error["code"]), (5, "INFERENCE_FAILED"))
 
-    def test_missing_or_invalid_server_mosaic_fails_closed(self):
-        for mode in ("missing_mosaic", "invalid_mosaic"):
+    def test_missing_or_invalid_server_processed_jpeg_fails_closed(self):
+        for mode in ("missing_data", "invalid_data"):
             with self.subTest(mode=mode):
                 application, _ = app(FakeGrpcClient(mode=mode))
                 with (
