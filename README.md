@@ -168,3 +168,18 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 ├── tests/                   # Python·Node 회귀 테스트
 ├── web/                     # browser demo client
 ```
+
+## 라이선스
+
+별도 표시된 제3자 구성요소를 제외하고, 이 저장소에서 자체 작성한 source code는
+[GNU Affero General Public License v3.0 only](LICENSE)로 배포합니다. Ultralytics runtime과
+YOLO 학습 checkpoint도 upstream의 기본 AGPL-3.0 조건을 따릅니다. 수정본을 network
+service로 운영할 때에는 AGPL v3 제13조에 따라 원격 사용자에게 해당 version의
+Corresponding Source를 받을 수 있는 방법을 제공해야 합니다.
+
+모델과 학습 데이터의 권리는 source code 라이선스와 별도로 확인해야 합니다. 특히
+`models/best.pt`는 WIDER FACE 기반 학습 이력이 있으므로, 이 저장소의 AGPL 표시는 해당
+checkpoint의 상업적 이용 가능성을 보증하지 않습니다. 상업 배포 전에는 WIDER FACE 관련
+권리를 별도로 검토하거나, 용도가 명확히 허용된 데이터로 다시 학습한 checkpoint로
+교체해야 합니다. Ultralytics, WIDER FACE, SAM 3.1, AdaFace, YuNet 관련 범위와 고지는
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.
