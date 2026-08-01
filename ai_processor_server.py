@@ -36,7 +36,7 @@ from service.adaface_model import (
     FaceCountError,
     FaceTooSmallError,
 )
-from service.frame import FrameLimits, decode_image, decode_jpeg
+from service.frame import MAX_LONG_EDGE, MIN_FRAME_DIMENSION, FrameLimits, decode_image, decode_jpeg
 from service.grpc_config import listen_address, server_options
 from service.mosaic import mosaic_jpeg
 from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
@@ -96,6 +96,7 @@ class GrpcServerSettings:
     max_sessions: int = MAX_SESSIONS
     max_whitelist_entries: int = 32
     max_jpeg_bytes: int = MAX_JPEG_BYTES
+    max_long_edge: int = MAX_LONG_EDGE
     inference_timeout_seconds: float = 1.5
     shutdown_grace_seconds: float = 5.0
     ssl_certfile: Path | None = None
@@ -112,6 +113,8 @@ class GrpcServerSettings:
             raise ValueError("max_whitelist_entries must be at least one")
         if not 1 <= self.max_jpeg_bytes <= MAX_JPEG_BYTES:
             raise ValueError(f"max_jpeg_bytes must be in 1..{MAX_JPEG_BYTES}")
+        if self.max_long_edge < MIN_FRAME_DIMENSION:
+            raise ValueError(f"max_long_edge must be at least {MIN_FRAME_DIMENSION}")
         if not math.isfinite(self.inference_timeout_seconds) or self.inference_timeout_seconds <= 0:
             raise ValueError("inference_timeout_seconds must be positive")
         if not math.isfinite(self.shutdown_grace_seconds) or self.shutdown_grace_seconds < 0:
@@ -155,7 +158,11 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.tracker_factory = tracker_factory
         self.mark_unhealthy = mark_unhealthy
         self.active_streams = 0
-        self.frame_limits = FrameLimits(max_jpeg_bytes=settings.max_jpeg_bytes)
+        self.frame_limits = FrameLimits(
+            max_jpeg_bytes=settings.max_jpeg_bytes,
+            max_long_edge=settings.max_long_edge,
+            max_pixels=settings.max_long_edge * settings.max_long_edge,
+        )
         self._inference_tasks: set[asyncio.Task] = set()
         self._mosaic_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -968,6 +975,12 @@ def parse_args() -> argparse.Namespace:
         default=positive_int(os.getenv("MAX_WHITELIST_ENTRIES", "32")),
     )
     parser.add_argument(
+        "--max-long-edge",
+        type=positive_int,
+        default=positive_int(os.getenv("MAX_LONG_EDGE", str(MAX_LONG_EDGE))),
+        help="Long-edge ceiling for decoded frames (default supports FHD; lower to pin the profile, e.g. 640).",
+    )
+    parser.add_argument(
         "--inference-timeout",
         type=float,
         default=float(os.getenv("GRPC_INFERENCE_TIMEOUT", "1.5")),
@@ -1019,6 +1032,7 @@ def main() -> None:
         port=arguments.port,
         max_sessions=arguments.max_sessions,
         max_whitelist_entries=arguments.max_whitelist_entries,
+        max_long_edge=arguments.max_long_edge,
         inference_timeout_seconds=arguments.inference_timeout,
         shutdown_grace_seconds=arguments.shutdown_grace,
         ssl_certfile=arguments.ssl_certfile,
