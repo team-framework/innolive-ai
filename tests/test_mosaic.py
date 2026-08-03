@@ -6,7 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from service.mosaic import mosaic_jpeg
+from service.mosaic import _feathered_mask, mosaic_jpeg
 
 
 def _decode(jpeg: bytes) -> np.ndarray:
@@ -78,6 +78,35 @@ class MosaicTests(unittest.TestCase):
         self.assertEqual(blur.call_count, 0)
         self.assertTrue(payload.startswith(b"\xff\xd8"))
         self.assertTrue(payload.endswith(b"\xff\xd9"))
+
+    def test_feathered_mask_keeps_face_opaque_and_softens_only_its_outer_edge(self):
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        mask[25:56, 25:56] = 255
+
+        feathered = _feathered_mask(mask)
+
+        self.assertTrue(np.all(feathered[mask != 0] == 255))
+        self.assertGreater(int(feathered[40, 20]), 0)
+        self.assertLess(int(feathered[40, 20]), 255)
+        self.assertEqual(int(feathered[40, 15]), 0)
+
+    def test_protected_blur_tapers_into_the_scene_outside_the_face_mask(self):
+        output = _decode(
+            mosaic_jpeg(
+                self.image,
+                [
+                    {
+                        "whitelisted": False,
+                        "mask_polygon": [[40, 30], [120, 30], [120, 90], [40, 90]],
+                    }
+                ],
+            )
+        )
+
+        outer_edge_difference = np.abs(
+            output[45:75, 34:40].astype(np.int16) - self.image[45:75, 34:40].astype(np.int16)
+        )
+        self.assertGreater(float(outer_edge_difference.mean()), 2)
 
     def test_invalid_protected_polygon_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "invalid mask polygon"):

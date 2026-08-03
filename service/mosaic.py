@@ -11,8 +11,9 @@ import numpy as np
 from service.protocol import MAX_JPEG_BYTES
 
 JPEG_QUALITY = 90
-BLUR_SIGMA = 24.0
-BLUR_DOWNSAMPLE = 4
+BLUR_SIGMA = 16.0
+BLUR_DOWNSAMPLE = 2
+MASK_FEATHER_RADIUS = 8
 MAX_MASK_POINTS = 64
 
 
@@ -28,8 +29,9 @@ def mosaic_jpeg(
         raise ValueError(f"mosaic byte limit must be in 1..{MAX_JPEG_BYTES}")
 
     mask = _protected_mask(image.shape[:2], objects)
+    blend_mask = _feathered_mask(mask)
     output = image
-    mask_rows, mask_columns = np.nonzero(mask)
+    mask_rows, mask_columns = np.nonzero(blend_mask)
     if mask_rows.size:
         padding = math.ceil(BLUR_SIGMA * 3)
         top = max(0, int(mask_rows.min()) - padding)
@@ -54,11 +56,11 @@ def mosaic_jpeg(
             interpolation=cv2.INTER_LINEAR,
         )
         output = image.copy()
-        np.copyto(
-            output[top:bottom, left:right],
-            blurred,
-            where=mask[top:bottom, left:right, None] != 0,
-        )
+        alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
+        inverse_alpha = 255 - alpha
+        output[top:bottom, left:right] = (
+            region.astype(np.uint32) * inverse_alpha + blurred.astype(np.uint32) * alpha + 127
+        ) // 255
 
     try:
         encoded, payload = cv2.imencode(
@@ -90,6 +92,26 @@ def _protected_mask(
         polygon = _polygon(item.get("mask_polygon"), width, height)
         cv2.fillPoly(mask, [polygon], 255)
     return mask
+
+
+def _feathered_mask(mask: np.ndarray) -> np.ndarray:
+    """Extend the protected area and taper only its outer boundary.
+
+    The source face pixels always remain at full opacity.  The short outer
+    taper blends the already-strongly blurred image into the scene instead of
+    leaving a conspicuous hard edge around the segmentation polygon.
+    """
+    if not np.any(mask):
+        return mask
+
+    kernel_size = MASK_FEATHER_RADIUS * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    expanded = cv2.dilate(mask, kernel)
+    distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    alpha = np.minimum(distance / MASK_FEATHER_RADIUS, 1.0) * 255.0
+    feathered = np.rint(alpha).astype(np.uint8)
+    feathered[mask != 0] = 255
+    return feathered
 
 
 def _polygon(value: Any, width: int, height: int) -> np.ndarray:
