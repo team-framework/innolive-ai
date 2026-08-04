@@ -18,6 +18,7 @@ from ai_processor_server import (
 )
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.adaface_model import FaceAlignmentError, FaceCountError, FaceTooSmallError
+from service.frame import MAX_LONG_EDGE
 from service.recognition import SessionRegistry
 from service.runtime import InferenceFailure, RuntimeConfig
 
@@ -229,10 +230,12 @@ class LoopbackServer:
         inference_timeout_seconds: float = 1.5,
         adaface: FakeAdaFace | None = None,
         max_sessions: int = 1_024,
+        max_long_edge: int = MAX_LONG_EDGE,
     ):
         self.runtime = runtime
         self.inference_timeout_seconds = inference_timeout_seconds
         self.adaface = adaface
+        self.max_long_edge = max_long_edge
         self.sessions = SessionRegistry(max_sessions=max_sessions)
         self.trackers: list[FakeTracker] = []
         self.bundle = None
@@ -253,6 +256,7 @@ class LoopbackServer:
             port=0,
             inference_timeout_seconds=self.inference_timeout_seconds,
             shutdown_grace_seconds=0,
+            max_long_edge=self.max_long_edge,
         )
         self.bundle = build_grpc_server(
             settings,
@@ -287,6 +291,20 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=RuntimeConfig(engine=Path("unused.engine")),
                 max_sessions=1_025,
             )
+
+    async def test_max_long_edge_below_minimum_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "max_long_edge"):
+            GrpcServerSettings(
+                runtime=RuntimeConfig(engine=Path("unused.engine")),
+                max_long_edge=16,
+            )
+
+    async def test_frame_limits_track_the_configured_long_edge(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime, max_long_edge=1280) as server:
+            limits = server.bundle.servicer.frame_limits
+            self.assertEqual(limits.max_long_edge, 1280)
+            self.assertEqual(limits.max_pixels, 1280 * 1280)
 
     async def test_process_cannot_silently_share_an_existing_port(self):
         runtime = FakeRuntime()
