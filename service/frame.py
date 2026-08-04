@@ -11,7 +11,11 @@ import numpy as np
 from service.protocol import MAX_JPEG_BYTES
 
 MIN_FRAME_DIMENSION = 32
-MAX_LONG_EDGE = 640
+# Long-edge ceiling for a decoded frame. FHD (1920x1080) is the largest source
+# the serving profile accepts: the detector letterboxes to imgsz=640 internally
+# ("detect small") while the mosaic blur runs at full resolution ("blur big"),
+# so raising this from the original 640 preserves output quality up to FHD.
+MAX_LONG_EDGE = 1920
 MAX_PIXELS = MAX_LONG_EDGE * MAX_LONG_EDGE
 _JPEG_START_OF_FRAME_MARKERS = frozenset(
     {

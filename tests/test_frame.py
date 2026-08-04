@@ -66,10 +66,10 @@ class FrameBoundaryTests(unittest.TestCase):
                 self.assertEqual(decoded.shape, image.shape)
 
     def test_png_dimensions_are_rejected_before_decode(self):
-        oversized = _png_header(641, 640)
+        oversized = _png_header(1921, 640)
         with (
             patch("service.frame.cv2.imdecode") as decoder,
-            self.assertRaisesRegex(ValueError, "long-edge 640"),
+            self.assertRaisesRegex(ValueError, "long-edge 1920"),
         ):
             decode_image(oversized)
 
@@ -104,9 +104,28 @@ class FrameBoundaryTests(unittest.TestCase):
     def test_declared_oversized_dimensions_are_rejected_before_decode(self):
         with (
             patch("service.frame.cv2.imdecode") as decoder,
-            self.assertRaisesRegex(ValueError, "long-edge 640"),
+            self.assertRaisesRegex(ValueError, "long-edge 1920"),
         ):
-            decode_jpeg(_jpeg_header(640, 641))
+            decode_jpeg(_jpeg_header(640, 1921))
+
+        decoder.assert_not_called()
+
+    def test_fhd_dimensions_are_accepted(self):
+        image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        success, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(success)
+        decoded = decode_jpeg(encoded.tobytes())
+        self.assertEqual(decoded.shape, (1080, 1920, 3))
+
+    def test_pixel_area_over_the_limit_is_rejected_before_decode(self):
+        # A caller may cap area below max_long_edge**2 (e.g. FHD area). A frame
+        # within the long edge but over that area is rejected before cv2 runs.
+        limits = FrameLimits(max_long_edge=1920, max_pixels=1920 * 1080)
+        with (
+            patch("service.frame.cv2.imdecode") as decoder,
+            self.assertRaisesRegex(ValueError, "pixel limit"),
+        ):
+            decode_jpeg(_jpeg_header(1920, 1200), limits)
 
         decoder.assert_not_called()
 
