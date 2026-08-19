@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 IMAGE_SIZE = 640
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
-EXPECTED_CLASS_NAMES = {0: "face"}
+EXPECTED_CLASS_NAMES = {0: "face", 1: "number_plate"}
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
@@ -106,7 +106,7 @@ def validate_engine(config: RuntimeConfig) -> dict[str, Any]:
         "dynamic": False,
         "batch": 1,
         "image_size": IMAGE_SIZE,
-        "class_names": {"0": "face"},
+        "class_names": {str(key): value for key, value in EXPECTED_CLASS_NAMES.items()},
     }
     for key, expected in required.items():
         if manifest.get(key) != expected:

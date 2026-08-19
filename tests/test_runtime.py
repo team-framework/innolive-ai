@@ -21,7 +21,7 @@ class RuntimeContractTests(unittest.TestCase):
             "dynamic": False,
             "batch": 1,
             "image_size": 640,
-            "class_names": {"0": "face"},
+            "class_names": {"0": "face", "1": "number_plate"},
             "source_checkpoint": "best.pt",
             "source_sha256": hashlib.sha256(b"checkpoint").hexdigest(),
             "engine_sha256": hashlib.sha256(b"engine").hexdigest(),

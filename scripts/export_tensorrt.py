@@ -183,7 +183,7 @@ def _manifest(
         "dynamic": False,
         "batch": 1,
         "image_size": IMAGE_SIZE,
-        "class_names": {"0": "face"},
+        "class_names": {str(key): value for key, value in EXPECTED_CLASS_NAMES.items()},
         "workspace_gib": workspace,
         "gpu": torch.cuda.get_device_name(device_index),
         "torch": torch.__version__,
