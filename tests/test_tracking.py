@@ -23,9 +23,9 @@ def boxes(*rows: tuple[float, float, float, float, float, float]) -> Boxes:
 class TrackingTests(unittest.TestCase):
     def test_fixed_threshold_contract(self):
         self.assertEqual(DETECTOR_CONFIDENCE, 0.01)
-        self.assertEqual(CONTINUATION_CONFIDENCE, 0.05)
+        self.assertEqual(CONTINUATION_CONFIDENCE, 0.02)
         self.assertEqual(ACTIVATION_CONFIDENCE, 0.25)
-        self.assertEqual(MAX_MASK_HOLD_FRAMES, 1)
+        self.assertEqual(MAX_MASK_HOLD_FRAMES, 30)
         self.assertEqual(HOLD_CONFIDENCE_DECAY, 0.90)
 
     def test_each_connection_has_an_independent_id_counter(self):
@@ -35,7 +35,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(int(first[0, 4]), 1)
         self.assertEqual(int(second[0, 4]), 1)
 
-    def test_detector_mask_is_held_for_exactly_one_missing_frame(self):
+    def test_mask_hold_is_fail_closed_until_the_track_buffer_expires(self):
         image = np.zeros((640, 640, 3), dtype=np.uint8)
         tracker = StreamTracker()
         tracked = tracker.update(boxes((20, 20, 100, 100, 0.90, 0)), image)
@@ -58,17 +58,46 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(detected[0]["source"], "detected")
 
         empty = boxes()
-        tracker.update(empty, image)
-        held, metrics = tracker.stabilize([], 640, 640)
-        self.assertEqual(metrics["held_tracks"], 1)
-        self.assertEqual(held[0]["source"], "held")
-        self.assertEqual(held[0]["hold_frames"], 1)
-        self.assertAlmostEqual(held[0]["confidence"], 0.81)
+        for gap in range(1, MAX_MASK_HOLD_FRAMES + 1):
+            tracker.update(empty, image)
+            held, metrics = tracker.stabilize([], 640, 640)
+            self.assertEqual(metrics["held_tracks"], 1, f"detection gap={gap}")
+            self.assertEqual(held[0]["source"], "held")
+            self.assertEqual(held[0]["hold_frames"], gap)
+            self.assertAlmostEqual(
+                held[0]["confidence"], round(0.90 * HOLD_CONFIDENCE_DECAY**gap, 4)
+            )
 
         tracker.update(empty, image)
         expired, metrics = tracker.stabilize([], 640, 640)
         self.assertEqual(expired, [])
         self.assertEqual(metrics["held_tracks"], 0)
+
+    def test_weak_tilted_detection_continues_the_track_instead_of_dropping(self):
+        image = np.zeros((640, 640, 3), dtype=np.uint8)
+        tracker = StreamTracker()
+        tracker.update(boxes((20, 20, 100, 100, 0.90, 0)), image)
+        weak = tracker.update(boxes((24, 22, 102, 104, 0.03, 0)), image)
+        self.assertEqual(len(weak), 1)
+        track_id = int(weak[0, 4])
+
+        objects, metrics = tracker.stabilize(
+            [
+                {
+                    "track_id": track_id,
+                    "class_id": 0,
+                    "class_name": "face",
+                    "confidence": 0.03,
+                    "bbox": [24, 22, 102, 104],
+                    "mask_polygon": [[24, 22], [102, 22], [102, 104], [24, 104]],
+                    "mask_area_px": 6464,
+                }
+            ],
+            640,
+            640,
+        )
+        self.assertEqual(objects[0]["source"], "continued_low")
+        self.assertEqual(metrics["low_confidence_continuations"], 1)
 
 
 if __name__ == "__main__":
