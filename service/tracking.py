@@ -1,4 +1,4 @@
-"""Connection-local BoT-SORT with one-frame segmentation mask hold."""
+"""Connection-local BoT-SORT with a fail-closed segmentation mask hold."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from ultralytics.utils import YAML, IterableSimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "botsort.yaml"
 DETECTOR_CONFIDENCE = 0.01
-CONTINUATION_CONFIDENCE = 0.05
+CONTINUATION_CONFIDENCE = 0.02
 ACTIVATION_CONFIDENCE = 0.25
-MAX_MASK_HOLD_FRAMES = 1
+MAX_MASK_HOLD_FRAMES = 30
 HOLD_CONFIDENCE_DECAY = 0.90
 
 
@@ -88,7 +88,7 @@ class StreamTracker:
         if values.get("tracker_type") != "botsort":
             raise ValueError("tracker_type must be botsort")
         if float(values.get("track_low_thresh", -1)) != CONTINUATION_CONFIDENCE:
-            raise ValueError("track_low_thresh must be 0.05")
+            raise ValueError("track_low_thresh must be 0.02")
         if float(values.get("track_high_thresh", -1)) != ACTIVATION_CONFIDENCE:
             raise ValueError("track_high_thresh must be 0.25")
         if float(values.get("new_track_thresh", -1)) != ACTIVATION_CONFIDENCE:
@@ -98,6 +98,7 @@ class StreamTracker:
         self.config_path = config_path
         self._tracker = _ConnectionBOTSORT(IterableSimpleNamespace(**values))
         self._masks: dict[int, _MaskState] = {}
+        self.hold_limit = max(1, int(values.get("track_buffer", MAX_MASK_HOLD_FRAMES)))
 
     @property
     def frame_id(self) -> int:
@@ -170,7 +171,7 @@ class StreamTracker:
             if state is None or track_id in current_ids:
                 continue
             gap = self.frame_id - state.last_detection_frame
-            if gap != MAX_MASK_HOLD_FRAMES:
+            if not 1 <= gap <= self.hold_limit:
                 continue
             target = np.asarray(lost.xyxy, dtype=np.float32).reshape(4)
             target[[0, 2]] = np.clip(target[[0, 2]], 0, width - 1)
@@ -188,7 +189,7 @@ class StreamTracker:
                     "class_id": state.class_id,
                     "class_name": state.class_name,
                     "confidence": round(
-                        state.confidence * HOLD_CONFIDENCE_DECAY,
+                        state.confidence * HOLD_CONFIDENCE_DECAY**gap,
                         4,
                     ),
                     "bbox": [round(float(value), 1) for value in target],
@@ -196,15 +197,15 @@ class StreamTracker:
                     "mask_area_px": round(_polygon_area(polygon), 1),
                     "source": "held",
                     "held": True,
-                    "hold_frames": 1,
-                    "hold_limit": 1,
+                    "hold_frames": gap,
+                    "hold_limit": self.hold_limit,
                 }
             )
         return held
 
     def _prune_masks(self) -> None:
         for track_id, state in list(self._masks.items()):
-            if self.frame_id - state.last_detection_frame > 30:
+            if self.frame_id - state.last_detection_frame > self.hold_limit:
                 del self._masks[track_id]
 
     def reset(self) -> None:

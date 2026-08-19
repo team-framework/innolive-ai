@@ -1,7 +1,9 @@
 # BoT-SORT settings tuned for stable face masks in a real-time video stream.
 tracker_type: botsort
 track_high_thresh: 0.25
-track_low_thresh: 0.05
+# Weak tilted/occluded face detections still continue a track instead of
+# dropping protection for the frame.
+track_low_thresh: 0.02
 new_track_thresh: 0.25
 track_buffer: 30
 match_thresh: 0.80
@@ -11,7 +13,8 @@ fuse_score: true
 gmc_method: sparseOptFlow
 
 # ReID adds another model and synchronization point. Motion + IoU association is
-# faster for the short face occlusions handled by mask_hold_frames.
+# enough for face streams; the last segmentation mask is held fail-closed for
+# up to track_buffer frames after the detection drops.
 proximity_thresh: 0.50
 appearance_thresh: 0.80
 with_reid: false
