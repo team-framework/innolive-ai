@@ -86,9 +86,10 @@ class MosaicTests(unittest.TestCase):
         feathered = _feathered_mask(mask)
 
         self.assertTrue(np.all(feathered[mask != 0] == 255))
-        self.assertGreater(int(feathered[40, 20]), 0)
-        self.assertLess(int(feathered[40, 20]), 255)
-        self.assertEqual(int(feathered[40, 15]), 0)
+        self.assertGreater(int(feathered[40, 23]), 0)
+        self.assertLess(int(feathered[40, 23]), 255)
+        self.assertGreater(int(feathered[40, 21]), 0)
+        self.assertEqual(int(feathered[40, 20]), 0)
 
     def test_protected_blur_tapers_into_the_scene_outside_the_face_mask(self):
         output = _decode(
@@ -104,9 +105,14 @@ class MosaicTests(unittest.TestCase):
         )
 
         outer_edge_difference = np.abs(
-            output[45:75, 34:40].astype(np.int16) - self.image[45:75, 34:40].astype(np.int16)
+            output[45:75, 38:40].astype(np.int16) - self.image[45:75, 38:40].astype(np.int16)
         )
         self.assertGreater(float(outer_edge_difference.mean()), 2)
+
+        scene_difference = np.abs(
+            output[45:75, 32:36].astype(np.int16) - self.image[45:75, 32:36].astype(np.int16)
+        )
+        self.assertLess(float(scene_difference.mean()), 5)
 
     def test_invalid_protected_polygon_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "invalid mask polygon"):
