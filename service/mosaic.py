@@ -13,7 +13,7 @@ from service.protocol import MAX_JPEG_BYTES
 JPEG_QUALITY = 90
 BLUR_SIGMA = 16.0
 BLUR_DOWNSAMPLE = 2
-MASK_FEATHER_RADIUS = 8
+MASK_FEATHER_RADIUS = 2
 MAX_MASK_POINTS = 64
 
 
@@ -99,10 +99,13 @@ def _feathered_mask(mask: np.ndarray) -> np.ndarray:
 
     The source face pixels always remain at full opacity.  The short outer
     taper blends the already-strongly blurred image into the scene instead of
-    leaving a conspicuous hard edge around the segmentation polygon.
+    leaving a conspicuous hard edge around the segmentation polygon.  Set
+    ``MASK_FEATHER_RADIUS`` to 0 to blur exactly the segmentation polygon.
     """
     if not np.any(mask):
         return mask
+    if MASK_FEATHER_RADIUS <= 0:
+        return (mask != 0).astype(np.uint8) * 255
 
     kernel_size = MASK_FEATHER_RADIUS * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
