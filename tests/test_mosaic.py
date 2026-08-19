@@ -88,7 +88,8 @@ class MosaicTests(unittest.TestCase):
         self.assertTrue(np.all(feathered[mask != 0] == 255))
         self.assertGreater(int(feathered[40, 23]), 0)
         self.assertLess(int(feathered[40, 23]), 255)
-        self.assertEqual(int(feathered[40, 21]), 0)
+        self.assertGreater(int(feathered[40, 21]), 0)
+        self.assertEqual(int(feathered[40, 20]), 0)
 
     def test_protected_blur_tapers_into_the_scene_outside_the_face_mask(self):
         output = _decode(

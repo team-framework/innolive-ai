@@ -12,11 +12,9 @@ from service.protocol import MAX_JPEG_BYTES
 
 JPEG_QUALITY = 90
 BLUR_SIGMA = 16.0
-# Blur strength: 1.0 keeps every protected pixel fully blurred.  0.70
-# keeps 30% of the original pixels, weakening the visible blur by 30%.
-BLUR_STRENGTH = 0.70
-BLUR_DOWNSAMPLE = 2
-MASK_FEATHER_RADIUS = 2
+# 2 * 0.7: pixelation softened by 30% while staying fully opaque.
+BLUR_DOWNSAMPLE = 1.4
+MASK_FEATHER_RADIUS = 4
 MAX_MASK_POINTS = 64
 
 
@@ -58,10 +56,6 @@ def mosaic_jpeg(
             (region.shape[1], region.shape[0]),
             interpolation=cv2.INTER_LINEAR,
         )
-        strength = round(BLUR_STRENGTH * 255)
-        blurred = (
-            blurred.astype(np.uint32) * strength + region.astype(np.uint32) * (255 - strength) + 127
-        ) // 255
         output = image.copy()
         alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
         inverse_alpha = 255 - alpha
