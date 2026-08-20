@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
@@ -20,6 +21,8 @@ from service.recognition import validate_entry_id, validate_session_id
 
 MAX_WINDOW = 5
 MAX_FRAME_ID = 2**32 - 1
+MAX_MOSAIC_BLUR_RADIUS = 64.0
+MAX_MOSAIC_PIXEL_SIZE = 8
 
 
 class VideoClientError(RuntimeError):
@@ -51,12 +54,48 @@ class VideoFrameError(VideoClientError):
 
 
 @dataclass(frozen=True, slots=True)
+class MosaicConfig:
+    """Per-frame face mosaic strength; unset fields fall back to server defaults.
+
+    ``blur_radius`` is the Gaussian blur radius in pixels (larger = stronger
+    blur) and ``pixel_size`` is the mosaic block size in pixels (1 disables
+    pixelation). Both may change from frame to frame on one open stream.
+    """
+
+    blur_radius: float | None = None
+    pixel_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.blur_radius is not None:
+            radius = self.blur_radius
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise TypeError("MosaicConfig.blur_radius must be a number of pixels")
+            radius = float(radius)
+            if not math.isfinite(radius) or not 0 < radius <= MAX_MOSAIC_BLUR_RADIUS:
+                raise ValueError(
+                    f"MosaicConfig.blur_radius must be in (0, {MAX_MOSAIC_BLUR_RADIUS}]"
+                )
+            object.__setattr__(self, "blur_radius", radius)
+        if self.pixel_size is not None:
+            size = self.pixel_size
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or not 1 <= size <= MAX_MOSAIC_PIXEL_SIZE
+            ):
+                raise ValueError(
+                    f"MosaicConfig.pixel_size must be an integer in 1..{MAX_MOSAIC_PIXEL_SIZE}"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class VideoFrame:
     """One complete JPEG request; timestamp is an opaque signed int64 value."""
 
     data: bytes
     timestamp: int
     frame_id: int
+    mosaic: MosaicConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,16 +669,21 @@ class VideoProcessorClient:
                     self._max_inflight_observed,
                     len(pending),
                 )
-                await call.write(
-                    ai_processor_pb2.VideoChunk(
-                        data=normalized.data,
-                        timestamp=normalized.timestamp,
-                        frame_id=normalized.frame_id,
-                        batch_size=1,
-                        session_id=session_id,
-                        output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
-                    )
+                chunk = ai_processor_pb2.VideoChunk(
+                    data=normalized.data,
+                    timestamp=normalized.timestamp,
+                    frame_id=normalized.frame_id,
+                    batch_size=1,
+                    session_id=session_id,
+                    output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
                 )
+                config = normalized.mosaic
+                if config is not None:
+                    if config.blur_radius is not None:
+                        chunk.mosaic_config.blur_radius = config.blur_radius
+                    if config.pixel_size is not None:
+                        chunk.mosaic_config.pixel_size = config.pixel_size
+                await call.write(chunk)
             await call.done_writing()
         finally:
             with suppress(Exception):
@@ -740,7 +784,10 @@ def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
         raise ValueError(f"VideoFrame.frame_id must be in 0..{MAX_FRAME_ID}")
     if frame.frame_id <= last_frame_id:
         raise ValueError("VideoFrame.frame_id must be strictly increasing")
-    return VideoFrame(jpeg, frame.timestamp, frame.frame_id)
+    mosaic = frame.mosaic
+    if mosaic is not None and not isinstance(mosaic, MosaicConfig):
+        raise TypeError("VideoFrame.mosaic must be a MosaicConfig instance")
+    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic)
 
 
 def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:

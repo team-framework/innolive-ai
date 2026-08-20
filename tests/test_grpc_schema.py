@@ -34,6 +34,10 @@ class GrpcSchemaContractTests(unittest.TestCase):
                 "frame_id": (3, descriptor_pb2.FieldDescriptorProto.TYPE_INT64),
                 "batch_size": (4, descriptor_pb2.FieldDescriptorProto.TYPE_UINT32),
             },
+            "MosaicConfig": {
+                "blur_radius": (1, descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE),
+                "pixel_size": (2, descriptor_pb2.FieldDescriptorProto.TYPE_UINT32),
+            },
             "ProcessedVideoChunk": {
                 "data": (1, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES),
                 "timestamp": (2, descriptor_pb2.FieldDescriptorProto.TYPE_INT64),
@@ -88,6 +92,14 @@ class GrpcSchemaContractTests(unittest.TestCase):
         face.track_id = 0
         self.assertTrue(face.HasField("track_id"))
 
+        mosaic = ai_processor_pb2.MosaicConfig()
+        self.assertFalse(mosaic.HasField("blur_radius"))
+        self.assertFalse(mosaic.HasField("pixel_size"))
+        mosaic.blur_radius = 24.0
+        mosaic.pixel_size = 2
+        self.assertTrue(mosaic.HasField("blur_radius"))
+        self.assertTrue(mosaic.HasField("pixel_size"))
+
         video = ai_processor_pb2.VideoChunk.DESCRIPTOR
         processed = ai_processor_pb2.ProcessedVideoChunk.DESCRIPTOR
         self.assertTrue(video.fields_by_name["batch_size"].GetOptions().deprecated)
@@ -96,7 +108,8 @@ class GrpcSchemaContractTests(unittest.TestCase):
 
     def test_session_and_whitelist_fields_are_additive(self):
         expected = {
-            "VideoChunk": {"session_id": 5, "output_mode": 6},
+            "VideoChunk": {"session_id": 5, "output_mode": 6, "mosaic_config": 7},
+            "MosaicConfig": {"blur_radius": 1, "pixel_size": 2},
             "ProcessedVideoChunk": {"mosaic_jpeg": 13},
             "FaceMetadata": {"whitelisted": 10},
             "FrameStats": {

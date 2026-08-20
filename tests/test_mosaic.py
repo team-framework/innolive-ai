@@ -6,6 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+import service.mosaic as mosaic
 from service.mosaic import _feathered_mask, mosaic_jpeg
 
 
@@ -120,6 +121,74 @@ class MosaicTests(unittest.TestCase):
                 self.image,
                 [{"whitelisted": False, "mask_polygon": [[1, 1], [2, 2]]}],
             )
+
+
+class MosaicParamTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.image = np.zeros((120, 160, 3), dtype=np.uint8)
+        for row in range(0, 120, 16):
+            for column in range(0, 160, 16):
+                if ((row // 16) + (column // 16)) % 2:
+                    self.image[row : row + 16, column : column + 16] = 255
+        self.objects = [
+            {
+                "whitelisted": False,
+                "mask_polygon": [[40, 30], [120, 30], [120, 90], [40, 90]],
+            }
+        ]
+
+    def test_defaults_are_stronger_than_the_legacy_sigma(self):
+        self.assertEqual(mosaic.DEFAULT_BLUR_RADIUS, 24.0)
+        self.assertEqual(mosaic.DEFAULT_PIXEL_SIZE, 2)
+
+    def test_custom_strength_changes_the_output(self):
+        weak = _decode(
+            mosaic_jpeg(
+                self.image,
+                self.objects,
+                blur_radius=8.0,
+                pixel_size=1,
+            )
+        )
+        default = _decode(mosaic_jpeg(self.image, self.objects))
+
+        original = self.image[40:80, 40:120].astype(np.int16)
+        weak_diff = float(np.abs(weak[40:80, 40:120].astype(np.int16) - original).mean())
+        default_diff = float(np.abs(default[40:80, 40:120].astype(np.int16) - original).mean())
+        # Both settings alter the protected region ...
+        self.assertGreater(weak_diff, 20)
+        self.assertGreater(default_diff, 20)
+        # ... and the stronger default flattens the pattern more than the weak one.
+        weak_std = float(weak[40:80, 40:120].astype(np.int16).std())
+        default_std = float(default[40:80, 40:120].astype(np.int16).std())
+        self.assertGreater(default_diff, weak_diff)
+        self.assertLess(default_std, weak_std)
+
+    def test_pixel_size_one_keeps_pure_gaussian_blur(self):
+        with patch("service.mosaic.cv2.GaussianBlur", wraps=cv2.GaussianBlur) as blur:
+            output = _decode(mosaic_jpeg(self.image, self.objects, blur_radius=12.0, pixel_size=1))
+
+        self.assertEqual(blur.call_count, 1)
+        args, _ = blur.call_args
+        self.assertAlmostEqual(float(args[2]), 12.0)
+        difference = np.abs(
+            output[40:80, 40:120].astype(np.int16) - self.image[40:80, 40:120].astype(np.int16)
+        )
+        self.assertGreater(float(difference.mean()), 20)
+
+    def test_invalid_strength_fails_closed(self):
+        cases = (
+            ({"blur_radius": 0.0}, "blur_radius"),
+            ({"blur_radius": mosaic.MAX_BLUR_RADIUS + 1}, "blur_radius"),
+            ({"blur_radius": float("nan")}, "blur_radius"),
+            ({"blur_radius": float("inf")}, "blur_radius"),
+            ({"pixel_size": 0}, "pixel_size"),
+            ({"pixel_size": mosaic.MAX_PIXEL_SIZE + 1}, "pixel_size"),
+            ({"pixel_size": 2.5}, "pixel_size"),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, expected):
+                mosaic_jpeg(self.image, self.objects, **kwargs)
 
 
 if __name__ == "__main__":

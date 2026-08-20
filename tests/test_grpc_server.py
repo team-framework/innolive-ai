@@ -33,6 +33,15 @@ def _jpeg(width: int = 64, height: int = 36) -> bytes:
     return payload.tobytes()
 
 
+def _striped_jpeg(width: int = 64, height: int = 36) -> bytes:
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:, ::2] = 255
+    encoded, payload = cv2.imencode(".jpg", image)
+    if not encoded:
+        raise RuntimeError("test JPEG encoding failed")
+    return payload.tobytes()
+
+
 def _image(extension: str, width: int = 64, height: int = 36) -> bytes:
     encoded, payload = cv2.imencode(
         extension,
@@ -51,8 +60,9 @@ def _request(
     batch_size: int = 1,
     session_id: str = "session-a",
     output_mode: int = ai_processor_pb2.VIDEO_OUTPUT_MODE_UNSPECIFIED,
+    mosaic_config: ai_processor_pb2.MosaicConfig | None = None,
 ):
-    return ai_processor_pb2.VideoChunk(
+    request = ai_processor_pb2.VideoChunk(
         data=_jpeg() if data is None else data,
         timestamp=timestamp,
         frame_id=frame_id,
@@ -60,6 +70,9 @@ def _request(
         session_id=session_id,
         output_mode=output_mode,
     )
+    if mosaic_config is not None:
+        request.mosaic_config.CopyFrom(mosaic_config)
+    return request
 
 
 async def _requests(*items: Any) -> AsyncIterator[Any]:
@@ -400,6 +413,107 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.data, source)
         self.assertEqual(response.mosaic_jpeg, b"")
+
+    async def test_mosaic_config_changes_in_real_time_within_one_stream(self):
+        source = _striped_jpeg()
+        async with LoopbackServer(FaceRuntime()) as server:
+            responses = await _collect(
+                server.stub.ProcessVideo(
+                    _requests(
+                        _request(
+                            data=source,
+                            frame_id=1,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                        ),
+                        _request(
+                            data=source,
+                            frame_id=2,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                            mosaic_config=ai_processor_pb2.MosaicConfig(
+                                blur_radius=8.0,
+                                pixel_size=1,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(
+            [response.status_message for response in responses], ["success", "success"]
+        )
+        self.assertTrue(all(response.data.startswith(b"\xff\xd8") for response in responses))
+        self.assertTrue(all(response.timing.blur_encode_ms > 0 for response in responses))
+        self.assertNotEqual(responses[0].data, responses[1].data)
+
+    async def test_partial_mosaic_config_keeps_unset_field_at_the_default(self):
+        source = _striped_jpeg()
+        async with LoopbackServer(FaceRuntime()) as server:
+            responses = await _collect(
+                server.stub.ProcessVideo(
+                    _requests(
+                        _request(
+                            data=source,
+                            frame_id=1,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                        ),
+                        _request(
+                            data=source,
+                            frame_id=2,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                            mosaic_config=ai_processor_pb2.MosaicConfig(pixel_size=1),
+                        ),
+                    )
+                )
+            )
+
+        self.assertEqual([r.status_message for r in responses], ["success", "success"])
+        # Only pixel_size changes; the default blur radius stays 24.
+        self.assertNotEqual(responses[0].data, responses[1].data)
+        self.assertTrue(responses[1].timing.blur_encode_ms > 0)
+
+    async def test_invalid_mosaic_config_fails_the_frame_without_pixels_and_keeps_stream(self):
+        async with LoopbackServer(FaceRuntime()) as server:
+            responses = await _collect(
+                server.stub.ProcessVideo(
+                    _requests(
+                        _request(
+                            frame_id=1,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                            mosaic_config=ai_processor_pb2.MosaicConfig(blur_radius=100.0),
+                        ),
+                        _request(
+                            frame_id=2,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                        ),
+                    )
+                )
+            )
+
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0].status_message, "failed")
+        self.assertEqual(responses[0].error_code, "MOSAIC_CONFIG_INVALID")
+        self.assertEqual(responses[0].data, b"")
+        self.assertEqual(responses[0].mosaic_jpeg, b"")
+        self.assertEqual(responses[1].status_message, "success")
+        self.assertTrue(responses[1].data.startswith(b"\xff\xd8"))
+
+    async def test_invalid_mosaic_config_in_metadata_mode_is_ignored(self):
+        async with LoopbackServer(FaceRuntime()) as server:
+            responses = await _collect(
+                server.stub.ProcessVideo(
+                    _requests(
+                        _request(
+                            frame_id=1,
+                            output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY,
+                            mosaic_config=ai_processor_pb2.MosaicConfig(blur_radius=100.0),
+                        )
+                    )
+                )
+            )
+
+        self.assertEqual(responses[0].status_message, "success")
+        self.assertEqual(responses[0].data, b"")
 
     async def test_invalid_protected_mask_never_returns_source_pixels(self):
         async with LoopbackServer(InvalidMaskRuntime()) as server:
