@@ -38,7 +38,12 @@ from service.adaface_model import (
 )
 from service.frame import MAX_LONG_EDGE, MIN_FRAME_DIMENSION, FrameLimits, decode_image, decode_jpeg
 from service.grpc_config import listen_address, server_options
-from service.mosaic import mosaic_jpeg
+from service.mosaic import (
+    DEFAULT_BLUR_RADIUS,
+    DEFAULT_PIXEL_SIZE,
+    mosaic_jpeg,
+    validate_mosaic_params,
+)
 from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
 from service.recognition import (
     RecognitionConfig,
@@ -270,6 +275,27 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 )
             )
 
+        blur_radius = DEFAULT_BLUR_RADIUS
+        pixel_size = DEFAULT_PIXEL_SIZE
+        if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
+            config = request.mosaic_config
+            if request.HasField("mosaic_config"):
+                if config.HasField("blur_radius"):
+                    blur_radius = float(config.blur_radius)
+                if config.HasField("pixel_size"):
+                    pixel_size = int(config.pixel_size)
+                try:
+                    blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
+                except ValueError as error:
+                    return FrameOutcome(
+                        self._error_response(
+                            request,
+                            "MOSAIC_CONFIG_INVALID",
+                            f"mosaic_config rejected: {error}",
+                            received_at,
+                        )
+                    )
+
         try:
             image = await asyncio.to_thread(
                 decode_jpeg,
@@ -333,6 +359,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                                 mosaic_jpeg,
                                 image,
                                 objects,
+                                blur_radius=blur_radius,
+                                pixel_size=pixel_size,
                                 max_bytes=self.settings.max_jpeg_bytes,
                             ),
                         )

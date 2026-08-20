@@ -11,45 +11,69 @@ import numpy as np
 from service.protocol import MAX_JPEG_BYTES
 
 JPEG_QUALITY = 90
-BLUR_SIGMA = 16.0
-# 2 * 0.7: pixelation softened by 30% while staying fully opaque.
-BLUR_DOWNSAMPLE = 1.4
-MASK_FEATHER_RADIUS = 4
+DEFAULT_BLUR_RADIUS = 24.0
+DEFAULT_PIXEL_SIZE = 2
+MAX_BLUR_RADIUS = 64.0
+MAX_PIXEL_SIZE = 8
+MASK_FEATHER_RADIUS = 8
 MAX_MASK_POINTS = 64
+
+
+def validate_mosaic_params(
+    blur_radius: Any,
+    pixel_size: Any,
+) -> tuple[float, int]:
+    """Validate client-supplied mosaic strength and return (radius, size)."""
+    if isinstance(blur_radius, bool) or not isinstance(blur_radius, (int, float)):
+        raise ValueError("blur_radius must be a number of pixels")
+    radius = float(blur_radius)
+    if not math.isfinite(radius) or not 0 < radius <= MAX_BLUR_RADIUS:
+        raise ValueError(f"blur_radius must be in (0, {MAX_BLUR_RADIUS}]")
+    if (
+        isinstance(pixel_size, bool)
+        or not isinstance(pixel_size, int)
+        or not 1 <= pixel_size <= MAX_PIXEL_SIZE
+    ):
+        raise ValueError(f"pixel_size must be an integer in 1..{MAX_PIXEL_SIZE}")
+    return radius, pixel_size
 
 
 def mosaic_jpeg(
     image: np.ndarray,
     objects: list[dict[str, Any]],
     *,
+    blur_radius: float = DEFAULT_BLUR_RADIUS,
+    pixel_size: int = DEFAULT_PIXEL_SIZE,
     max_bytes: int = MAX_JPEG_BYTES,
 ) -> bytes:
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
         raise ValueError("mosaic input must be a uint8 BGR image")
     if not 1 <= max_bytes <= MAX_JPEG_BYTES:
         raise ValueError(f"mosaic byte limit must be in 1..{MAX_JPEG_BYTES}")
+    blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
     mask = _protected_mask(image.shape[:2], objects)
     blend_mask = _feathered_mask(mask)
     output = image
     mask_rows, mask_columns = np.nonzero(blend_mask)
     if mask_rows.size:
-        padding = math.ceil(BLUR_SIGMA * 3)
+        padding = math.ceil(blur_radius * 3)
         top = max(0, int(mask_rows.min()) - padding)
         bottom = min(image.shape[0], int(mask_rows.max()) + padding + 1)
         left = max(0, int(mask_columns.min()) - padding)
         right = min(image.shape[1], int(mask_columns.max()) + padding + 1)
         region = image[top:bottom, left:right]
         reduced_size = (
-            max(1, math.ceil(region.shape[1] / BLUR_DOWNSAMPLE)),
-            max(1, math.ceil(region.shape[0] / BLUR_DOWNSAMPLE)),
+            max(1, math.ceil(region.shape[1] / pixel_size)),
+            max(1, math.ceil(region.shape[0] / pixel_size)),
         )
         reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
+        reduced_sigma = blur_radius / pixel_size
         blurred_reduced = cv2.GaussianBlur(
             reduced,
             (0, 0),
-            BLUR_SIGMA / BLUR_DOWNSAMPLE,
-            BLUR_SIGMA / BLUR_DOWNSAMPLE,
+            reduced_sigma,
+            reduced_sigma,
         )
         blurred = cv2.resize(
             blurred_reduced,

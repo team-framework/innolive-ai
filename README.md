@@ -125,6 +125,24 @@ TensorRT version을 검증합니다. 기존 engine을 교체할 때만 export co
 - `CreateSession` · `ListSessions` · `DeleteSession`: in-memory session lifecycle 관리
 - Python client: `grpc_client.VideoProcessorClient`
 
+### 모자이크 강도 실시간 설정 (`MosaicConfig`)
+
+`VIDEO_OUTPUT_MODE_MOSAIC_JPEG` 스트림에서 `VideoChunk.mosaic_config`로
+프레임 단위로 모자이크 강도를 지정할 수 있습니다. 지정하지 않으면 서버 기본값
+(`blur_radius 24`, `pixel_size 2`)을 사용하고, 스트림이 열린 상태에서도
+다음 프레임부터 원하는 값으로 바꿀 수 있습니다. 설정은 해당 `ProcessVideo`
+콜(스트림)에만 적용되며 다른 세션이나 다른 스트림에는 전파되지 않습니다.
+
+| 필드 | 타입 | 범위 | 의미 |
+| --- | --- | --- | --- |
+| `blur_radius` | `double` | `(0, 64]` | 가우시안 블러 반경(px). 클수록 더 흐림 |
+| `pixel_size` | `uint32` | `1..8` | 모자이크 블록 크기(px). `1`은 픽셀화 비활성(순수 블러) |
+
+두 필드 모두 `optional`이라 한쪽만 지정할 수 있으며 unset 필드는 서버 기본값을
+사용합니다. 범위를 벗어나면 해당 프레임만 `MOSAIC_CONFIG_INVALID` 에러를 받고
+스트림은 유지됩니다(에러 응답에는 픽셀이 포함되지 않습니다). Python client에서는
+`VideoFrame(mosaic=MosaicConfig(blur_radius=..., pixel_size=...))`으로 전달합니다.
+
 등록 이미지는 저장하지 않고 정규화된 AdaFace embedding만 메모리에 유지합니다. 자세한
 message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor.proto)를
 참고합니다.

@@ -33,6 +33,15 @@ message VideoChunk {
   string session_id = 5;
   // Response payload requested for this stream. Unspecified returns a server-processed JPEG.
   VideoOutputMode output_mode = 6;
+  // Per-frame mosaic strength. Unset uses the server defaults. May change mid-stream.
+  MosaicConfig mosaic_config = 7;
+}
+
+message MosaicConfig {
+  // Gaussian blur radius in pixels; larger means a stronger blur. Valid range: (0, 64].
+  optional double blur_radius = 1;
+  // Mosaic block size in pixels; 1 disables pixelation. Valid range: 1..8.
+  optional uint32 pixel_size = 2;
 }
 
 enum VideoOutputMode {

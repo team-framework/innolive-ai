@@ -13,6 +13,7 @@ from google.protobuf import empty_pb2
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from grpc_client import (
+    MosaicConfig,
     VideoFrame,
     VideoFrameError,
     VideoProcessorClient,
@@ -582,6 +583,61 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             sorted(request.session_id for request in loopback.servicer.requests),
             ["session-a", "session-a", "session-b", "session-b"],
         )
+
+    def test_mosaic_config_validates_ranges_and_types(self):
+        self.assertEqual(
+            MosaicConfig(blur_radius=1, pixel_size=8),
+            MosaicConfig(blur_radius=1.0, pixel_size=8),
+        )
+        for kwargs in (
+            {"blur_radius": 0},
+            {"blur_radius": 65},
+            {"blur_radius": float("nan")},
+            {"blur_radius": float("inf")},
+            {"blur_radius": "8"},
+            {"pixel_size": 0},
+            {"pixel_size": 9},
+            {"pixel_size": 2.5},
+            {"pixel_size": True},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises((ValueError, TypeError)):
+                MosaicConfig(**kwargs)
+
+    def test_video_frame_keeps_mosaic_default_none_and_preserves_it(self):
+        self.assertIsNone(VideoFrame(_jpeg(1), 0, 1).mosaic)
+        config = MosaicConfig(blur_radius=12)
+        self.assertIs(VideoFrame(_jpeg(1), 0, 1, config).mosaic, config)
+
+    async def test_process_video_forwards_per_frame_mosaic_config(self):
+        frames = (
+            VideoFrame(_jpeg(1), 0, 1),
+            VideoFrame(
+                _jpeg(2),
+                1,
+                2,
+                MosaicConfig(blur_radius=32.0, pixel_size=4),
+            ),
+            VideoFrame(_jpeg(3), 2, 3, MosaicConfig(pixel_size=1)),
+        )
+        async with (
+            ClientLoopback() as loopback,
+            VideoProcessorClient(f"127.0.0.1:{loopback.port}") as client,
+        ):
+            results = [
+                result async for result in client.process_video(frames, session_id="client-session")
+            ]
+
+        self.assertEqual(len(results), 3)
+        received = loopback.servicer.requests
+        self.assertEqual(len(received), 3)
+        self.assertFalse(received[0].HasField("mosaic_config"))
+        self.assertTrue(received[1].HasField("mosaic_config"))
+        self.assertAlmostEqual(received[1].mosaic_config.blur_radius, 32.0)
+        self.assertEqual(received[1].mosaic_config.pixel_size, 4)
+        self.assertTrue(received[2].HasField("mosaic_config"))
+        self.assertFalse(received[2].mosaic_config.HasField("blur_radius"))
+        self.assertTrue(received[2].mosaic_config.HasField("pixel_size"))
+        self.assertEqual(received[2].mosaic_config.pixel_size, 1)
 
 
 if __name__ == "__main__":
