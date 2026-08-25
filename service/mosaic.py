@@ -1,4 +1,4 @@
-"""Fail-closed server-side face mosaic composition."""
+"""Fail-closed server-side object mosaic composition."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from service.detection import is_number_plate_object
 from service.protocol import MAX_JPEG_BYTES
 
 JPEG_QUALITY = 90
@@ -112,7 +113,7 @@ def _protected_mask(
     height, width = dimensions
     mask = np.zeros((height, width), dtype=np.uint8)
     for item in objects:
-        if item.get("whitelisted") is True:
+        if item.get("whitelisted") is True and not is_number_plate_object(item):
             continue
         polygon = _polygon(item.get("mask_polygon"), width, height)
         cv2.fillPoly(mask, [polygon], 255)
@@ -122,7 +123,7 @@ def _protected_mask(
 def _feathered_mask(mask: np.ndarray) -> np.ndarray:
     """Extend the protected area and taper only its outer boundary.
 
-    The source face pixels always remain at full opacity.  The short outer
+    The source protected pixels always remain at full opacity.  The short outer
     taper blends the already-strongly blurred image into the scene instead of
     leaving a conspicuous hard edge around the segmentation polygon.  Set
     ``MASK_FEATHER_RADIUS`` to 0 to blur exactly the segmentation polygon.
@@ -148,17 +149,17 @@ def _polygon(value: Any, width: int, height: int) -> np.ndarray:
         or not 3 <= len(value) <= MAX_MASK_POINTS
         or any(not isinstance(point, (list, tuple)) or len(point) != 2 for point in value)
     ):
-        raise ValueError("protected face has an invalid mask polygon")
+        raise ValueError("protected object has an invalid mask polygon")
     try:
         polygon = np.asarray(value, dtype=np.float32).reshape((-1, 2))
     except (TypeError, ValueError) as error:
-        raise ValueError("protected face has an invalid mask polygon") from error
+        raise ValueError("protected object has an invalid mask polygon") from error
     if not np.isfinite(polygon).all():
-        raise ValueError("protected face mask contains a non-finite point")
+        raise ValueError("protected object mask contains a non-finite point")
     polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
     polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
     rounded = np.rint(polygon).astype(np.int32)
     area = float(cv2.contourArea(rounded))
     if not math.isfinite(area) or area <= 0:
-        raise ValueError("protected face mask has no area")
+        raise ValueError("protected object mask has no area")
     return rounded

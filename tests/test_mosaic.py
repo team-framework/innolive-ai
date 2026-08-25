@@ -80,6 +80,26 @@ class MosaicTests(unittest.TestCase):
         self.assertTrue(payload.startswith(b"\xff\xd8"))
         self.assertTrue(payload.endswith(b"\xff\xd9"))
 
+    def test_number_plate_is_blurred_even_if_whitelisted_metadata_is_wrong(self):
+        output = _decode(
+            mosaic_jpeg(
+                self.image,
+                [
+                    {
+                        "class_id": 1,
+                        "class_name": "number_plate",
+                        "whitelisted": True,
+                        "mask_polygon": [[20, 20], [120, 20], [120, 90], [20, 90]],
+                    }
+                ],
+            )
+        )
+
+        difference = np.abs(
+            output[40:70, 40:100].astype(np.int16) - self.image[40:70, 40:100].astype(np.int16)
+        )
+        self.assertGreater(float(difference.mean()), 20)
+
     def test_feathered_mask_keeps_face_opaque_and_softens_only_its_outer_edge(self):
         mask = np.zeros((80, 80), dtype=np.uint8)
         mask[25:56, 25:56] = 255
@@ -90,7 +110,9 @@ class MosaicTests(unittest.TestCase):
         self.assertGreater(int(feathered[40, 23]), 0)
         self.assertLess(int(feathered[40, 23]), 255)
         self.assertGreater(int(feathered[40, 21]), 0)
-        self.assertEqual(int(feathered[40, 20]), 0)
+        self.assertGreater(int(feathered[40, 20]), 0)
+        self.assertLess(int(feathered[40, 20]), 255)
+        self.assertEqual(int(feathered[40, 16]), 0)
 
     def test_protected_blur_tapers_into_the_scene_outside_the_face_mask(self):
         output = _decode(
@@ -111,7 +133,7 @@ class MosaicTests(unittest.TestCase):
         self.assertGreater(float(outer_edge_difference.mean()), 2)
 
         scene_difference = np.abs(
-            output[45:75, 32:36].astype(np.int16) - self.image[45:75, 32:36].astype(np.int16)
+            output[45:75, 28:32].astype(np.int16) - self.image[45:75, 28:32].astype(np.int16)
         )
         self.assertLess(float(scene_difference.mean()), 5)
 

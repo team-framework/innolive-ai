@@ -159,6 +159,8 @@ class FaceRuntime(FakeRuntime):
                     ],
                     "confidence": 0.9,
                     "track_id": 1,
+                    "class_id": 0,
+                    "class_name": "face",
                     "source": "detected",
                 }
             ],

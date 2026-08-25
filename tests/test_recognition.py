@@ -25,10 +25,18 @@ from service.recognition import (
 def _object(track_id: int) -> dict[str, Any]:
     return {
         "track_id": track_id,
+        "class_id": 0,
+        "class_name": "face",
         "bbox": [10.0, 10.0, 70.0, 70.0],
         "mask_polygon": [[10.0, 10.0], [70.0, 10.0], [70.0, 70.0]],
         "confidence": 0.9,
     }
+
+
+def _number_plate(track_id: int) -> dict[str, Any]:
+    item = _object(track_id)
+    item.update(class_id=1, class_name="number_plate")
+    return item
 
 
 class FakeRecognitionRuntime:
@@ -282,6 +290,19 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.calls, 0)
         self.assertEqual(metrics["adaface_calls"], 0)
         self.assertFalse(face["whitelisted"])
+
+    async def test_number_plate_never_enters_face_recognition(self):
+        session = SessionRegistry().get_or_create("session")
+        session.append(np.asarray([1.0, 0.0]))
+        runtime = FakeRecognitionRuntime()
+        recognition = StreamRecognition(runtime, self.config, owner="session")
+        plate = _number_plate(1)
+
+        metrics = recognition.process(self.image, [plate], session.snapshot(), 1)
+
+        self.assertEqual(runtime.calls, 0)
+        self.assertEqual(metrics["adaface_calls"], 0)
+        self.assertFalse(plate["whitelisted"])
 
     async def test_unavailable_adaface_protects_faces_with_a_nonempty_whitelist(self):
         session = SessionRegistry().get_or_create("session")

@@ -7,7 +7,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from service.runtime import RuntimeConfig, select_runtime, validate_engine
+import numpy as np
+
+from service.runtime import (
+    IMAGE_SIZE,
+    RuntimeConfig,
+    RuntimeManager,
+    select_runtime,
+    validate_engine,
+)
 
 
 class RuntimeContractTests(unittest.TestCase):
@@ -16,11 +24,11 @@ class RuntimeContractTests(unittest.TestCase):
         engine.write_bytes(b"engine")
         manifest = {
             "schema_version": 1,
-            "standard_profile": "B1-640-Q90-W5",
+            "standard_profile": "B1-1024-Q90-W5",
             "precision": "fp16",
             "dynamic": False,
             "batch": 1,
-            "image_size": 640,
+            "image_size": 1024,
             "class_names": {"0": "face", "1": "number_plate"},
             "source_checkpoint": "best.pt",
             "source_sha256": hashlib.sha256(b"checkpoint").hexdigest(),
@@ -89,6 +97,24 @@ class RuntimeContractTests(unittest.TestCase):
     def test_normalizes_backend_and_device_options(self):
         config = RuntimeConfig(backend=" PyTorch ", device=" MPS ")
         self.assertEqual((config.backend, config.device), ("pytorch", "mps"))
+
+    def test_prediction_uses_1024_and_both_model_classes(self):
+        class FakeModel:
+            def __init__(self):
+                self.kwargs = None
+
+            def predict(self, **kwargs):
+                self.kwargs = kwargs
+                return ["prediction"]
+
+        model = FakeModel()
+        runtime = RuntimeManager.__new__(RuntimeManager)
+        runtime._model = model
+        runtime.device = "cpu"
+
+        self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
+        self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
+        self.assertEqual(model.kwargs["classes"], [0, 1])
 
 
 if __name__ == "__main__":

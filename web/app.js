@@ -2,7 +2,7 @@
 
 export const PROFILE = Object.freeze({
   protocolVersion: 2,
-  longEdge: 640,
+  longEdge: 1024,
   jpegQuality: 0.90,
   targetFps: 30,
   requestWindow: 5,
@@ -184,6 +184,92 @@ export function validateSessionId(value) {
 
 export function whitelistUrl(sessionId) {
   return `/api/whitelist?session_id=${encodeURIComponent(validateSessionId(sessionId))}`;
+}
+
+export function inferenceUrl(sessionId) {
+  return `/api/infer-image?session_id=${encodeURIComponent(validateSessionId(sessionId))}`;
+}
+
+export function normalizeImageInference(value) {
+  const sourceWidth = Number(value?.source?.width);
+  const sourceHeight = Number(value?.source?.height);
+  const inputWidth = Number(value?.model_input?.width);
+  const inputHeight = Number(value?.model_input?.height);
+  const visualizationWidth = Number(value?.visualization?.width);
+  const visualizationHeight = Number(value?.visualization?.height);
+  const modelInputLongEdge = Number(value?.model_input?.long_edge);
+  if (
+    ![
+      sourceWidth,
+      sourceHeight,
+      inputWidth,
+      inputHeight,
+      visualizationWidth,
+      visualizationHeight,
+      modelInputLongEdge,
+    ]
+      .every((number) => Number.isSafeInteger(number) && number > 0)
+    || modelInputLongEdge > PROFILE.longEdge
+    || inputWidth > PROFILE.longEdge
+    || inputHeight > PROFILE.longEdge
+    || inputWidth !== visualizationWidth
+    || inputHeight !== visualizationHeight
+  ) {
+    throw new Error("gateway returned invalid image inference dimensions");
+  }
+  const inputJpeg = value?.model_input?.jpeg_base64;
+  const visualizationJpeg = value?.visualization?.jpeg_base64;
+  if (
+    typeof inputJpeg !== "string" || !inputJpeg
+    || typeof visualizationJpeg !== "string" || !visualizationJpeg
+  ) {
+    throw new Error("gateway returned invalid image inference JPEGs");
+  }
+  if (!Array.isArray(value?.objects)) {
+    throw new Error("gateway returned invalid image inference objects");
+  }
+  return {
+    session_id: validateSessionId(value?.session_id),
+    source: { width: sourceWidth, height: sourceHeight },
+    model_input: {
+      width: inputWidth,
+      height: inputHeight,
+      long_edge: modelInputLongEdge,
+      jpeg_base64: inputJpeg,
+    },
+    visualization: {
+      width: visualizationWidth,
+      height: visualizationHeight,
+      jpeg_base64: visualizationJpeg,
+    },
+    objects: value.objects,
+    elapsed_ms: Number(value.elapsed_ms || 0),
+  };
+}
+
+export async function inferImage(file, sessionId, request = fetch) {
+  if (
+    !file
+    || (file.type && !file.type.startsWith("image/"))
+    || file.type === "image/svg+xml"
+  ) {
+    throw new Error("a browser-decodable image is required");
+  }
+  const validatedSessionId = validateSessionId(sessionId);
+  const response = await request(inferenceUrl(validatedSessionId), {
+    method: "POST",
+    headers: file.type ? { "content-type": file.type } : {},
+    body: file,
+  });
+  const result = normalizeImageInference(await readApiResponse(response));
+  if (result.session_id !== validatedSessionId) {
+    throw new Error("image inference session does not match the active session");
+  }
+  return result;
+}
+
+export function isSupportedVideoFile(file) {
+  return !file || !(file.type && !file.type.startsWith("video/"));
 }
 
 export function websocketUrl(locationValue, sessionId) {
@@ -653,11 +739,15 @@ class App {
   constructor() {
     this.elements = Object.fromEntries(
       [
-        "start", "stop", "status", "source", "output", "capture",
+        "start", "stop", "clear-video", "status", "source", "output", "capture",
         "capture-fps", "result-fps", "display-fps",
+        "video-file", "video-dropzone", "video-file-summary",
         "session-id", "whitelist-files", "whitelist-dropzone", "add-whitelist",
         "new-session", "refresh-whitelist", "whitelist-status", "session-list",
         "selected-file-summary", "enrollment-results", "whitelist-entries",
+        "inference-file", "inference-dropzone", "run-inference", "inference-status",
+        "inference-summary", "inference-viewers", "inference-original",
+        "inference-model-input", "inference-result",
       ].map((id) => [id, document.getElementById(id)]),
     );
     this.captureContext = this.elements.capture.getContext("2d", { alpha: false });
@@ -675,7 +765,17 @@ class App {
     this.elements["whitelist-files"].addEventListener("change", (event) => {
       this.setWhitelistFiles(event.target.files);
     });
+    this.elements["inference-file"].addEventListener("change", (event) => {
+      this.setInferenceFile(event.target.files);
+    });
+    this.elements["video-file"].addEventListener("change", (event) => {
+      this.setVideoFile(event.target.files);
+    });
+    this.elements["clear-video"].addEventListener("click", () => this.setVideoFile([]));
     this.bindWhitelistDropzone();
+    this.bindInferenceDropzone();
+    this.bindVideoDropzone();
+    this.elements.source.addEventListener("ended", () => this.finishVideoInput());
     this.sessionStatuses = [];
     this.sessionsReady = false;
     this.selectedWhitelistFiles = [];
@@ -684,9 +784,198 @@ class App {
     this.enrolling = false;
     this.deletingWhitelistEntryId = null;
     this.deletingSessionId = null;
+    this.inferenceFile = null;
+    this.inferenceObjectUrl = null;
+    this.inferenceRunning = false;
+    this.videoFile = null;
+    this.videoObjectUrl = null;
+    this.elements["run-inference"].addEventListener("click", () => this.inferSelectedImage());
     this.resetState();
     this.blackout("보호 결과 대기 중");
     void this.initializeSessions();
+  }
+
+  bindVideoDropzone() {
+    const dropzone = this.elements["video-dropzone"];
+    const picker = this.elements["video-file"];
+    const openPicker = () => {
+      if (!this.running && !this.socket) picker.click();
+    };
+    dropzone.addEventListener("click", openPicker);
+    dropzone.addEventListener("keydown", (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      openPicker();
+    });
+    for (const eventName of ["dragenter", "dragover"]) {
+      dropzone.addEventListener(eventName, (event) => {
+        if (this.running || this.socket) return;
+        event.preventDefault();
+        dropzone.dataset.dragging = "true";
+      });
+    }
+    dropzone.addEventListener("dragleave", (event) => {
+      if (!dropzone.contains(event.relatedTarget)) delete dropzone.dataset.dragging;
+    });
+    dropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      delete dropzone.dataset.dragging;
+      if (!this.running && !this.socket) this.setVideoFile(event.dataTransfer?.files || []);
+    });
+  }
+
+  setVideoFile(files) {
+    if (this.running || this.socket) return;
+    const file = Array.from(files || [])[0] || null;
+    if (file && !isSupportedVideoFile(file)) {
+      this.videoFile = null;
+      this.revokeVideoObjectUrl();
+      this.elements.source.pause();
+      this.elements.source.removeAttribute("src");
+      this.elements.source.load();
+      this.elements["video-file-summary"].textContent = "지원하지 않는 동영상 형식";
+      this.elements["video-file-summary"].dataset.state = "error";
+      this.updateVideoInputState();
+      return;
+    }
+
+    this.videoFile = file;
+    this.revokeVideoObjectUrl();
+    if (!file) {
+      this.elements.source.pause();
+      this.elements.source.removeAttribute("src");
+      this.elements.source.load();
+      this.elements["video-file-summary"].textContent = "선택하지 않으면 카메라를 사용합니다.";
+      delete this.elements["video-file-summary"].dataset.state;
+      this.updateVideoInputState();
+      return;
+    }
+
+    this.videoObjectUrl = URL.createObjectURL(file);
+    this.elements.source.pause();
+    this.elements.source.srcObject = null;
+    this.elements.source.src = this.videoObjectUrl;
+    this.elements.source.autoplay = false;
+    this.elements.source.controls = true;
+    this.elements.source.muted = true;
+    this.elements.source.loop = false;
+    this.elements.source.load();
+    this.elements["video-file-summary"].textContent = `${file.name || "동영상"} 선택됨 · 동영상 시작을 누르세요.`;
+    this.elements["video-file-summary"].dataset.state = "ready";
+    this.updateVideoInputState();
+  }
+
+  revokeVideoObjectUrl() {
+    if (this.videoObjectUrl) URL.revokeObjectURL(this.videoObjectUrl);
+    this.videoObjectUrl = null;
+  }
+
+  updateVideoInputState() {
+    const locked = this.running || this.socket;
+    this.elements["video-file"].disabled = Boolean(locked);
+    this.elements["clear-video"].disabled = Boolean(locked) || !this.videoFile;
+    this.elements["video-dropzone"].dataset.disabled = String(Boolean(locked));
+    this.elements["video-dropzone"].setAttribute("aria-disabled", String(Boolean(locked)));
+    this.elements.start.textContent = this.videoFile ? "동영상 시작" : "카메라 시작";
+  }
+
+  bindInferenceDropzone() {
+    const dropzone = this.elements["inference-dropzone"];
+    const picker = this.elements["inference-file"];
+    dropzone.addEventListener("click", () => picker.click());
+    dropzone.addEventListener("keydown", (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      picker.click();
+    });
+    for (const eventName of ["dragenter", "dragover"]) {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropzone.dataset.dragging = "true";
+      });
+    }
+    dropzone.addEventListener("dragleave", (event) => {
+      if (!dropzone.contains(event.relatedTarget)) delete dropzone.dataset.dragging;
+    });
+    dropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      delete dropzone.dataset.dragging;
+      this.setInferenceFile(event.dataTransfer?.files || []);
+    });
+  }
+
+  setInferenceFile(files) {
+    const file = Array.from(files || [])[0] || null;
+    if (
+      file
+      && ((file.type && !file.type.startsWith("image/")) || file.type === "image/svg+xml")
+    ) {
+      this.inferenceFile = null;
+      if (this.inferenceObjectUrl) URL.revokeObjectURL(this.inferenceObjectUrl);
+      this.inferenceObjectUrl = null;
+      this.elements["inference-viewers"].hidden = true;
+      this.elements["inference-status"].textContent = "지원하지 않는 이미지 형식";
+      this.elements["inference-status"].dataset.state = "error";
+      this.updateInferenceButton();
+      return;
+    }
+    this.inferenceFile = file;
+    if (this.inferenceObjectUrl) URL.revokeObjectURL(this.inferenceObjectUrl);
+    this.inferenceObjectUrl = null;
+    this.elements["inference-viewers"].hidden = true;
+    if (file) {
+      this.inferenceObjectUrl = URL.createObjectURL(file);
+      this.elements["inference-original"].src = this.inferenceObjectUrl;
+      this.elements["inference-status"].textContent = `${file.name || "이미지"} 선택됨`;
+      this.elements["inference-status"].dataset.state = "ready";
+      this.elements["inference-summary"].textContent = "추론 실행을 눌러 모델 입력을 확인하세요.";
+    } else {
+      this.elements["inference-original"].removeAttribute("src");
+      this.elements["inference-status"].textContent = "이미지 선택 대기 중";
+      delete this.elements["inference-status"].dataset.state;
+      this.elements["inference-summary"].textContent = "세션 준비 후 추론을 실행하세요.";
+    }
+    this.updateInferenceButton();
+  }
+
+  updateInferenceButton() {
+    this.elements["run-inference"].disabled = (
+      this.inferenceRunning || !this.inferenceFile || !this.sessionsReady
+      || !this.elements["session-id"].value
+    );
+  }
+
+  async inferSelectedImage() {
+    if (this.inferenceRunning || !this.inferenceFile) return;
+    const sessionId = validateSessionId(this.elements["session-id"].value);
+    this.inferenceRunning = true;
+    this.updateInferenceButton();
+    this.elements["inference-status"].textContent = "추론 중";
+    delete this.elements["inference-status"].dataset.state;
+    try {
+      const result = await inferImage(this.inferenceFile, sessionId);
+      this.elements["inference-model-input"].src = `data:image/jpeg;base64,${result.model_input.jpeg_base64}`;
+      this.elements["inference-result"].src = `data:image/jpeg;base64,${result.visualization.jpeg_base64}`;
+      this.elements["inference-viewers"].hidden = false;
+      const counts = result.objects.reduce((summary, object) => {
+        const name = object.class_name || "object";
+        summary[name] = (summary[name] || 0) + 1;
+        return summary;
+      }, {});
+      const countLabel = Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(" · ");
+      this.elements["inference-summary"].textContent = (
+        `모델 입력 ${result.model_input.width}×${result.model_input.height}`
+        + ` · ${result.objects.length}개 검출${countLabel ? ` (${countLabel})` : ""}`
+      );
+      this.elements["inference-status"].textContent = "추론 완료";
+      this.elements["inference-status"].dataset.state = "success";
+    } catch (error) {
+      this.elements["inference-status"].textContent = error.message;
+      this.elements["inference-status"].dataset.state = "error";
+    } finally {
+      this.inferenceRunning = false;
+      this.updateInferenceButton();
+    }
   }
 
   bindWhitelistDropzone() {
@@ -812,6 +1101,9 @@ class App {
     this.lastTerminalSequence = 0;
     this.streamSessionId = null;
     this.localStreamCounted = false;
+    this.sourceMode = null;
+    this.videoEnded = false;
+    this.videoCompletionScheduled = false;
     this.activeProfile = PROFILE;
     this.renderQueue = new LatestRenderQueue();
     this.rates = {
@@ -824,8 +1116,10 @@ class App {
   async start() {
     if (this.running || this.socket) return;
     this.resetState();
+    const useVideoFile = Boolean(this.videoFile);
     if (
-      !window.isSecureContext
+      !useVideoFile
+      && !window.isSecureContext
       && !["localhost", "127.0.0.1"].includes(location.hostname)
     ) {
       this.blackout("원격 카메라는 HTTPS가 필요합니다");
@@ -840,25 +1134,40 @@ class App {
       const response = await fetch("/healthz", { cache: "no-store" });
       if (!response.ok) throw new Error(`server is not ready (${response.status})`);
       this.activeProfile = negotiateServerProfile(await response.json());
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: {
-            ideal: this.activeProfile.targetFps,
-            max: this.activeProfile.targetFps,
+      if (useVideoFile) {
+        this.sourceMode = "video";
+        this.videoEnded = false;
+        this.elements.source.currentTime = 0;
+        this.elements.source.src = this.videoObjectUrl;
+        this.elements.source.autoplay = false;
+        this.elements.source.controls = true;
+        this.elements.source.muted = true;
+        this.elements.source.loop = false;
+        await this.elements.source.play();
+      } else {
+        this.sourceMode = "camera";
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: {
+              ideal: this.activeProfile.targetFps,
+              max: this.activeProfile.targetFps,
+            },
           },
-        },
-        audio: false,
-      });
-      if (generation !== this.generation) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
+          audio: false,
+        });
+        if (generation !== this.generation) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        this.stream = stream;
+        this.elements.source.autoplay = true;
+        this.elements.source.controls = false;
+        this.elements.source.srcObject = stream;
+        await this.elements.source.play();
       }
-      this.stream = stream;
-      this.elements.source.srcObject = stream;
-      await this.elements.source.play();
       if (typeof this.elements.source.requestVideoFrameCallback !== "function") {
         throw new Error("requestVideoFrameCallback is required for real-frame capture");
       }
@@ -876,15 +1185,18 @@ class App {
         this.localStreamCounted = true;
         this.renderSessions(this.streamSessionId);
         this.elements.stop.disabled = false;
-        this.setStatus("연결됨", true);
+        this.setStatus(useVideoFile ? "동영상 연결됨" : "연결됨", true);
         this.blackout("첫 보호 결과 대기 중");
-        this.scheduleCapture();
+        if (useVideoFile && this.elements.source.ended) this.finishVideoInput();
+        else this.scheduleCapture();
       };
       socket.onmessage = (event) => {
         if (generation !== this.generation || socket !== this.socket) return;
         this.receive(event);
       };
-      socket.onerror = () => this.failClosed("WebSocket transport error");
+      socket.onerror = () => {
+        if (socket === this.socket) this.failClosed("WebSocket transport error");
+      };
       socket.onclose = (event) => {
         if (socket === this.socket) {
           this.failClosed(`WebSocket closed (${event.code})`, false);
@@ -1172,6 +1484,8 @@ class App {
     this.elements["new-session"].disabled = controlsLocked;
     this.elements["refresh-whitelist"].disabled = controlsLocked;
     this.updateEnrollmentButton();
+    this.updateInferenceButton();
+    this.updateVideoInputState();
     this.renderWhitelistEntries();
     this.renderSessionRows(sessions, active, managementLocked);
   }
@@ -1290,6 +1604,19 @@ class App {
     this.videoRequest = null;
   }
 
+  finishVideoInput() {
+    if (
+      !this.running
+      || this.sourceMode !== "video"
+      || this.videoEnded
+    ) return;
+    this.videoEnded = true;
+    this.clearCaptureSchedule();
+    this.elements.source.pause();
+    this.setStatus("동영상 재생 완료 · 반환 대기 중", true);
+    this.maybeFinishVideo();
+  }
+
   capture(now) {
     this.scheduleCapture();
     if (!this.running) return;
@@ -1319,6 +1646,7 @@ class App {
       if (!jpeg) return this.failClosed("JPEG encoding failed");
       this.pendingLatest = { jpeg, width, height };
       this.pump();
+      this.maybeFinishVideo();
     }, "image/jpeg", this.activeProfile.jpegQuality);
   }
 
@@ -1444,7 +1772,39 @@ class App {
       bitmap?.close();
       this.renderQueue.finish(item);
       this.scheduleRender();
+      this.maybeFinishVideo();
     }
+  }
+
+  maybeFinishVideo() {
+    if (
+      !this.videoEnded
+      || !this.running
+      || this.encoding
+      || this.pendingLatest
+      || this.inFlight.size
+      || this.renderRequest !== null
+      || this.renderQueue.active
+      || this.renderQueue.waiting
+    ) return;
+    this.completeVideo();
+  }
+
+  completeVideo() {
+    if (this.videoCompletionScheduled) return;
+    this.videoCompletionScheduled = true;
+    this.running = false;
+    this.generation += 1;
+    this.clearCaptureSchedule();
+    this.elements.source.pause();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket?.readyState === WebSocket.OPEN) socket.close(1000, "video complete");
+    this.releaseLocalStreamCount();
+    this.streamSessionId = null;
+    this.renderSessions(this.elements["session-id"].value);
+    this.elements.stop.disabled = true;
+    this.setStatus("동영상 처리 완료", true);
   }
 
   drawMosaic(bitmap, metadata) {
@@ -1478,8 +1838,8 @@ class App {
   }
 
   blackout(message) {
-    if (!this.elements.output.width) this.elements.output.width = 640;
-    if (!this.elements.output.height) this.elements.output.height = 360;
+    if (!this.elements.output.width) this.elements.output.width = PROFILE.longEdge;
+    if (!this.elements.output.height) this.elements.output.height = 576;
     this.outputContext.fillStyle = "#000";
     this.outputContext.fillRect(0, 0, this.elements.output.width, this.elements.output.height);
     this.setStatus(message, false);
@@ -1496,6 +1856,17 @@ class App {
     this.renderQueue.drain();
   }
 
+  releaseLocalStreamCount() {
+    if (!this.localStreamCounted) return;
+    const activeSession = this.sessionStatuses.find(
+      (session) => session.session_id === this.streamSessionId,
+    );
+    if (activeSession) {
+      activeSession.active_stream_count = Math.max(0, activeSession.active_stream_count - 1);
+    }
+    this.localStreamCounted = false;
+  }
+
   failClosed(message, closeSocket = true) {
     this.running = false;
     this.generation += 1;
@@ -1509,17 +1880,11 @@ class App {
     }
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
-    this.elements.source.srcObject = null;
-    if (this.localStreamCounted) {
-      const activeSession = this.sessionStatuses.find(
-        (session) => session.session_id === this.streamSessionId,
-      );
-      if (activeSession) {
-        activeSession.active_stream_count = Math.max(0, activeSession.active_stream_count - 1);
-      }
-      this.localStreamCounted = false;
-    }
+    if (this.sourceMode === "camera") this.elements.source.srcObject = null;
+    this.releaseLocalStreamCount();
     this.streamSessionId = null;
+    this.sourceMode = null;
+    this.videoEnded = false;
     this.renderSessions(this.elements["session-id"].value);
     this.elements.stop.disabled = true;
   }

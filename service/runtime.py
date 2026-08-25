@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
+from service.detection import EXPECTED_CLASS_NAMES
 from service.tracking import (
     ACTIVATION_CONFIDENCE,
     CONTINUATION_CONFIDENCE,
@@ -30,10 +31,10 @@ if TYPE_CHECKING:
     from service.tracking import StreamTracker
 
 
-IMAGE_SIZE = 640
+IMAGE_SIZE = 1024
+STANDARD_PROFILE = "B1-1024-Q90-W5"
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
-EXPECTED_CLASS_NAMES = {0: "face", 1: "number_plate"}
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
@@ -101,7 +102,7 @@ def validate_engine(config: RuntimeConfig) -> dict[str, Any]:
 
     required = {
         "schema_version": 1,
-        "standard_profile": "B1-640-Q90-W5",
+        "standard_profile": STANDARD_PROFILE,
         "precision": "fp16",
         "dynamic": False,
         "batch": 1,
@@ -269,7 +270,7 @@ class RuntimeManager:
                 imgsz=IMAGE_SIZE,
                 conf=DETECTOR_CONFIDENCE,
                 iou=0.70,
-                classes=[0],
+                classes=list(EXPECTED_CLASS_NAMES),
                 max_det=MAX_DETECTIONS,
                 retina_masks=True,
                 device=self.device,
@@ -415,6 +416,7 @@ class RuntimeManager:
                 self.manifest["engine_sha256"] if self.manifest is not None else None
             ),
             "image_size": IMAGE_SIZE,
+            "class_names": {str(key): value for key, value in EXPECTED_CLASS_NAMES.items()},
             "batch_size": 1,
             "scheduler": "serialized_b1",
             "frames": self.frames,

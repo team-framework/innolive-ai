@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the standard static B1-640 FP16 TensorRT face model."""
+"""Export the standard static B1-1024 FP16 TensorRT segmentation model."""
 
 from __future__ import annotations
 
@@ -23,10 +23,9 @@ from service.runtime import (
     DEFAULT_ENGINE,
     EXPECTED_CLASS_NAMES,
     IMAGE_SIZE,
+    STANDARD_PROFILE,
     sha256_file,
 )
-
-STANDARD_PROFILE = "B1-640-Q90-W5"
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +120,7 @@ def _validate_checkpoint(checkpoint: Path, yolo: Any) -> None:
     names = {int(key): str(value).strip().lower() for key, value in source.names.items()}
     if source.task != "segment" or names != EXPECTED_CLASS_NAMES:
         raise SystemExit(
-            "expected a face segmentation checkpoint with "
+            "expected a face/number_plate segmentation checkpoint with "
             f"names={EXPECTED_CLASS_NAMES}, "
             f"got task={source.task!r}, names={names!r}"
         )

@@ -53,6 +53,48 @@
       <section class="controls panel">
         <button id="start" disabled>카메라 시작</button>
         <button id="stop" disabled>중지</button>
+        <button id="clear-video" class="secondary" type="button" disabled>카메라로 전환</button>
+        <input id="video-file" class="visually-hidden" type="file" accept="video/*" />
+        <div id="video-dropzone" class="video-source-picker" role="button" tabindex="0" aria-controls="video-file">
+          <span class="upload-icon" aria-hidden="true">▶</span>
+          <span>
+            <strong>동영상 선택 또는 드롭</strong>
+            <small id="video-file-summary">선택하지 않으면 카메라를 사용합니다.</small>
+          </span>
+        </div>
+      </section>
+
+      <section class="panel image-inference">
+        <div class="section-heading">
+          <div>
+            <h2>이미지 단건 추론 시각화</h2>
+            <p class="section-description">업로드한 이미지와 모델에 실제 전달한 resize 이미지, box/mask 윤곽선을 비교합니다.</p>
+          </div>
+          <span id="inference-status" class="inference-status">이미지 선택 대기 중</span>
+        </div>
+        <input id="inference-file" class="visually-hidden" type="file" accept="image/*" />
+        <div id="inference-dropzone" class="upload-zone" role="button" tabindex="0" aria-controls="inference-file">
+          <span class="upload-icon" aria-hidden="true">＋</span>
+          <strong>추론할 이미지 선택 또는 드롭</strong>
+        </div>
+        <div class="inference-actions">
+          <span id="inference-summary">세션 준비 후 추론을 실행하세요.</span>
+          <button id="run-inference" class="primary" disabled>추론 실행</button>
+        </div>
+        <div id="inference-viewers" class="inference-viewers" hidden>
+          <figure class="inference-figure">
+            <figcaption>업로드 원본</figcaption>
+            <img id="inference-original" class="inference-image" alt="업로드 원본" />
+          </figure>
+          <figure class="inference-figure">
+            <figcaption>모델 실제 입력 · resize</figcaption>
+            <img id="inference-model-input" class="inference-image" alt="모델에 전달된 resize 이미지" />
+          </figure>
+          <figure class="inference-figure inference-figure-result">
+            <figcaption>추론 결과 · box/mask 윤곽선</figcaption>
+            <img id="inference-result" class="inference-image" alt="box와 mask 윤곽선이 표시된 추론 결과" />
+          </figure>
+        </div>
       </section>
 
       <section class="viewers">
@@ -62,7 +104,7 @@
         </article>
         <article class="panel protected">
           <h2>보호 출력</h2>
-          <canvas id="output" width="640" height="360"></canvas>
+          <canvas id="output" width="1024" height="576"></canvas>
         </article>
       </section>
 
