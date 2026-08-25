@@ -12,7 +12,7 @@ from service.protocol import MAX_JPEG_BYTES
 
 MIN_FRAME_DIMENSION = 32
 # Long-edge ceiling for a decoded frame. FHD (1920x1080) is the largest source
-# the serving profile accepts: the detector letterboxes to imgsz=640 internally
+# the serving profile accepts: the detector letterboxes to imgsz=1024 internally
 # ("detect small") while the mosaic blur runs at full resolution ("blur big"),
 # so raising this from the original 640 preserves output quality up to FHD.
 MAX_LONG_EDGE = 1920
@@ -58,6 +58,27 @@ class FrameLimits:
 
 
 DEFAULT_FRAME_LIMITS = FrameLimits()
+
+
+def resize_long_edge(image: np.ndarray, max_long_edge: int) -> np.ndarray:
+    """Resize an image down to a long-edge ceiling without upscaling."""
+
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image must be a three-channel BGR array")
+    if type(max_long_edge) is not int or max_long_edge < MIN_FRAME_DIMENSION:
+        raise ValueError(f"max_long_edge must be at least {MIN_FRAME_DIMENSION}")
+
+    height, width = image.shape[:2]
+    source_long_edge = max(height, width)
+    if source_long_edge <= max_long_edge:
+        return image.copy()
+
+    scale = max_long_edge / source_long_edge
+    target_size = (
+        max(MIN_FRAME_DIMENSION, round(width * scale)),
+        max(MIN_FRAME_DIMENSION, round(height * scale)),
+    )
+    return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
 
 
 def decode_jpeg(jpeg: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> np.ndarray:

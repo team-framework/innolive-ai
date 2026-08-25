@@ -1,15 +1,15 @@
 # InnoLive AI Face Processor
 
-실시간 영상의 얼굴을 **세그멘테이션·추적**하고, 세션별 whitelist에 등록된 인물만
-제외해 서버에서 모자이크 JPEG를 반환하는 gRPC AI 서버입니다.
+실시간 영상의 얼굴과 차량 번호판을 **세그멘테이션·추적**하고, 세션별 whitelist에
+등록된 인물의 얼굴만 제외해 서버에서 모자이크 JPEG를 반환하는 gRPC AI 서버입니다.
 
-`YOLO26n-seg`가 얼굴 mask를 만들고 `BoT-SORT`가 track을 유지합니다. 각 track은
-`YuNet + AdaFace`로 whitelist와 비교되며, 확인되지 않은 얼굴은 서버에서
-fail-closed 방식으로 보호됩니다.
+`YOLO26n-seg`가 얼굴·번호판 mask를 만들고 `BoT-SORT`가 object track을 유지합니다.
+face track만 `YuNet + AdaFace`로 whitelist와 비교하며, number_plate와 확인되지 않은
+얼굴은 서버에서 fail-closed 방식으로 보호됩니다.
 
 ## 핵심 기능
 
-- **Mask-level 비식별화**: bbox가 아닌 instance mask 단위로 얼굴 영역을 정밀하게 합성
+- **Mask-level 비식별화**: bbox가 아닌 instance mask 단위로 얼굴·번호판 영역을 정밀하게 합성
 - **안정적인 실시간 추적**: stream별 BoT-SORT와 1-frame mask hold로 탐지 공백 완화
 - **선택적 모자이크**: 세션별 AdaFace whitelist와 track cache를 이용해 등록 인물만 제외
 - **Fail-closed 처리**: 인식·합성·전송 실패 시 원본 frame으로 되돌아가지 않음
@@ -21,11 +21,13 @@ fail-closed 방식으로 보호됩니다.
 ```mermaid
 flowchart LR
     Client["클라이언트<br/>JPEG frame"] -->|gRPC 양방향 stream| Decode["검증 · decode"]
-    Decode --> Detect["YOLO26n-seg<br/>얼굴 mask 탐지"]
-    Detect --> Track["BoT-SORT<br/>얼굴 track 유지"]
-    Track --> Match{"AdaFace whitelist<br/>일치 여부"}
+    Decode --> Detect["YOLO26n-seg<br/>얼굴·번호판 mask 탐지"]
+    Detect --> Track["BoT-SORT<br/>object track 유지"]
+    Track --> Type{"class"}
+    Type -->|number_plate| Mosaic["mask 기반 모자이크"]
+    Type -->|face| Match{"AdaFace whitelist<br/>일치 여부"}
     Match -->|일치| Keep["얼굴 유지"]
-    Match -->|불일치 · 판단 실패| Mosaic["mask 기반 모자이크"]
+    Match -->|불일치 · 판단 실패| Mosaic
     Keep --> Output["처리 JPEG + metadata"]
     Mosaic --> Output
 
@@ -46,8 +48,8 @@ App client는 gRPC를 직접 호출하고, 브라우저 demo만 `server.py`의 W
   - CVAT 기반 annotation 검수·가공
   - SAM 3.1을 이용한 bbox → segmentation mask 변환
   - 데이터 구축·학습 pipeline은 외부에서 관리하며, 이 저장소는 serving checkpoint와 runtime을 다룹니다.
-- **얼굴 탐지 · 추적**
-  - YOLO26n-seg: 640px, face 단일 class instance segmentation
+- **객체 탐지 · 추적**
+  - YOLO26n-seg: 1024px, face·number_plate 2-class instance segmentation
   - BoT-SORT: stream-local multi-object tracking과 temporal mask hold
 - **얼굴 인식 · 정렬**
   - AdaFace ViT-Base KP-RPE, WebFace12M: 512차원 face embedding과 cosine matching
@@ -71,10 +73,10 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-`models/best.pt`만으로 얼굴 segmentation과 전체 보호 모자이크를 실행할 수 있습니다.
+`models/best.pt`만으로 face/number_plate segmentation과 보호 모자이크를 실행할 수 있습니다.
 Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 [`models/README.md`](models/README.md)의 안내에 따라 준비합니다. Artifact가 없으면 서버는
-모든 얼굴을 계속 보호하고 whitelist 등록 요청만 거부합니다.
+모든 얼굴과 번호판을 계속 보호하고 whitelist 등록 요청만 거부합니다.
 
 ### 2. gRPC 서버 실행
 
@@ -102,25 +104,29 @@ gRPC 서버를 실행한 상태에서 새 terminal을 엽니다.
 ```
 
 브라우저에서 `http://127.0.0.1:8001`을 열면 camera stream과 whitelist 등록 흐름을 확인할
-수 있습니다.
+수 있습니다. `이미지 단건 추론 시각화`에서 이미지를 업로드하면 원본, gateway가 gRPC로
+전달한 실제 resize 입력, `bbox`와 `mask_polygon` 윤곽선이 표시된 결과를 함께 확인할 수
+있습니다.
 
 ### NVIDIA TensorRT
 
-TensorRT engine은 실제 배포 대상인 Linux x86_64 NVIDIA 장비에서 생성합니다.
+TensorRT engine과 검증 manifest는 Git에 포함하지 않습니다. 실제 배포 대상인
+Linux x86_64 NVIDIA 장비에서 저장소의 `models/best.pt`로 매번 생성합니다. 이렇게
+해야 GPU와 TensorRT version이 다른 환경의 engine을 잘못 재사용하지 않습니다.
 
 ```bash
 .venv/bin/pip install -r requirements-export.txt
-.venv/bin/python -m scripts.export_tensorrt --device 0
+.venv/bin/python -m scripts.export_tensorrt --device 0 --force
 .venv/bin/python ai_processor_server.py --backend tensorrt --device 0
 ```
 
-Manifest는 build 환경을 기록하고, runtime은 serving profile·engine/checkpoint hash와
-TensorRT version을 검증합니다. 기존 engine을 교체할 때만 export command에 `--force`를
-추가합니다.
+Export 단계가 `best_b1.engine`과 `best_b1.engine.json`을 생성하고, runtime은 local
+manifest의 serving profile·engine/checkpoint hash와 TensorRT version을 검증합니다.
+두 파일은 배포 호스트에서만 유지되며 기존 engine을 교체할 때는 `--force`를 사용합니다.
 
 ## API 요약
 
-- `ProcessVideo`: JPEG frame과 처리된 JPEG·face metadata를 주고받는 bidirectional stream
+- `ProcessVideo`: JPEG frame과 처리된 JPEG·object metadata를 주고받는 bidirectional stream
 - `AddWhitelist` · `DeleteWhitelist` · `GetWhitelistStatus`: 세션별 face exemplar 관리
 - `CreateSession` · `ListSessions` · `DeleteSession`: in-memory session lifecycle 관리
 - Python client: `grpc_client.VideoProcessorClient`
@@ -142,6 +148,10 @@ TensorRT version을 검증합니다. 기존 engine을 교체할 때만 export co
 사용합니다. 범위를 벗어나면 해당 프레임만 `MOSAIC_CONFIG_INVALID` 에러를 받고
 스트림은 유지됩니다(에러 응답에는 픽셀이 포함되지 않습니다). Python client에서는
 `VideoFrame(mosaic=MosaicConfig(blur_radius=..., pixel_size=...))`으로 전달합니다.
+
+브라우저 demo gateway는 `POST /api/infer-image?session_id=...`에 JPEG·PNG·WebP를 raw body로
+받습니다. 입력은 long edge 1024 이하로 resize한 뒤 gRPC `ProcessVideo`에 전달하며, 응답에는
+동일한 model input JPEG, box/mask overlay JPEG, object metadata가 포함됩니다.
 
 등록 이미지는 저장하지 않고 정규화된 AdaFace embedding만 메모리에 유지합니다. 자세한
 message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor.proto)를
@@ -177,6 +187,7 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 │   ├── adaface_*.py         # AdaFace backbone과 YuNet runtime
 │   ├── recognition.py       # session whitelist와 track decision cache
 │   ├── frame.py             # bounded image validation/decode
+│   ├── visualization.py     # 단건 추론 box/mask overlay JPEG
 │   ├── mosaic.py            # mask union, blur, JPEG 합성
 │   └── protocol.py          # browser WebSocket binary codec
 ├── protos/                  # gRPC schema와 generated Python stubs

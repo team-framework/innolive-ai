@@ -1,7 +1,14 @@
 # Runtime model files
 
+`best.pt` is the serving YOLO segmentation checkpoint. The runtime uses `imgsz=1024`
+and expects class `0` as `face` and class `1` as `number_plate`; both classes are
+included in the protected mosaic path, while only `face` enters AdaFace recognition.
+
 The TensorRT, AdaFace, and YuNet binaries are deployment artifacts and are not
-tracked by Git. The server expects these defaults:
+tracked by Git. Build the TensorRT engine on the target Linux x86_64 NVIDIA host
+from `best.pt`; do not copy an engine built on another GPU or TensorRT stack.
+The export command creates both `best_b1.engine` and its local validation manifest
+`best_b1.engine.json` next to the checkpoint. The server expects these defaults:
 
 | File | Source | SHA-256 used for smoke testing |
 | --- | --- | --- |

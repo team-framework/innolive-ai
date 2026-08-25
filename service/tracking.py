@@ -88,11 +88,11 @@ class StreamTracker:
         if values.get("tracker_type") != "botsort":
             raise ValueError("tracker_type must be botsort")
         if float(values.get("track_low_thresh", -1)) != CONTINUATION_CONFIDENCE:
-            raise ValueError("track_low_thresh must be 0.05")
+            raise ValueError(f"track_low_thresh must be {CONTINUATION_CONFIDENCE}")
         if float(values.get("track_high_thresh", -1)) != ACTIVATION_CONFIDENCE:
-            raise ValueError("track_high_thresh must be 0.25")
+            raise ValueError(f"track_high_thresh must be {ACTIVATION_CONFIDENCE}")
         if float(values.get("new_track_thresh", -1)) != ACTIVATION_CONFIDENCE:
-            raise ValueError("new_track_thresh must be 0.25")
+            raise ValueError(f"new_track_thresh must be {ACTIVATION_CONFIDENCE}")
         values["with_reid"] = False
         values["device"] = device
         self.config_path = config_path

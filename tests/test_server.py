@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 from collections.abc import AsyncIterator
 from contextlib import ExitStack
@@ -44,6 +45,7 @@ class FakeGrpcClient:
         self.active_stream_counts: dict[str, int] = {}
         self.created_sessions = 0
         self.processed_jpeg = jpeg(value=192)
+        self.image_inference_inputs: list[tuple[str, bytes]] = []
 
     async def __aenter__(self):
         return self
@@ -71,6 +73,23 @@ class FakeGrpcClient:
             yield VideoResult(source_jpeg=frame.data, response=response)
             if response.error_code == "INFERENCE_FAILED":
                 return
+
+    async def process_jpegs(
+        self,
+        jpegs,
+        *,
+        session_id: str,
+        window: int,
+    ) -> AsyncIterator[VideoResult]:
+        self.image_inference_options = (session_id, window)
+        for frame_id, payload in enumerate(jpegs, start=1):
+            self.image_inference_inputs.append((session_id, payload))
+            frame = SimpleNamespace(data=payload, timestamp=frame_id, frame_id=frame_id)
+            response = self._response(frame)
+            decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+            response.width = decoded.shape[1]
+            response.height = decoded.shape[0]
+            yield VideoResult(source_jpeg=payload, response=response)
 
     async def add_whitelist(self, image: bytes, *, session_id: str):
         if self.mode == "whitelist_error":
@@ -201,6 +220,35 @@ class FakeGrpcClient:
             processed_jpeg = b""
         else:
             processed_jpeg = self.processed_jpeg
+        faces = [
+            ai_processor_pb2.FaceMetadata(
+                bbox=ai_processor_pb2.BoundingBox(x1=1, y1=2, x2=30, y2=32),
+                confidence=0.9,
+                polygon=[
+                    ai_processor_pb2.Point(x=1, y=2),
+                    ai_processor_pb2.Point(x=30, y=2),
+                    ai_processor_pb2.Point(x=30, y=32),
+                ],
+                track_id=1,
+                source="detected",
+                class_name="face",
+                whitelisted=True,
+            )
+        ]
+        if self.mode == "image_inference":
+            faces.append(
+                ai_processor_pb2.FaceMetadata(
+                    bbox=ai_processor_pb2.BoundingBox(x1=40, y1=5, x2=60, y2=20),
+                    confidence=0.8,
+                    polygon=[
+                        ai_processor_pb2.Point(x=40, y=5),
+                        ai_processor_pb2.Point(x=60, y=5),
+                        ai_processor_pb2.Point(x=60, y=20),
+                    ],
+                    source="detected",
+                    class_name="number_plate",
+                )
+            )
         return ai_processor_pb2.ProcessedVideoChunk(
             data=processed_jpeg,
             timestamp=frame.timestamp,
@@ -208,21 +256,7 @@ class FakeGrpcClient:
             width=64,
             height=36,
             frame_id=frame.frame_id,
-            faces=[
-                ai_processor_pb2.FaceMetadata(
-                    bbox=ai_processor_pb2.BoundingBox(x1=1, y1=2, x2=30, y2=32),
-                    confidence=0.9,
-                    polygon=[
-                        ai_processor_pb2.Point(x=1, y=2),
-                        ai_processor_pb2.Point(x=30, y=2),
-                        ai_processor_pb2.Point(x=30, y=32),
-                    ],
-                    track_id=1,
-                    source="detected",
-                    class_name="face",
-                    whitelisted=True,
-                )
-            ],
+            faces=faces,
             timing=ai_processor_pb2.ProcessingTiming(
                 queue_ms=0.1,
                 decode_ms=0.2,
@@ -238,13 +272,13 @@ class FakeGrpcClient:
         )
 
 
-def app(client: FakeGrpcClient | None = None):
+def app(client: FakeGrpcClient | None = None, *, max_jpeg_bytes: int = 4096):
     fake = client or FakeGrpcClient()
     application = create_app(
         ServerSettings(
             session_id="demo-session",
             grpc_target="test-grpc:50051",
-            max_jpeg_bytes=4096,
+            max_jpeg_bytes=max_jpeg_bytes,
         ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
@@ -323,6 +357,75 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(status_b.json()["entry_count"], 0)
         self.assertEqual(status_b.json()["entry_ids"], [])
         self.assertEqual(fake.whitelist_images, [("session-a", face), ("session-a", face)])
+
+    def test_image_inference_returns_resized_input_and_box_mask_visualization(self):
+        application, fake = app(
+            FakeGrpcClient(mode="image_inference"),
+            max_jpeg_bytes=1_000_000,
+        )
+        source = jpeg(width=1600, height=900, value=80)
+        with TestClient(application) as client:
+            response = client.post(
+                "/api/infer-image?session_id=session-image",
+                content=source,
+                headers={"content-type": "image/jpeg"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["session_id"], "session-image")
+        self.assertEqual(payload["source"], {"width": 1600, "height": 900})
+        self.assertEqual(
+            payload["model_input"] | {"jpeg_base64": ""},
+            {"width": 1024, "height": 576, "long_edge": 1024, "jpeg_base64": ""},
+        )
+        self.assertEqual(
+            (payload["visualization"]["width"], payload["visualization"]["height"]),
+            (1024, 576),
+        )
+        self.assertEqual(
+            [item["class_id"] for item in payload["objects"]],
+            [0, 1],
+        )
+        input_jpeg = base64.b64decode(payload["model_input"]["jpeg_base64"])
+        visualization_jpeg = base64.b64decode(payload["visualization"]["jpeg_base64"])
+        input_image = cv2.imdecode(np.frombuffer(input_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        visualization = cv2.imdecode(
+            np.frombuffer(visualization_jpeg, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertEqual(input_image.shape, (576, 1024, 3))
+        self.assertEqual(visualization.shape, (576, 1024, 3))
+        self.assertGreater(int(np.std(visualization)), int(np.std(input_image)))
+        self.assertEqual(fake.image_inference_options, ("session-image", 1))
+        self.assertEqual(len(fake.image_inference_inputs), 1)
+        self.assertEqual(
+            cv2.imdecode(
+                np.frombuffer(fake.image_inference_inputs[0][1], dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            ).shape,
+            (576, 1024, 3),
+        )
+
+    def test_image_inference_validates_session_image_and_body_limit(self):
+        application, _ = app()
+        with TestClient(application) as client:
+            missing_session = client.post("/api/infer-image", content=jpeg())
+            invalid_image = client.post(
+                "/api/infer-image?session_id=session-a",
+                content=b"not-an-image",
+            )
+            oversized = client.post(
+                "/api/infer-image?session_id=session-a",
+                content=b"x" * 4097,
+            )
+
+        self.assertEqual(missing_session.status_code, 400)
+        self.assertEqual(missing_session.json()["error"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(invalid_image.status_code, 400)
+        self.assertEqual(invalid_image.json()["error"]["code"], "INVALID_IMAGE")
+        self.assertEqual(oversized.status_code, 413)
+        self.assertEqual(oversized.json()["error"]["code"], "PAYLOAD_TOO_LARGE")
 
     def test_whitelist_api_deletes_one_entry_and_preserves_grpc_status(self):
         application, fake = app()

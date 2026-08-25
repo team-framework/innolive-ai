@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production gRPC entry point for the B1-640 face video pipeline."""
+"""Production gRPC entry point for the B1-1024 protected-video pipeline."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from service.adaface_model import (
     FaceCountError,
     FaceTooSmallError,
 )
+from service.detection import is_number_plate_object
 from service.frame import MAX_LONG_EDGE, MIN_FRAME_DIMENSION, FrameLimits, decode_image, decode_jpeg
 from service.grpc_config import listen_address, server_options
 from service.mosaic import (
@@ -63,6 +64,7 @@ from service.runtime import (
     BACKENDS,
     DEFAULT_CHECKPOINT,
     DEFAULT_ENGINE,
+    STANDARD_PROFILE,
     InferenceFailure,
     RuntimeConfig,
     RuntimeManager,
@@ -74,7 +76,7 @@ LOGGER = logging.getLogger("innolive.grpc")
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
 SERVICE_NAME = "AiProcessor"
-PROFILE = "B1-640-Q90-W5"
+PROFILE = STANDARD_PROFILE
 MAX_SESSIONS = 1_024
 MOSAIC_MAX_INFLIGHT = 2
 
@@ -350,7 +352,10 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
             mosaic_started = time.perf_counter()
             try:
-                if any(item.get("whitelisted") is not True for item in objects):
+                if any(
+                    item.get("whitelisted") is not True or is_number_plate_object(item)
+                    for item in objects
+                ):
                     async with self._mosaic_slots:
                         loop = asyncio.get_running_loop()
                         processed_data = await loop.run_in_executor(
@@ -885,7 +890,8 @@ async def serve(settings: GrpcServerSettings) -> None:
             LOGGER.info("AdaFace ready: %s", adaface.health())
         else:
             LOGGER.warning(
-                "AdaFace unavailable; all faces remain protected: %s", adaface.load_error
+                "AdaFace unavailable; all detected objects remain protected: %s",
+                adaface.load_error,
             )
         await bundle.server.wait_for_termination()
     finally:
@@ -915,7 +921,7 @@ def port_number(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="InnoLive B1-640 protected-video gRPC server")
+    parser = argparse.ArgumentParser(description="InnoLive B1-1024 protected-video gRPC server")
     parser.add_argument("--host", default=os.getenv("GRPC_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port",
@@ -1006,7 +1012,7 @@ def parse_args() -> argparse.Namespace:
         "--max-long-edge",
         type=positive_int,
         default=positive_int(os.getenv("MAX_LONG_EDGE", str(MAX_LONG_EDGE))),
-        help="Long-edge ceiling for decoded frames (default supports FHD; lower to pin the profile, e.g. 640).",
+        help="Long-edge ceiling for decoded frames (default supports FHD; lower to pin the profile, e.g. 1024).",
     )
     parser.add_argument(
         "--inference-timeout",

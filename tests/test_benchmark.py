@@ -13,8 +13,8 @@ class BenchmarkContractTests(unittest.TestCase):
         landscape = np.zeros((1080, 1920, 3), dtype=np.uint8)
         portrait = np.zeros((1920, 1080, 3), dtype=np.uint8)
         small = np.zeros((240, 320, 3), dtype=np.uint8)
-        self.assertEqual(resize_long_edge(landscape).shape, (360, 640, 3))
-        self.assertEqual(resize_long_edge(portrait).shape, (640, 360, 3))
+        self.assertEqual(resize_long_edge(landscape).shape, (576, 1024, 3))
+        self.assertEqual(resize_long_edge(portrait).shape, (1024, 576, 3))
         self.assertEqual(resize_long_edge(small).shape, (240, 320, 3))
 
     def test_metadata_guard_rejects_pixel_fields_recursively(self):

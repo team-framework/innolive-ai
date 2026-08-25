@@ -3,8 +3,8 @@
 #
 # Usage: ./scripts/run_local.sh
 #
-# The gRPC server (ai_processor_server.py, 127.0.0.1:50051) runs in the
-# background and the browser demo gateway (server.py, http://127.0.0.1:8001)
+# The gRPC server (ai_processor_server.py, ${HOST:-127.0.0.1}:50051) runs in the
+# background and the browser demo gateway (server.py, http://${HOST:-127.0.0.1}:8001)
 # runs in the foreground. Ctrl+C stops both. On Apple Silicon the gRPC server
 # uses the auto backend and falls back to PyTorch/MPS because TensorRT needs
 # a Linux x86_64 NVIDIA host.
@@ -14,6 +14,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PROJECT_ROOT}/.venv/bin/python"
 GRPC_PORT=50051
 WEB_PORT=8001
+BIND_HOST="${HOST:-127.0.0.1}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "virtualenv python not found: $PYTHON" >&2
@@ -30,7 +31,7 @@ for port in "$GRPC_PORT" "$WEB_PORT"; do
   fi
 done
 
-"$PYTHON" ai_processor_server.py &
+"$PYTHON" ai_processor_server.py --host "$BIND_HOST" &
 GRPC_PID=$!
 
 cleanup() {
@@ -39,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "starting gRPC server on 127.0.0.1:${GRPC_PORT} (pid ${GRPC_PID})..."
+echo "starting gRPC server on ${BIND_HOST}:${GRPC_PORT} (pid ${GRPC_PID})..."
 
 ready=0
 for _ in $(seq 1 360); do
@@ -64,7 +65,7 @@ if [[ $ready -ne 1 ]]; then
   exit 1
 fi
 
-echo "gRPC server:  127.0.0.1:${GRPC_PORT}"
-echo "browser demo: http://127.0.0.1:${WEB_PORT}"
+echo "gRPC server:  ${BIND_HOST}:${GRPC_PORT}"
+echo "browser demo: http://${BIND_HOST}:${WEB_PORT}"
 
-"$PYTHON" server.py --grpc-target "127.0.0.1:${GRPC_PORT}"
+"$PYTHON" server.py --host "$BIND_HOST" --grpc-target "127.0.0.1:${GRPC_PORT}"

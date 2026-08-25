@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the B1-640-Q90-W5 ILF1 transport and latency acceptance gate."""
+"""Run the B1-1024-Q90-W5 ILF1 transport and latency acceptance gate."""
 
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def summarize(
         "latency_not_continuously_growing": latency_growth_ms <= max(20.0, first_p50 * 0.20),
     }
     return {
-        "profile": "B1-640-Q90-W5",
+        "profile": "B1-1024-Q90-W5",
         "passed": all(gates.values()),
         "gates": gates,
         "metrics": {

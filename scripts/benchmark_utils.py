@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-LONG_EDGE = 640
+LONG_EDGE = 1024
 JPEG_QUALITY = 90
 
 

@@ -1,4 +1,4 @@
-# BoT-SORT settings tuned for stable face masks in a real-time video stream.
+# BoT-SORT settings tuned for stable segmentation masks in a real-time video stream.
 tracker_type: botsort
 track_high_thresh: 0.25
 track_low_thresh: 0.05

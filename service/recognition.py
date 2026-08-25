@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from service.detection import is_face_object
+
 MAX_SESSION_ID_BYTES = 256
 MAX_ENTRY_ID_BYTES = 256
 
@@ -361,6 +363,8 @@ class StreamRecognition:
             self._protect_all_tracks()
         if snapshot.entries and runtime_ready:
             for item in objects:
+                if not is_face_object(item):
+                    continue
                 outcome = self._schedule(
                     item,
                     image,
@@ -376,7 +380,8 @@ class StreamRecognition:
             track_id = item.get("track_id")
             state = self._states.get(int(track_id)) if track_id is not None else None
             allowed = (
-                runtime_ready
+                is_face_object(item)
+                and runtime_ready
                 and state is not None
                 and self._is_whitelisted_for_entries(
                     state,

@@ -16,6 +16,9 @@ import {
   fitLongEdge,
   framePacket,
   getWhitelistStatus,
+  inferImage,
+  inferenceUrl,
+  isSupportedVideoFile,
   listSessions,
   negotiateServerProfile,
   normalizeWhitelistImage,
@@ -34,6 +37,10 @@ assert.doesNotMatch(browserHtml, /comparison-session|compare-sessions|비교할 
 assert.match(browserHtml, /id="session-list"/);
 assert.match(browserHtml, /id="whitelist-dropzone"/);
 assert.match(browserHtml, /id="whitelist-entries"/);
+assert.match(browserHtml, /id="inference-model-input"/);
+assert.match(browserHtml, /id="inference-result"/);
+assert.match(browserHtml, /id="video-file"/);
+assert.match(browserHtml, /id="video-dropzone"/);
 assert.doesNotMatch(browserHtml, /id="diagnostics"|sent-fps|round-trip|server-time/);
 assert.doesNotMatch(
   browserHtml,
@@ -53,7 +60,7 @@ assert.doesNotMatch(browserScript, /createImageBitmap\(frame\.jpeg\)|request\.jp
 
 assert.deepEqual(PROFILE, {
   protocolVersion: 2,
-  longEdge: 640,
+  longEdge: 1024,
   jpegQuality: 0.90,
   targetFps: 30,
   requestWindow: 5,
@@ -61,8 +68,8 @@ assert.deepEqual(PROFILE, {
   upscaleSmallInputs: false,
 });
 
-assert.deepEqual(fitLongEdge(1920, 1080), [640, 360]);
-assert.deepEqual(fitLongEdge(1080, 1920), [360, 640]);
+assert.deepEqual(fitLongEdge(1920, 1080), [1024, 576]);
+assert.deepEqual(fitLongEdge(1080, 1920), [576, 1024]);
 assert.deepEqual(fitLongEdge(320, 240), [320, 240]);
 
 assert.equal(validateSessionId(" Session-A "), " Session-A ");
@@ -71,6 +78,10 @@ assert.throws(() => validateSessionId("가".repeat(86)), /256 UTF-8 bytes/);
 assert.equal(
   whitelistUrl(" Session-A "),
   "/api/whitelist?session_id=%20Session-A%20",
+);
+assert.equal(
+  inferenceUrl(" Session-A "),
+  "/api/infer-image?session_id=%20Session-A%20",
 );
 assert.equal(
   websocketUrl({ protocol: "https:", host: "demo.test" }, "session-b"),
@@ -177,7 +188,7 @@ const reusedTab = await ensureTabSession(
 assert.equal(reusedTab.created, false);
 assert.equal(reusedTab.active.session_id, firstTab.active.session_id);
 
-assert.deepEqual(enrollmentSize(1600, 800), [640, 320]);
+assert.deepEqual(enrollmentSize(1600, 800), [1024, 512]);
 assert.deepEqual(enrollmentSize(320, 240), [320, 240]);
 assert.throws(() => enrollmentSize(0, 100), /invalid dimensions/);
 
@@ -213,9 +224,9 @@ const normalizedPng = await normalizeWhitelistImage(
   },
 );
 assert.equal(normalizedPng.type, "image/jpeg");
-assert.deepEqual([canvas.width, canvas.height], [640, 320]);
-assert.deepEqual(imageOperations[0], ["fill", "#fff", 0, 0, 640, 320]);
-assert.deepEqual(imageOperations[1], ["draw", 0, 0, 640, 320]);
+assert.deepEqual([canvas.width, canvas.height], [1024, 512]);
+assert.deepEqual(imageOperations[0], ["fill", "#fff", 0, 0, 1024, 512]);
+assert.deepEqual(imageOperations[1], ["draw", 0, 0, 1024, 512]);
 assert.equal(encodedQuality, PROFILE.jpegQuality);
 assert.equal(enrollmentBitmapCloses, 1, "normalized image bitmap must close once");
 
@@ -324,6 +335,55 @@ assert.deepEqual(queriedStatus, {
   whitelist_version: 3,
   entry_ids: ["entry-a", "entry/b"],
 });
+
+let inferenceRequest = null;
+const inferenceResult = await inferImage(
+  { type: "image/png", name: "scene.png" },
+  "session-image",
+  async (url, options) => {
+    inferenceRequest = { url, options };
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        session_id: "session-image",
+        source: { width: 1600, height: 900 },
+        model_input: {
+          width: 1024,
+          height: 576,
+          long_edge: 1024,
+          jpeg_base64: "input-jpeg",
+        },
+        visualization: {
+          width: 1024,
+          height: 576,
+          jpeg_base64: "visualized-jpeg",
+        },
+        objects: [
+          { class_id: 0, class_name: "face" },
+          { class_id: 1, class_name: "number_plate" },
+        ],
+        elapsed_ms: 4.5,
+      }),
+    };
+  },
+);
+assert.equal(inferenceRequest.url, "/api/infer-image?session_id=session-image");
+assert.equal(inferenceRequest.options.method, "POST");
+assert.equal(inferenceRequest.options.headers["content-type"], "image/png");
+assert.equal(inferenceRequest.options.body.type, "image/png");
+assert.deepEqual(inferenceResult.model_input, {
+  width: 1024,
+  height: 576,
+  long_edge: 1024,
+  jpeg_base64: "input-jpeg",
+});
+assert.equal(inferenceResult.objects[1].class_name, "number_plate");
+
+assert.equal(isSupportedVideoFile({ type: "video/mp4" }), true);
+assert.equal(isSupportedVideoFile({ type: "video/webm" }), true);
+assert.equal(isSupportedVideoFile({ type: "image/jpeg" }), false);
+assert.equal(isSupportedVideoFile({ type: "" }), true);
 
 let deletedWhitelistRequest = null;
 await deleteWhitelistEntry("session b", "entry/b", async (url, options) => {
@@ -520,7 +580,7 @@ assert.throws(
 const missingJpeg = resultPacket.slice(0, resultPacket.length - 4);
 assert.throws(() => parseMosaicResult(missingJpeg), /missing its JPEG/);
 assert.throws(
-  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, width: 641 })),
+  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, width: 1025 })),
   /dimensions are invalid/,
 );
 

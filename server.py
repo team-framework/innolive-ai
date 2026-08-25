@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import logging
 import math
 import time
@@ -21,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from grpc_client import VideoClientError, VideoFrame, VideoProcessorClient, VideoRpcError
+from service.frame import FrameLimits, decode_image, resize_long_edge
 from service.protocol import (
     HEADER,
     MAGIC,
@@ -32,15 +34,16 @@ from service.protocol import (
     recover_sequence,
 )
 from service.recognition import validate_entry_id, validate_session_id
+from service.runtime import IMAGE_SIZE, STANDARD_PROFILE
+from service.visualization import annotate_detections, encode_jpeg
 
 LOGGER = logging.getLogger("innolive.demo")
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
-PROFILE = "B1-640-Q90-W5"
+PROFILE = STANDARD_PROFILE
 GRPC_SERVICE = "AiProcessor"
 REQUEST_WINDOW = 5
 TARGET_FPS = 30
-IMAGE_SIZE = 640
 JPEG_QUALITY = 90
 RECOVERABLE_GRPC_ERRORS = frozenset({"DECODE_FAILED", "INVALID_BATCH_SIZE"})
 STAT_FIELDS = (
@@ -284,6 +287,85 @@ class GrpcDemoGateway:
                 "whitelist_version": int(response.whitelist_version),
             },
             status_code=201,
+        )
+
+    async def infer_image(self, request: Request) -> JSONResponse:
+        """Run one uploaded image through the same gRPC detector path."""
+
+        client = await self._api_client(request)
+        if isinstance(client, JSONResponse):
+            return client
+        session_id = self._api_session_id(request)
+        if isinstance(session_id, JSONResponse):
+            return session_id
+        started = time.perf_counter()
+        try:
+            encoded = await _bounded_body(request, self.settings.max_jpeg_bytes)
+            source = decode_image(
+                encoded,
+                FrameLimits(max_jpeg_bytes=self.settings.max_jpeg_bytes),
+            )
+            source_height, source_width = source.shape[:2]
+            model_input = resize_long_edge(source, IMAGE_SIZE)
+            model_input_jpeg = encode_jpeg(model_input, JPEG_QUALITY)
+            if len(model_input_jpeg) > self.settings.max_jpeg_bytes:
+                raise PayloadTooLarge(
+                    f"resized model input exceeds the {self.settings.max_jpeg_bytes} byte limit"
+                )
+
+            result = None
+            async with aclosing(
+                client.process_jpegs(
+                    [model_input_jpeg],
+                    session_id=session_id,
+                    window=1,
+                )
+            ) as results:
+                async for item in results:
+                    result = item
+                    break
+            if result is None:
+                raise VideoClientError("gRPC returned no image inference result")
+
+            response = result.response
+            expected_size = (model_input.shape[1], model_input.shape[0])
+            response_size = (int(response.width), int(response.height))
+            if response_size != expected_size:
+                raise VideoClientError(
+                    "gRPC image result dimensions do not match the resized model input"
+                )
+            objects = [_face_object(face) for face in response.faces]
+            visualization = annotate_detections(model_input, objects)
+            visualization_jpeg = encode_jpeg(visualization, JPEG_QUALITY)
+        except PayloadTooLarge as error:
+            return _api_error(413, "PAYLOAD_TOO_LARGE", str(error))
+        except (TypeError, ValueError) as error:
+            return _api_error(400, "INVALID_IMAGE", str(error))
+        except VideoRpcError as error:
+            return _rpc_error_response(error)
+        except VideoClientError as error:
+            return _api_error(502, "INFERENCE_FAILED", str(error))
+
+        input_height, input_width = model_input.shape[:2]
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "source": {"width": int(source_width), "height": int(source_height)},
+                "model_input": {
+                    "width": int(input_width),
+                    "height": int(input_height),
+                    "long_edge": IMAGE_SIZE,
+                    "jpeg_base64": base64.b64encode(model_input_jpeg).decode("ascii"),
+                },
+                "visualization": {
+                    "width": int(input_width),
+                    "height": int(input_height),
+                    "jpeg_base64": base64.b64encode(visualization_jpeg).decode("ascii"),
+                },
+                "objects": objects,
+                "elapsed_ms": round((time.perf_counter() - started) * 1_000, 2),
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     async def delete_whitelist(self, request: Request) -> Response:
@@ -615,9 +697,10 @@ class GrpcWebSocketSession:
 
 
 def _face_object(face: Any) -> dict[str, Any]:
+    class_name = str(face.class_name) or "face"
     item = {
-        "class_id": 0,
-        "class_name": str(face.class_name) or "face",
+        "class_id": {"face": 0, "number_plate": 1}.get(class_name, -1),
+        "class_name": class_name,
         "confidence": round(float(face.confidence), 4),
         "bbox": [
             round(float(face.bbox.x1), 1),
@@ -656,6 +739,7 @@ def create_app(
     app.add_api_route("/api/whitelist", gateway.whitelist_status, methods=["GET"])
     app.add_api_route("/api/whitelist", gateway.add_whitelist, methods=["POST"])
     app.add_api_route("/api/whitelist", gateway.delete_whitelist, methods=["DELETE"])
+    app.add_api_route("/api/infer-image", gateway.infer_image, methods=["POST"])
     app.add_api_websocket_route("/ws", gateway.stream)
     app.state.gateway = gateway
     return app

@@ -7,7 +7,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from service.frame import FrameLimits, decode_image, decode_jpeg
+from service.frame import FrameLimits, decode_image, decode_jpeg, resize_long_edge
 
 
 def _jpeg_header(width: int, height: int) -> bytes:
@@ -116,6 +116,15 @@ class FrameBoundaryTests(unittest.TestCase):
         self.assertTrue(success)
         decoded = decode_jpeg(encoded.tobytes())
         self.assertEqual(decoded.shape, (1080, 1920, 3))
+
+    def test_resize_long_edge_does_not_upscale_and_preserves_aspect_ratio(self):
+        image = np.zeros((900, 1600, 3), dtype=np.uint8)
+        resized = resize_long_edge(image, 1024)
+        unchanged = resize_long_edge(image, 2048)
+
+        self.assertEqual(resized.shape, (576, 1024, 3))
+        self.assertEqual(unchanged.shape, image.shape)
+        self.assertIsNot(resized, image)
 
     def test_pixel_area_over_the_limit_is_rejected_before_decode(self):
         # A caller may cap area below max_long_edge**2 (e.g. FHD area). A frame
