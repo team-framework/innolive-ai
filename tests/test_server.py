@@ -377,11 +377,11 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(payload["source"], {"width": 1600, "height": 900})
         self.assertEqual(
             payload["model_input"] | {"jpeg_base64": ""},
-            {"width": 1024, "height": 576, "long_edge": 1024, "jpeg_base64": ""},
+            {"width": 640, "height": 360, "long_edge": 640, "jpeg_base64": ""},
         )
         self.assertEqual(
             (payload["visualization"]["width"], payload["visualization"]["height"]),
-            (1024, 576),
+            (640, 360),
         )
         self.assertEqual(
             [item["class_id"] for item in payload["objects"]],
@@ -394,8 +394,8 @@ class GrpcDemoGatewayTests(unittest.TestCase):
             np.frombuffer(visualization_jpeg, dtype=np.uint8),
             cv2.IMREAD_COLOR,
         )
-        self.assertEqual(input_image.shape, (576, 1024, 3))
-        self.assertEqual(visualization.shape, (576, 1024, 3))
+        self.assertEqual(input_image.shape, (360, 640, 3))
+        self.assertEqual(visualization.shape, (360, 640, 3))
         self.assertGreater(int(np.std(visualization)), int(np.std(input_image)))
         self.assertEqual(fake.image_inference_options, ("session-image", 1))
         self.assertEqual(len(fake.image_inference_inputs), 1)
@@ -404,7 +404,7 @@ class GrpcDemoGatewayTests(unittest.TestCase):
                 np.frombuffer(fake.image_inference_inputs[0][1], dtype=np.uint8),
                 cv2.IMREAD_COLOR,
             ).shape,
-            (576, 1024, 3),
+            (360, 640, 3),
         )
 
     def test_image_inference_validates_session_image_and_body_limit(self):

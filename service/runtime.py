@@ -31,8 +31,8 @@ if TYPE_CHECKING:
     from service.tracking import StreamTracker
 
 
-IMAGE_SIZE = 1024
-STANDARD_PROFILE = "B1-1024-Q90-W5"
+IMAGE_SIZE = 640
+STANDARD_PROFILE = "B1-640-Q90-W5"
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})

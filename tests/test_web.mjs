@@ -60,7 +60,7 @@ assert.doesNotMatch(browserScript, /createImageBitmap\(frame\.jpeg\)|request\.jp
 
 assert.deepEqual(PROFILE, {
   protocolVersion: 2,
-  longEdge: 1024,
+  longEdge: 640,
   jpegQuality: 0.90,
   targetFps: 30,
   requestWindow: 5,
@@ -68,8 +68,8 @@ assert.deepEqual(PROFILE, {
   upscaleSmallInputs: false,
 });
 
-assert.deepEqual(fitLongEdge(1920, 1080), [1024, 576]);
-assert.deepEqual(fitLongEdge(1080, 1920), [576, 1024]);
+assert.deepEqual(fitLongEdge(1920, 1080), [640, 360]);
+assert.deepEqual(fitLongEdge(1080, 1920), [360, 640]);
 assert.deepEqual(fitLongEdge(320, 240), [320, 240]);
 
 assert.equal(validateSessionId(" Session-A "), " Session-A ");
@@ -188,7 +188,7 @@ const reusedTab = await ensureTabSession(
 assert.equal(reusedTab.created, false);
 assert.equal(reusedTab.active.session_id, firstTab.active.session_id);
 
-assert.deepEqual(enrollmentSize(1600, 800), [1024, 512]);
+assert.deepEqual(enrollmentSize(1600, 800), [640, 320]);
 assert.deepEqual(enrollmentSize(320, 240), [320, 240]);
 assert.throws(() => enrollmentSize(0, 100), /invalid dimensions/);
 
@@ -224,9 +224,9 @@ const normalizedPng = await normalizeWhitelistImage(
   },
 );
 assert.equal(normalizedPng.type, "image/jpeg");
-assert.deepEqual([canvas.width, canvas.height], [1024, 512]);
-assert.deepEqual(imageOperations[0], ["fill", "#fff", 0, 0, 1024, 512]);
-assert.deepEqual(imageOperations[1], ["draw", 0, 0, 1024, 512]);
+assert.deepEqual([canvas.width, canvas.height], [640, 320]);
+assert.deepEqual(imageOperations[0], ["fill", "#fff", 0, 0, 640, 320]);
+assert.deepEqual(imageOperations[1], ["draw", 0, 0, 640, 320]);
 assert.equal(encodedQuality, PROFILE.jpegQuality);
 assert.equal(enrollmentBitmapCloses, 1, "normalized image bitmap must close once");
 
@@ -349,14 +349,14 @@ const inferenceResult = await inferImage(
         session_id: "session-image",
         source: { width: 1600, height: 900 },
         model_input: {
-          width: 1024,
-          height: 576,
-          long_edge: 1024,
+          width: 640,
+          height: 360,
+          long_edge: 640,
           jpeg_base64: "input-jpeg",
         },
         visualization: {
-          width: 1024,
-          height: 576,
+          width: 640,
+          height: 360,
           jpeg_base64: "visualized-jpeg",
         },
         objects: [
@@ -373,9 +373,9 @@ assert.equal(inferenceRequest.options.method, "POST");
 assert.equal(inferenceRequest.options.headers["content-type"], "image/png");
 assert.equal(inferenceRequest.options.body.type, "image/png");
 assert.deepEqual(inferenceResult.model_input, {
-  width: 1024,
-  height: 576,
-  long_edge: 1024,
+  width: 640,
+  height: 360,
+  long_edge: 640,
   jpeg_base64: "input-jpeg",
 });
 assert.equal(inferenceResult.objects[1].class_name, "number_plate");
@@ -580,7 +580,7 @@ assert.throws(
 const missingJpeg = resultPacket.slice(0, resultPacket.length - 4);
 assert.throws(() => parseMosaicResult(missingJpeg), /missing its JPEG/);
 assert.throws(
-  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, width: 1025 })),
+  () => parseMosaicResult(mosaicPacket(7, { ...resultMetadata, width: 641 })),
   /dimensions are invalid/,
 );
 

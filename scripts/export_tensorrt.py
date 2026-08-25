@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the standard static B1-1024 FP16 TensorRT segmentation model."""
+"""Export the standard static B1-640 FP16 TensorRT segmentation model."""
 
 from __future__ import annotations
 

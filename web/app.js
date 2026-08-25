@@ -2,7 +2,7 @@
 
 export const PROFILE = Object.freeze({
   protocolVersion: 2,
-  longEdge: 1024,
+  longEdge: 640,
   jpegQuality: 0.90,
   targetFps: 30,
   requestWindow: 5,

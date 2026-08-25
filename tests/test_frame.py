@@ -119,10 +119,10 @@ class FrameBoundaryTests(unittest.TestCase):
 
     def test_resize_long_edge_does_not_upscale_and_preserves_aspect_ratio(self):
         image = np.zeros((900, 1600, 3), dtype=np.uint8)
-        resized = resize_long_edge(image, 1024)
+        resized = resize_long_edge(image, 640)
         unchanged = resize_long_edge(image, 2048)
 
-        self.assertEqual(resized.shape, (576, 1024, 3))
+        self.assertEqual(resized.shape, (360, 640, 3))
         self.assertEqual(unchanged.shape, image.shape)
         self.assertIsNot(resized, image)
 
