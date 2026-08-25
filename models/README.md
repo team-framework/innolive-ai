@@ -1,6 +1,6 @@
 # Runtime model files
 
-`best.pt` is the serving YOLO segmentation checkpoint. The runtime uses `imgsz=1024`
+`best.pt` is the serving YOLO segmentation checkpoint. The runtime uses `imgsz=640`
 and expects class `0` as `face` and class `1` as `number_plate`; both classes are
 included in the protected mosaic path, while only `face` enters AdaFace recognition.
 

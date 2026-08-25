@@ -49,7 +49,7 @@ App client는 gRPC를 직접 호출하고, 브라우저 demo만 `server.py`의 W
   - SAM 3.1을 이용한 bbox → segmentation mask 변환
   - 데이터 구축·학습 pipeline은 외부에서 관리하며, 이 저장소는 serving checkpoint와 runtime을 다룹니다.
 - **객체 탐지 · 추적**
-  - YOLO26n-seg: 1024px, face·number_plate 2-class instance segmentation
+  - YOLO26n-seg: 640px, face·number_plate 2-class instance segmentation
   - BoT-SORT: stream-local multi-object tracking과 temporal mask hold
 - **얼굴 인식 · 정렬**
   - AdaFace ViT-Base KP-RPE, WebFace12M: 512차원 face embedding과 cosine matching
@@ -150,7 +150,7 @@ manifest의 serving profile·engine/checkpoint hash와 TensorRT version을 검�
 `VideoFrame(mosaic=MosaicConfig(blur_radius=..., pixel_size=...))`으로 전달합니다.
 
 브라우저 demo gateway는 `POST /api/infer-image?session_id=...`에 JPEG·PNG·WebP를 raw body로
-받습니다. 입력은 long edge 1024 이하로 resize한 뒤 gRPC `ProcessVideo`에 전달하며, 응답에는
+받습니다. 입력은 long edge 640 이하로 resize한 뒤 gRPC `ProcessVideo`에 전달하며, 응답에는
 동일한 model input JPEG, box/mask overlay JPEG, object metadata가 포함됩니다.
 
 등록 이미지는 저장하지 않고 정규화된 AdaFace embedding만 메모리에 유지합니다. 자세한

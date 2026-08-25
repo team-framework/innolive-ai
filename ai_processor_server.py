@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production gRPC entry point for the B1-1024 protected-video pipeline."""
+"""Production gRPC entry point for the B1-640 protected-video pipeline."""
 
 from __future__ import annotations
 
@@ -921,7 +921,7 @@ def port_number(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="InnoLive B1-1024 protected-video gRPC server")
+    parser = argparse.ArgumentParser(description="InnoLive B1-640 protected-video gRPC server")
     parser.add_argument("--host", default=os.getenv("GRPC_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port",
@@ -1012,7 +1012,7 @@ def parse_args() -> argparse.Namespace:
         "--max-long-edge",
         type=positive_int,
         default=positive_int(os.getenv("MAX_LONG_EDGE", str(MAX_LONG_EDGE))),
-        help="Long-edge ceiling for decoded frames (default supports FHD; lower to pin the profile, e.g. 1024).",
+        help="Long-edge ceiling for decoded frames (default supports FHD; lower to pin the profile, e.g. 640).",
     )
     parser.add_argument(
         "--inference-timeout",

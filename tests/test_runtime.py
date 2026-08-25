@@ -24,11 +24,11 @@ class RuntimeContractTests(unittest.TestCase):
         engine.write_bytes(b"engine")
         manifest = {
             "schema_version": 1,
-            "standard_profile": "B1-1024-Q90-W5",
+            "standard_profile": "B1-640-Q90-W5",
             "precision": "fp16",
             "dynamic": False,
             "batch": 1,
-            "image_size": 1024,
+            "image_size": 640,
             "class_names": {"0": "face", "1": "number_plate"},
             "source_checkpoint": "best.pt",
             "source_sha256": hashlib.sha256(b"checkpoint").hexdigest(),
@@ -98,7 +98,7 @@ class RuntimeContractTests(unittest.TestCase):
         config = RuntimeConfig(backend=" PyTorch ", device=" MPS ")
         self.assertEqual((config.backend, config.device), ("pytorch", "mps"))
 
-    def test_prediction_uses_1024_and_both_model_classes(self):
+    def test_prediction_uses_640_and_both_model_classes(self):
         class FakeModel:
             def __init__(self):
                 self.kwargs = None
