@@ -40,18 +40,20 @@ class WhitelistEntryNotFoundError(LookupError):
 
 
 def validate_session_id(value: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("session_id must not be empty or whitespace-only")
-    if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
-        raise ValueError(f"session_id exceeds {MAX_SESSION_ID_BYTES} UTF-8 bytes")
-    return value
+    return _validate_identifier("session_id", value, MAX_SESSION_ID_BYTES)
 
 
 def validate_entry_id(value: str) -> str:
+    return _validate_identifier("entry_id", value, MAX_ENTRY_ID_BYTES)
+
+
+def _validate_identifier(name: str, value: str, max_bytes: int) -> str:
+    """Validate opaque client IDs without normalizing their wire representation."""
+
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("entry_id must not be empty or whitespace-only")
-    if len(value.encode("utf-8")) > MAX_ENTRY_ID_BYTES:
-        raise ValueError(f"entry_id exceeds {MAX_ENTRY_ID_BYTES} UTF-8 bytes")
+        raise ValueError(f"{name} must not be empty or whitespace-only")
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{name} exceeds {max_bytes} UTF-8 bytes")
     return value
 
 
