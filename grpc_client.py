@@ -319,14 +319,11 @@ class VideoProcessorClient:
         session_id: str,
         timeout: float = 10.0,
     ) -> ai_processor_pb2.WhitelistResponse:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         session_id = validate_session_id(session_id)
         encoded = _validate_image(image)
         try:
-            return await self._stub.AddWhitelist(
+            return await stub.AddWhitelist(
                 ai_processor_pb2.FaceData(data=encoded, session_id=session_id),
                 timeout=timeout,
             )
@@ -340,14 +337,11 @@ class VideoProcessorClient:
         session_id: str,
         timeout: float = 2.0,
     ) -> ai_processor_pb2.WhitelistResponse:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         session_id = validate_session_id(session_id)
         entry_id = validate_entry_id(entry_id)
         try:
-            response = await self._stub.DeleteWhitelist(
+            response = await stub.DeleteWhitelist(
                 ai_processor_pb2.DeleteWhitelistRequest(
                     session_id=session_id,
                     entry_id=entry_id,
@@ -365,12 +359,9 @@ class VideoProcessorClient:
         *,
         timeout: float = 2.0,
     ) -> ai_processor_pb2.SessionInfo:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         try:
-            response = await self._stub.CreateSession(
+            response = await stub.CreateSession(
                 ai_processor_pb2.CreateSessionRequest(),
                 timeout=timeout,
             )
@@ -384,12 +375,9 @@ class VideoProcessorClient:
         *,
         timeout: float = 2.0,
     ) -> tuple[ai_processor_pb2.SessionInfo, ...]:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         try:
-            response = await self._stub.ListSessions(
+            response = await stub.ListSessions(
                 ai_processor_pb2.ListSessionsRequest(),
                 timeout=timeout,
             )
@@ -406,13 +394,10 @@ class VideoProcessorClient:
         *,
         timeout: float = 2.0,
     ) -> None:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         session_id = validate_session_id(session_id)
         try:
-            await self._stub.DeleteSession(
+            await stub.DeleteSession(
                 ai_processor_pb2.DeleteSessionRequest(session_id=session_id),
                 timeout=timeout,
             )
@@ -443,13 +428,10 @@ class VideoProcessorClient:
         *,
         timeout: float = 2.0,
     ) -> ai_processor_pb2.GetWhitelistStatusResponse:
-        if self._stub is None:
-            raise RuntimeError("use VideoProcessorClient with 'async with'")
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        stub = self._request_stub(timeout)
         session_id = validate_session_id(session_id)
         try:
-            response = await self._stub.GetWhitelistStatus(
+            response = await stub.GetWhitelistStatus(
                 ai_processor_pb2.GetWhitelistStatusRequest(session_id=session_id),
                 timeout=timeout,
             )
@@ -470,6 +452,15 @@ class VideoProcessorClient:
         if len(entry_ids) != len(set(entry_ids)):
             raise VideoProtocolError("GetWhitelistStatus returned duplicate entry IDs")
         return response
+
+    def _request_stub(self, timeout: float) -> ai_processor_pb2_grpc.AiProcessorStub:
+        """Return an open service stub after applying the shared unary-RPC contract."""
+
+        if self._stub is None:
+            raise RuntimeError("use VideoProcessorClient with 'async with'")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        return self._stub
 
     async def process_video(
         self,
