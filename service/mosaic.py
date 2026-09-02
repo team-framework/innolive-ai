@@ -54,44 +54,56 @@ def mosaic_jpeg(
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
     mask = _protected_mask(image.shape[:2], objects)
-    blend_mask = _feathered_mask(mask)
-    output = image
+    output = _mosaic_masked_region(image, _feathered_mask(mask), blur_radius, pixel_size)
+
+    return _encode_jpeg(output, max_bytes)
+
+
+def _mosaic_masked_region(
+    image: np.ndarray,
+    blend_mask: np.ndarray,
+    blur_radius: float,
+    pixel_size: int,
+) -> np.ndarray:
+    """Apply the protected-region transform to the smallest blur-safe crop."""
+
     mask_rows, mask_columns = np.nonzero(blend_mask)
-    if mask_rows.size:
-        padding = math.ceil(blur_radius * 3)
-        top = max(0, int(mask_rows.min()) - padding)
-        bottom = min(image.shape[0], int(mask_rows.max()) + padding + 1)
-        left = max(0, int(mask_columns.min()) - padding)
-        right = min(image.shape[1], int(mask_columns.max()) + padding + 1)
-        region = image[top:bottom, left:right]
-        reduced_size = (
-            max(1, math.ceil(region.shape[1] / pixel_size)),
-            max(1, math.ceil(region.shape[0] / pixel_size)),
-        )
-        reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
-        reduced_sigma = blur_radius / pixel_size
-        blurred_reduced = cv2.GaussianBlur(
-            reduced,
-            (0, 0),
-            reduced_sigma,
-            reduced_sigma,
-        )
-        blurred = cv2.resize(
-            blurred_reduced,
-            (region.shape[1], region.shape[0]),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        output = image.copy()
-        alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
-        inverse_alpha = 255 - alpha
-        output[top:bottom, left:right] = (
-            region.astype(np.uint32) * inverse_alpha + blurred.astype(np.uint32) * alpha + 127
-        ) // 255
+    if not mask_rows.size:
+        return image
+
+    padding = math.ceil(blur_radius * 3)
+    top = max(0, int(mask_rows.min()) - padding)
+    bottom = min(image.shape[0], int(mask_rows.max()) + padding + 1)
+    left = max(0, int(mask_columns.min()) - padding)
+    right = min(image.shape[1], int(mask_columns.max()) + padding + 1)
+    region = image[top:bottom, left:right]
+    reduced_size = (
+        max(1, math.ceil(region.shape[1] / pixel_size)),
+        max(1, math.ceil(region.shape[0] / pixel_size)),
+    )
+    reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
+    reduced_sigma = blur_radius / pixel_size
+    blurred = cv2.resize(
+        cv2.GaussianBlur(reduced, (0, 0), reduced_sigma, reduced_sigma),
+        (region.shape[1], region.shape[0]),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    output = image.copy()
+    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
+    inverse_alpha = 255 - alpha
+    output[top:bottom, left:right] = (
+        region.astype(np.uint32) * inverse_alpha + blurred.astype(np.uint32) * alpha + 127
+    ) // 255
+    return output
+
+
+def _encode_jpeg(image: np.ndarray, max_bytes: int) -> bytes:
+    """Encode the final BGR frame while retaining the serving byte contract."""
 
     try:
         encoded, payload = cv2.imencode(
             ".jpg",
-            output,
+            image,
             [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
         )
     except cv2.error as error:
