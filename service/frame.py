@@ -93,16 +93,7 @@ def decode_jpeg(jpeg: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> np.n
 
     declared_width, declared_height = _jpeg_dimensions(jpeg)
     _validate_dimensions(declared_width, declared_height, limits)
-    try:
-        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-    except cv2.error as error:
-        raise ValueError("frame could not be decoded as JPEG") from error
-    if image is None:
-        raise ValueError("frame could not be decoded as JPEG")
-
-    height, width = image.shape[:2]
-    _validate_dimensions(width, height, limits)
-    return image
+    return _decode_bgr(jpeg, limits, error_message="frame could not be decoded as JPEG")
 
 
 def decode_image(encoded: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> np.ndarray:
@@ -117,14 +108,20 @@ def decode_image(encoded: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> 
 
     width, height = _non_jpeg_dimensions(encoded)
     _validate_dimensions(width, height, limits)
+    return _decode_bgr(encoded, limits, error_message="encoded image could not be decoded")
+
+
+def _decode_bgr(encoded: bytes, limits: FrameLimits, *, error_message: str) -> np.ndarray:
+    """Decode an already format-validated image and enforce decoded dimensions."""
+
     try:
         image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     except cv2.error as error:
-        raise ValueError("encoded image could not be decoded") from error
+        raise ValueError(error_message) from error
     if image is None:
-        raise ValueError("encoded image could not be decoded")
-    decoded_height, decoded_width = image.shape[:2]
-    _validate_dimensions(decoded_width, decoded_height, limits)
+        raise ValueError(error_message)
+    height, width = image.shape[:2]
+    _validate_dimensions(width, height, limits)
     return image
 
 

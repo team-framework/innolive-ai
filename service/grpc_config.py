@@ -12,8 +12,7 @@ PROTOBUF_OVERHEAD_BYTES = 64 * 1024
 def server_options() -> tuple[tuple[str, int], ...]:
     minimum_ping_ms = _positive_env("GRPC_MIN_RECV_PING_MS", 30_000)
     return (
-        ("grpc.max_receive_message_length", MAX_JPEG_BYTES + PROTOBUF_OVERHEAD_BYTES),
-        ("grpc.max_send_message_length", MAX_GRPC_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES),
+        *_message_size_options(receive=MAX_JPEG_BYTES, send=MAX_GRPC_RESPONSE_BYTES),
         ("grpc.so_reuseport", 0),
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.min_ping_interval_without_data_ms", minimum_ping_ms),
@@ -27,11 +26,7 @@ def channel_options() -> tuple[tuple[str, int], ...]:
     if keepalive_ms < minimum_ping_ms:
         raise ValueError("GRPC_KEEPALIVE_MS must be at least GRPC_MIN_RECV_PING_MS")
     return (
-        ("grpc.max_send_message_length", MAX_JPEG_BYTES + PROTOBUF_OVERHEAD_BYTES),
-        (
-            "grpc.max_receive_message_length",
-            MAX_GRPC_RESPONSE_BYTES + PROTOBUF_OVERHEAD_BYTES,
-        ),
+        *_message_size_options(receive=MAX_GRPC_RESPONSE_BYTES, send=MAX_JPEG_BYTES),
         ("grpc.keepalive_time_ms", keepalive_ms),
         ("grpc.keepalive_timeout_ms", 20_000),
         ("grpc.keepalive_permit_without_calls", 1),
@@ -41,6 +36,15 @@ def channel_options() -> tuple[tuple[str, int], ...]:
 
 def listen_address(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+
+
+def _message_size_options(*, receive: int, send: int) -> tuple[tuple[str, int], ...]:
+    """Return directional gRPC limits with protobuf headroom in one place."""
+
+    return (
+        ("grpc.max_receive_message_length", receive + PROTOBUF_OVERHEAD_BYTES),
+        ("grpc.max_send_message_length", send + PROTOBUF_OVERHEAD_BYTES),
+    )
 
 
 def _positive_env(name: str, default: int) -> int:

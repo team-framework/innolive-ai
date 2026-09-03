@@ -170,6 +170,19 @@ message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor
 node tests/test_web.mjs
 ```
 
+### CPU-safe smoke test
+
+GPU가 사용 중인 개발 환경에서는 모델 runtime server를 새로 띄우지 않고 아래 검증만
+실행합니다. 이 스모크 스위트는 runtime·gRPC transport의 test double을 사용해 GPU server를
+시작하지 않습니다. 실제 model artifact를 이용한 성능 측정은 배포 GPU에서만 수행하세요.
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m unittest discover -s tests
+node tests/test_web.mjs
+```
+
 배포 GPU용 `scripts/benchmark_grpc.py`는 30 FPS, server p95 33.3 ms 이하와 W5 ordering을
 acceptance target으로 검사합니다. 이는 보장된 성능 수치가 아니므로 실제 sequential
 validation video와 배포 환경에서 다시 측정해야 합니다.
@@ -197,6 +210,22 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 ├── tests/                   # Python·Node 회귀 테스트
 ├── web/                     # browser demo client
 ```
+
+### 코드 경계
+
+기능을 추가하거나 내부를 정리할 때에는 다음 경계를 유지합니다. 이렇게 하면 transport와
+모델 runtime을 독립적으로 테스트할 수 있고, 보호 정책이 UI 구현에 섞이지 않습니다.
+
+| 영역 | 책임 | 의존하면 안 되는 영역 |
+| --- | --- | --- |
+| `service/frame.py`, `service/protocol.py` | 입력 크기·형식 검증과 browser binary codec | 모델·세션 상태 |
+| `service/runtime.py`, `service/tracking.py` | detector 실행, stream-local track과 mask 안정화 | HTTP/WebSocket |
+| `service/recognition.py`, `service/mosaic.py` | whitelist 판단과 fail-closed 픽셀 보호 | gRPC/FastAPI 객체 |
+| `ai_processor_server.py` | protobuf 변환, lifecycle, bounded execution lane | browser protocol |
+| `grpc_client.py`, `server.py` | 각각 app client와 browser demo transport adapter | model 직접 로딩 |
+
+공개 API·protobuf 계약을 바꾸지 않는 정리는 해당 계층 안의 private helper로 제한하고,
+경계가 바뀌는 변경은 protocol test와 transport test를 함께 갱신합니다.
 
 ## 라이선스
 
