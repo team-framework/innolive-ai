@@ -36,6 +36,7 @@ from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
+DEFAULT_DETECTOR_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
@@ -639,7 +640,7 @@ class SwapLab:
         from ultralytics import YOLO
 
         self.settings = settings
-        self.model = YOLO(str(settings.detector), task="segment")
+        self.model, self.detector_backend = self._load_detector(YOLO, settings.detector)
         self.names = {int(key): str(value) for key, value in self.model.names.items()}
         if self.names != {0: "face", 1: "number_plate"}:
             raise RuntimeError(f"expected class 0=face and 1=number_plate, got {self.names}")
@@ -667,6 +668,24 @@ class SwapLab:
         self.worker: asyncio.Task[None] | None = None
         self.frames = 0
         self.latencies: deque[float] = deque(maxlen=300)
+
+    @staticmethod
+    def _load_detector(yolo: Any, detector_path: Path) -> tuple[Any, str]:
+        """Keep the swap test runnable when a serialized detector is from another TRT runtime."""
+
+        try:
+            model = yolo(str(detector_path), task="segment")
+            # Ultralytics may defer TensorRT deserialization until this property access.
+            _ = model.names
+            return model, "TensorRT" if detector_path.suffix == ".engine" else "PyTorch"
+        except Exception as error:
+            if detector_path.suffix != ".engine" or not DEFAULT_DETECTOR_CHECKPOINT.is_file():
+                raise
+            print(
+                f"Detector engine could not load ({error}); using {DEFAULT_DETECTOR_CHECKPOINT.name} "
+                "until it is rebuilt for this TensorRT runtime."
+            )
+            return yolo(str(DEFAULT_DETECTOR_CHECKPOINT), task="segment"), "PyTorchFallback"
 
     async def start(self) -> None:
         self.worker = asyncio.create_task(self._batch_loop(), name="yolo-swap-batcher")
@@ -954,6 +973,7 @@ def create_app(settings: Settings) -> FastAPI:
             "queue": lab.queue.qsize(),
             "p50_ms": float(np.percentile(lab.latencies, 50)) if lab.latencies else None,
             "swapper_providers": lab.swapper.provider_summary(),
+            "detector_backend": lab.detector_backend,
             "last_swap_alignment_ms": round(lab.swapper.last_alignment_ms, 2),
             "last_swap_generator_ms": round(lab.swapper.last_generator_ms, 2),
         }
