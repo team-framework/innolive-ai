@@ -14,8 +14,36 @@ python3 -m venv .venv-face-swap-lab
 .venv-face-swap-lab/bin/pip install -r requirements-face-swap-lab.txt
 ```
 
+## AlphaFace 256 실험
+
+기본값은 `AlphaFace 256 (CoreML/CPU)`입니다. 이 모드는 InsightFace `buffalo_l`로 source
+embedding과 매 frame target face를 만들고, 256px AlphaFace ONNX를 실행한 뒤 원래 FHD frame에
+합성합니다.
+
+```text
+models/face_swap/alphaface/alphaface_swapper_fused_norm.onnx
+models/face_swap/alphaface/emp.npy
+~/.insightface/models/buffalo_l/
+```
+
+두 AlphaFace asset은 `models/face_swap/` 아래에 두며 Git에서는 제외됩니다. 현재 내려받은
+ONNX는 공개된 community conversion artifact이므로 **품질·성능 평가 전용**으로 사용합니다.
+FaceFusion은 같은 계열 AlphaFace artifact를 Non-Commercial로 표기하므로, 서비스 배포 전에
+원 가중치와 변환본의 사용 권한을 별도로 확인해야 합니다.
+
+누락된 asset은 아래 command로 다운로드·SHA-256 검증할 수 있습니다.
+
+```bash
+bash scripts/setup_alphaface_lab.sh
+```
+
+이 ONNX의 입력 batch는 고정 `1`입니다. GUI의 `1/4/16 synthetic sessions`는 같은 frame을
+순차 실행해 다중 클라이언트 부하를 확인하는 방식이며, 3090용 dynamic batch 구현은 아닙니다.
+Linux NVIDIA 환경에서는 별도 ONNX export 또는 batch profile을 갖춘 TensorRT engine을 만들어
+batch `1/4/8/16`을 실측해야 합니다.
+
 생성형 face-swap model 없이 webcam·mask·부하 UI를 먼저 확인하려면 아래 command로 실행하고
-기본값인 `Landmark mask mapping (YuNet + 106-point ONNX)`를 선택합니다. 이 모드는
+`Landmark mask mapping (YuNet + 106-point ONNX)`를 선택합니다. 이 모드는
 매 frame YuNet으로 target face를 탐지하고 source의 얼굴 질감을 106개 landmark에 정렬한 뒤
 feathered mask로 합성합니다. 표정·옆모습·가림을 생성하지는
 않지만, 생성형 model보다 훨씬 가볍고 mask 경계와 frame-rate의 기준선으로 적합합니다.
@@ -51,9 +79,9 @@ source image와 webcam 대상에는 모두 사용 권한을 확보해야 합니�
 
 ## 실험 순서
 
-1. session `1`, `Landmark mask mapping`으로 camera·source·mask 품질·저장 버튼을 확인합니다.
-2. session `1`, `InSwapper 128`으로 기본 결과와 frame p50/p95를 저장합니다.
-3. 같은 장면에서 session `4`, `16`을 순서대로 선택합니다.
+1. session `1`, `AlphaFace 256`으로 기본 결과와 frame p50/p95를 저장합니다.
+2. 같은 장면에서 session `4`, `16`을 순서대로 선택합니다.
+3. `Landmark mask mapping`, `InSwapper 128`을 같은 장면에서 비교합니다.
 4. 큰 얼굴, 측면 얼굴, 안경/손/머리카락 가림 장면을 `Save pair`로 저장해 비교합니다.
 
 `Ellipse mask mapping fallback (OpenCV)`은 YuNet 또는 landmark asset이 없을 때만 사용합니다.

@@ -39,8 +39,9 @@ class FaceSwapLabTests(unittest.TestCase):
         caption = face_swap_lab.preview_caption("test model", 16)
         self.assertIn("16 independent synthetic session", caption)
 
-    def test_landmark_mapping_is_registered_before_fallback(self):
-        self.assertEqual(face_swap_lab.MODEL_CHOICES[0], face_swap_lab.MODEL_MESH_MAPPING)
+    def test_alphaface_is_registered_before_fallback(self):
+        self.assertEqual(face_swap_lab.MODEL_CHOICES[0], face_swap_lab.MODEL_ALPHAFACE)
+        self.assertIn(face_swap_lab.MODEL_MESH_MAPPING, face_swap_lab.MODEL_CHOICES)
         self.assertIn(face_swap_lab.MODEL_GEOMETRIC, face_swap_lab.MODEL_CHOICES)
 
     def test_face_roi_is_clipped_to_frame(self):

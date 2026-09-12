@@ -37,10 +37,15 @@ DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_MODEL = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_YUNET_MODEL = ROOT / "models" / "face_detection_yunet_2023mar.onnx"
 DEFAULT_LANDMARK_MODEL = Path.home() / ".insightface" / "models" / "buffalo_l" / "2d106det.onnx"
+DEFAULT_ALPHAFACE_MODEL = (
+    ROOT / "models" / "face_swap" / "alphaface" / "alphaface_swapper_fused_norm.onnx"
+)
+DEFAULT_ALPHAFACE_EMBEDDING_MAP = ROOT / "models" / "face_swap" / "alphaface" / "emp.npy"
+MODEL_ALPHAFACE = "AlphaFace 256 (CoreML/CPU)"
 MODEL_MESH_MAPPING = "Landmark mask mapping (YuNet + 106-point ONNX)"
 MODEL_GEOMETRIC = "Ellipse mask mapping fallback (OpenCV)"
 MODEL_INSWAPPER = "InSwapper 128 (CoreML/CPU)"
-MODEL_CHOICES = (MODEL_MESH_MAPPING, MODEL_GEOMETRIC, MODEL_INSWAPPER)
+MODEL_CHOICES = (MODEL_ALPHAFACE, MODEL_MESH_MAPPING, MODEL_GEOMETRIC, MODEL_INSWAPPER)
 SESSION_CHOICES = (1, 4, 16)
 MAX_SAMPLE_COUNT = 180
 
@@ -84,7 +89,10 @@ def mps_status() -> str:
 
 
 def preferred_preview_model() -> str:
-    """Prefer the local non-generative mapper when its two small assets exist."""
+    """Prefer an installed generative model, then the local non-generative mapper."""
+
+    if DEFAULT_ALPHAFACE_MODEL.is_file() and DEFAULT_ALPHAFACE_EMBEDDING_MAP.is_file():
+        return MODEL_ALPHAFACE
 
     if DEFAULT_YUNET_MODEL.is_file() and DEFAULT_LANDMARK_MODEL.is_file():
         return MODEL_MESH_MAPPING
@@ -340,8 +348,152 @@ class InSwapper128:
         return output, min(len(faces), max_faces)
 
 
-def build_swapper(model_name: str, source_path: Path, model_path: Path):
+class AlphaFace256:
+    """ONNX AlphaFace adapter using buffalo_l embeddings and 256px ArcFace alignment.
+
+    The downloaded ONNX graph has fixed batch size one. The GUI's synthetic
+    sessions therefore measure sequential multi-client pressure, not a dynamic
+    batch implementation for the eventual TensorRT server.
+    """
+
+    name = MODEL_ALPHAFACE
+    _arcface_112_template = np.asarray(
+        (
+            (38.2946, 51.6963),
+            (73.5318, 51.5014),
+            (56.0252, 71.7366),
+            (41.5493, 92.3655),
+            (70.7299, 92.2041),
+        ),
+        dtype=np.float32,
+    )
+
+    def __init__(self, source: np.ndarray, model_path: Path, embedding_map_path: Path):
+        if not model_path.is_file():
+            raise FileNotFoundError(f"AlphaFace ONNX model is missing: {model_path}")
+        if not embedding_map_path.is_file():
+            raise FileNotFoundError(
+                f"AlphaFace identity projection is missing: {embedding_map_path}"
+            )
+        try:
+            import onnxruntime as ort
+            from insightface.app import FaceAnalysis
+        except ImportError as error:
+            raise RuntimeError("install requirements-face-swap-lab.txt to use AlphaFace") from error
+
+        providers, self.provider_status = coreml_providers()
+        self.analysis = FaceAnalysis(name="buffalo_l", providers=providers)
+        self.analysis.prepare(ctx_id=0, det_size=(640, 640))
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self._validate_graph()
+        self.embedding_map = np.load(embedding_map_path).astype(np.float32)
+        if self.embedding_map.shape != (512, 512):
+            raise ValueError("AlphaFace identity projection must have shape (512, 512)")
+        source_faces = self.analysis.get(source)
+        if not source_faces:
+            raise ValueError("no face found in source image")
+        source_face = max(source_faces, key=lambda face: self._area(face.bbox))
+        self.source_embedding = self._project_embedding(source_face.embedding)
+        self.template = self._arcface_112_template * (256.0 / 112.0)
+
+    def _validate_graph(self) -> None:
+        inputs = {item.name: item.shape for item in self.session.get_inputs()}
+        expected = {"target": [1, 3, 256, 256], "source_embedding": [1, 512]}
+        if inputs != expected:
+            raise ValueError(f"unexpected AlphaFace ONNX input contract: {inputs}")
+        outputs = self.session.get_outputs()
+        if len(outputs) != 1 or outputs[0].shape != [1, 3, 256, 256]:
+            raise ValueError("unexpected AlphaFace ONNX output contract")
+
+    @staticmethod
+    def _area(bbox: Any) -> float:
+        return float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+
+    def _project_embedding(self, embedding: np.ndarray) -> np.ndarray:
+        projected = np.asarray(embedding, dtype=np.float32).reshape(1, 512) @ self.embedding_map
+        norm = float(np.linalg.norm(projected))
+        if not np.isfinite(norm) or norm <= 1e-12:
+            raise ValueError("AlphaFace identity projection is invalid")
+        return projected / norm
+
+    def _align(self, frame: np.ndarray, landmarks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        matrix, _ = cv2.estimateAffinePartial2D(
+            np.asarray(landmarks, dtype=np.float32), self.template, method=cv2.LMEDS
+        )
+        if matrix is None:
+            raise ValueError("could not align target face for AlphaFace")
+        crop = cv2.warpAffine(
+            frame,
+            matrix,
+            (256, 256),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        return crop, matrix
+
+    @staticmethod
+    def _face_roi(bbox: np.ndarray, shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+        padding = max(24, int(max(x1 - x0, y1 - y0) * 0.32))
+        return (
+            max(0, int(x0) - padding),
+            max(0, int(y0) - padding),
+            min(shape[1], int(x1) + padding),
+            min(shape[0], int(y1) + padding),
+        )
+
+    def _run(self, crop: np.ndarray) -> np.ndarray:
+        target = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        target = np.transpose(target, (2, 0, 1))[None, :, :, :]
+        swapped = self.session.run(
+            None,
+            {"target": target, "source_embedding": self.source_embedding},
+        )[0][0]
+        swapped = np.transpose(swapped, (1, 2, 0))
+        swapped = np.clip(swapped, 0.0, 1.0)
+        return cv2.cvtColor((swapped * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+    def swap(self, frame: np.ndarray, *, max_faces: int) -> tuple[np.ndarray, int]:
+        faces = sorted(
+            self.analysis.get(frame), key=lambda face: self._area(face.bbox), reverse=True
+        )[:max_faces]
+        if not faces:
+            return frame.copy(), 0
+        output = frame.copy()
+        completed = 0
+        crop_mask = np.zeros((256, 256), dtype=np.uint8)
+        cv2.ellipse(crop_mask, (128, 136), (106, 116), 0, 0, 360, 255, -1)
+        crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), 5.0)
+        for face in faces:
+            crop, matrix = self._align(frame, face.kps)
+            swapped = self._run(crop)
+            x0, y0, x1, y1 = self._face_roi(face.bbox, frame.shape)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            inverse = cv2.invertAffineTransform(matrix)
+            inverse[:, 2] -= (x0, y0)
+            size = (x1 - x0, y1 - y0)
+            mapped = cv2.warpAffine(swapped, inverse, size, flags=cv2.INTER_LINEAR)
+            mask = cv2.warpAffine(crop_mask, inverse, size, flags=cv2.INTER_LINEAR)
+            region = output[y0:y1, x0:x1]
+            alpha = (mask.astype(np.float32) / 255.0)[..., None]
+            output[y0:y1, x0:x1] = (mapped * alpha + region * (1.0 - alpha)).astype(np.uint8)
+            completed += 1
+        return output, completed
+
+
+def build_swapper(
+    model_name: str,
+    source_path: Path,
+    model_path: Path,
+    *,
+    alphaface_model_path: Path = DEFAULT_ALPHAFACE_MODEL,
+    alphaface_embedding_map_path: Path = DEFAULT_ALPHAFACE_EMBEDDING_MAP,
+):
     source = read_bgr(source_path)
+    if model_name == MODEL_ALPHAFACE:
+        swapper = AlphaFace256(source, alphaface_model_path, alphaface_embedding_map_path)
+        return swapper, f"{swapper.provider_status}; 256px ONNX, fixed batch 1"
     if model_name == MODEL_MESH_MAPPING:
         swapper = LandmarkMaskMappingSwapper(source)
         return swapper, f"{swapper.landmarks.provider_status}; no generative face model"
@@ -388,10 +540,21 @@ class LoadStats:
 
 
 class FaceSwapLabApp:
-    def __init__(self, root: tk.Tk, *, source_path: Path, model_path: Path, camera: int):
+    def __init__(
+        self,
+        root: tk.Tk,
+        *,
+        source_path: Path,
+        model_path: Path,
+        alphaface_model_path: Path,
+        alphaface_embedding_map_path: Path,
+        camera: int,
+    ):
         self.root = root
         self.source_path = source_path
         self.model_path = model_path
+        self.alphaface_model_path = alphaface_model_path
+        self.alphaface_embedding_map_path = alphaface_embedding_map_path
         self.camera_index = camera
         self.camera: cv2.VideoCapture | None = None
         self.swapper: Any | None = None
@@ -508,7 +671,11 @@ class FaceSwapLabApp:
             if not 1 <= max_faces <= 4:
                 raise ValueError("Max faces must be between 1 and 4")
             self.swapper, provider_status = build_swapper(
-                self.model_var.get(), self.source_path, self.model_path
+                self.model_var.get(),
+                self.source_path,
+                self.model_path,
+                alphaface_model_path=self.alphaface_model_path,
+                alphaface_embedding_map_path=self.alphaface_embedding_map_path,
             )
             self.provider_var.set(f"{provider_status} | {mps_status()}")
             self.camera = cv2.VideoCapture(self.camera_index)
@@ -600,6 +767,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--alphaface-model-path", type=Path, default=DEFAULT_ALPHAFACE_MODEL)
+    parser.add_argument(
+        "--alphaface-embedding-map", type=Path, default=DEFAULT_ALPHAFACE_EMBEDDING_MAP
+    )
     parser.add_argument("--camera", type=int, default=0)
     return parser.parse_args()
 
@@ -611,6 +782,8 @@ def main() -> None:
         root,
         source_path=args.source.expanduser().resolve(),
         model_path=args.model_path.expanduser().resolve(),
+        alphaface_model_path=args.alphaface_model_path.expanduser().resolve(),
+        alphaface_embedding_map_path=args.alphaface_embedding_map.expanduser().resolve(),
         camera=args.camera,
     )
     root.mainloop()
