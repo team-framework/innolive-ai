@@ -29,6 +29,17 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 브라우저에서 `http://SERVER_IP:8088`로 접근합니다. 신뢰할 수 있는 사설망에서만 실행하세요.
 
+기본 browser 경로는 WebRTC 영상 트랙이다. 카메라 JPEG를 WebSocket으로 왕복하지 않으므로,
+FHD에서 HTTP/WebSocket proxy 왕복 지연이 추론 FPS를 제한하지 않는다. WebRTC가 지원되지
+않거나 ICE 연결에 실패하면 기존 WebSocket JPEG 경로로 자동 fallback한다. 원격/NAT 환경은
+서버의 UDP candidate port를 허용해야 한다. 직접 UDP가 불가능한 배포는 TURN을 설정한다.
+
+```bash
+export WEBRTC_TURN_URL='turn:turn.example.com:3478?transport=udp'
+export WEBRTC_TURN_USERNAME='...'
+export WEBRTC_TURN_CREDENTIAL='...'
+```
+
 - YOLO26n-seg는 dynamic TensorRT engine을 사용하며 class `0=face`, `1=number_plate`만 유지한다. 이 클래스 계약이 아니면 시작을 거부한다.
 - 기본 baseline은 dynamic B4 engine과 최대 4개 frame batch다. model quality는 그대로이며, B8/B16은 B4의 실측 GPU 여유가 확인된 경우에만 별도 engine으로 export한다.
 - InSwapper ONNX Runtime CUDA arena는 session당 2GiB 상한(`--swap-ort-mem-gib`)과 exact-request growth를 사용한다. swap에 필요하지 않은 age/gender/106-landmark InsightFace session은 만들지 않는다.

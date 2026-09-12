@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -17,6 +18,14 @@ from typing import Any
 
 import cv2
 import numpy as np
+from aiortc import (
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
+from av import VideoFrame
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,6 +51,22 @@ DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
+
+
+def _webrtc_ice_servers() -> list[RTCIceServer]:
+    """Use public STUN by default; deployments behind NAT can provide TURN."""
+
+    servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
+    turn_url = os.getenv("WEBRTC_TURN_URL")
+    if turn_url:
+        servers.append(
+            RTCIceServer(
+                urls=turn_url,
+                username=os.getenv("WEBRTC_TURN_USERNAME"),
+                credential=os.getenv("WEBRTC_TURN_CREDENTIAL"),
+            )
+        )
+    return servers
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +100,33 @@ class StreamState:
     tracker: StreamTracker
     recognition: StreamRecognition
     sequence: int = 0
+
+
+class SwapVideoTrack(MediaStreamTrack):
+    """WebRTC return track that transforms each decoded camera frame once."""
+
+    kind = "video"
+
+    def __init__(self, source: MediaStreamTrack, lab: "SwapLab", stream: StreamState) -> None:
+        super().__init__()
+        self.source = source
+        self.lab = lab
+        self.stream = stream
+
+    async def recv(self) -> VideoFrame:
+        frame = await self.source.recv()
+        image = frame.to_ndarray(format="bgr24")
+        try:
+            output, _ = await self.lab.submit(image, self.stream)
+        except RuntimeError:
+            # Preserve the source frame when the latency-first queue drops a
+            # frame. The next decoded frame is still processed; no stale face
+            # image is ever replayed.
+            output = image
+        result = VideoFrame.from_ndarray(np.ascontiguousarray(output), format="bgr24")
+        result.pts = frame.pts
+        result.time_base = frame.time_base
+        return result
 
 
 @dataclass(slots=True)
@@ -1033,6 +1085,7 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="InnoLive TensorRT Face Swap Lab")
     lab = SwapLab(settings)
     file_task: asyncio.Task[None] | None = None
+    peer_connections: set[RTCPeerConnection] = set()
     settings.hls_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/hls", StaticFiles(directory=str(settings.hls_dir)), name="hls")
 
@@ -1051,6 +1104,7 @@ def create_app(settings: Settings) -> FastAPI:
         if file_task is not None:
             file_task.cancel()
             await asyncio.gather(file_task, return_exceptions=True)
+        await asyncio.gather(*(peer.close() for peer in peer_connections), return_exceptions=True)
         await lab.close()
 
     @app.get("/", response_class=HTMLResponse)
@@ -1081,10 +1135,43 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(400, "invalid jpeg")
         return await lab.enroll(session_id, image)
 
+    @app.post("/webrtc/offer/{session_id}")
+    async def webrtc_offer(session_id: str, offer: dict[str, str]) -> dict[str, str]:
+        """Negotiate a direct browser camera/result video pair over WebRTC."""
+
+        if offer.get("type") != "offer" or not offer.get("sdp"):
+            raise HTTPException(400, "WebRTC SDP offer is required")
+        peer = RTCPeerConnection(RTCConfiguration(iceServers=_webrtc_ice_servers()))
+        peer_connections.add(peer)
+        stream = lab.create_stream(session_id)
+
+        @peer.on("track")
+        def on_track(track: MediaStreamTrack) -> None:
+            if track.kind == "video":
+                peer.addTrack(SwapVideoTrack(track, lab, stream))
+
+        @peer.on("connectionstatechange")
+        async def on_connection_state_change() -> None:
+            if peer.connectionState in {"closed", "failed", "disconnected"}:
+                peer_connections.discard(peer)
+                stream.recognition.close()
+                stream.tracker.reset()
+                await peer.close()
+
+        await peer.setRemoteDescription(
+            RTCSessionDescription(sdp=offer["sdp"], type=offer["type"])
+        )
+        answer = await peer.createAnswer()
+        await peer.setLocalDescription(answer)
+        local = peer.localDescription
+        assert local is not None
+        return {"type": local.type, "sdp": local.sdp}
+
     @app.websocket("/ws/{session_id}")
     async def stream(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
         state = lab.create_stream(session_id)
+        previous_output_send_ms = 0.0
         try:
             while True:
                 payload = await websocket.receive_bytes()
@@ -1111,10 +1198,16 @@ def create_app(settings: Settings) -> FastAPI:
                         "submit_wait_ms": round((submitted_at - decoded_at) * 1_000, 2),
                         "output_encode_ms": round((encoded_at - submitted_at) * 1_000, 2),
                         "server_e2e_ms": round((encoded_at - received_at) * 1_000, 2),
+                        # send_bytes is deliberately measured separately: the normal
+                        # e2e span ends at JPEG encode, while WebSocket extensions or
+                        # a proxy may spend substantial time after that point.
+                        "previous_output_send_ms": round(previous_output_send_ms, 2),
                     }
                     header = json.dumps(metadata, separators=(",", ":")).encode()
                     packet = len(header).to_bytes(4, "big") + header + encoded.tobytes()
+                    send_started = time.perf_counter()
                     await websocket.send_bytes(packet)
+                    previous_output_send_ms = (time.perf_counter() - send_started) * 1_000
         except WebSocketDisconnect:
             state.recognition.close()
             state.tracker.reset()
@@ -1259,51 +1352,61 @@ def main() -> None:
     )
     import uvicorn
 
-    uvicorn.run(create_app(settings), host=args.host, port=args.port)
+    # JPEG payloads are already entropy-compressed.  WebSocket per-message
+    # deflate only adds CPU latency and can hide that cost outside server_e2e_ms.
+    uvicorn.run(
+        create_app(settings),
+        host=args.host,
+        port=args.port,
+        ws_per_message_deflate=False,
+    )
 
 
 _HTML = """<!doctype html>
 <meta charset="utf-8"><title>TensorRT Swap Lab</title>
 <style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style>
 <h1>TensorRT Face Swap Lab</h1><p>Browser webcam → TensorRT YOLO → face swap</p>
-<video id="v" autoplay muted playsinline></video><img id="o"><pre id="m">starting…</pre>
+<video id="v" autoplay muted playsinline></video><video id="rtc-output" autoplay muted playsinline hidden></video><img id="ws-output" hidden><pre id="m">starting…</pre>
 <script>
 const id=crypto.randomUUID();
-const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`);
-const v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m');
-const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__;
-const decoder=new TextDecoder();
-let busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now();
-navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false}).then(s=>v.srcObject=s);
+const v=document.querySelector('#v'),rtcOutput=document.querySelector('#rtc-output'),wsOutput=document.querySelector('#ws-output'),m=document.querySelector('#m');
+const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__,decoder=new TextDecoder();
+let ws=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now();
 function report(){
   const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;
-  const networkServerMs=Math.max(0,receivedAt-sentAt);
-  const serverE2eMs=lastMeta.wire?.server_e2e_ms ?? 0;
-  m.textContent=JSON.stringify({...lastMeta,client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+networkServerMs.toFixed(1),client_transport_ms:+Math.max(0,networkServerMs-serverE2eMs).toFixed(1),client_packet_parse_ms:+packetParseMs.toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_fps:+(frames*1000/elapsed).toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);
+  const networkServerMs=Math.max(0,receivedAt-sentAt),serverE2eMs=lastMeta.wire?.server_e2e_ms??0;
+  m.textContent=JSON.stringify({...lastMeta,transport:'websocket-fallback',client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+networkServerMs.toFixed(1),client_transport_ms:+Math.max(0,networkServerMs-serverE2eMs).toFixed(1),client_packet_parse_ms:+packetParseMs.toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_ws_extensions:ws?.extensions||'none',client_fps:+(frames*1000/elapsed).toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);
   frames=0;windowAt=now;
 }
-ws.onmessage=async e=>{
-  if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return;}
-  receivedAt=performance.now();
-  const packet=await e.data.arrayBuffer();
-  const headerLength=new DataView(packet).getUint32(0);
-  lastMeta=JSON.parse(decoder.decode(packet.slice(4,4+headerLength)));
-  const jpeg=new Blob([packet.slice(4+headerLength)],{type:'image/jpeg'});
-  packetParseMs=performance.now()-receivedAt;
-  if(lastUrl)URL.revokeObjectURL(lastUrl);
-  lastUrl=URL.createObjectURL(jpeg);
-  o.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};
-  o.src=lastUrl;
-};
-setInterval(()=>{
-  if(busy||!v.videoWidth||ws.readyState!==1)return;
-  busy=true;
-  const scale=Math.min(1,captureWidth/v.videoWidth);
-  c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);
-  ctx.drawImage(v,0,0,c.width,c.height);
-  const captureAt=performance.now();
-  c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b);}else busy=false;},'image/jpeg',__JPEG_QUALITY__);
-},16);
+function startWebSocket(){
+  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`);
+  ws.onmessage=async e=>{
+    if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return;}
+    receivedAt=performance.now();const packet=await e.data.arrayBuffer(),headerLength=new DataView(packet).getUint32(0);
+    lastMeta=JSON.parse(decoder.decode(packet.slice(4,4+headerLength)));const jpeg=new Blob([packet.slice(4+headerLength)],{type:'image/jpeg'});packetParseMs=performance.now()-receivedAt;
+    if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(jpeg);wsOutput.hidden=false;
+    wsOutput.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};wsOutput.src=lastUrl;
+  };
+  setInterval(()=>{
+    if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;
+    const scale=Math.min(1,captureWidth/v.videoWidth);c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);ctx.drawImage(v,0,0,c.width,c.height);
+    const captureAt=performance.now();c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b);}else busy=false;},'image/jpeg',__JPEG_QUALITY__);
+  },16);
+}
+function iceComplete(peer){return new Promise(resolve=>{if(peer.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,3000);peer.onicegatheringstatechange=()=>{if(peer.iceGatheringState==='complete'){clearTimeout(timer);resolve();}};});}
+async function startWebRtc(stream){
+  if(!window.RTCPeerConnection)throw new Error('WebRTC unavailable');
+  const peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  const sender=peer.addTrack(stream.getVideoTracks()[0],stream);
+  try{const parameters=sender.getParameters();parameters.encodings=parameters.encodings?.length?parameters.encodings:[{}];parameters.encodings[0].maxBitrate=12000000;parameters.encodings[0].maxFramerate=30;await sender.setParameters(parameters);}catch(error){console.warn('Unable to set FHD WebRTC sender bitrate',error);}
+  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;m.textContent=JSON.stringify({transport:'webrtc',capture_resolution:`${v.videoWidth}x${v.videoHeight}`,status:'connected'},null,2);};
+  const offer=await peer.createOffer({offerToReceiveVideo:true});await peer.setLocalDescription(offer);await iceComplete(peer);
+  const response=await fetch(`/webrtc/offer/${id}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(peer.localDescription)});
+  if(!response.ok)throw new Error(`WebRTC signaling failed: ${response.status}`);
+  await peer.setRemoteDescription(await response.json());
+  peer.onconnectionstatechange=()=>{if(peer.connectionState==='failed')m.textContent='WebRTC failed; reload to use WebSocket fallback.';};
+}
+(async()=>{const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false});v.srcObject=stream;try{await startWebRtc(stream);}catch(error){console.warn(error);m.textContent=`WebRTC unavailable (${error.message}); using WebSocket fallback`;startWebSocket();}})();
 </script>"""
 
 
