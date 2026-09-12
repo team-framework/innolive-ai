@@ -65,7 +65,8 @@ class Settings:
     hls_dir: Path
     swap_debug_dir: Path | None = None
     swap_debug_frames: int = 1
-    stream_jpeg_quality: int = 95
+    stream_jpeg_quality: int = 90
+    capture_max_width: int = 640
 
 
 @dataclass(slots=True)
@@ -1054,7 +1055,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
-        return _HTML.replace("__JPEG_QUALITY__", str(settings.stream_jpeg_quality / 100))
+        return (
+            _HTML.replace("__JPEG_QUALITY__", str(settings.stream_jpeg_quality / 100))
+            .replace("__CAPTURE_WIDTH__", str(settings.capture_max_width))
+        )
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -1195,8 +1199,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stream-jpeg-quality",
         type=int,
-        default=95,
-        help="browser input and WebSocket output JPEG quality (1-100; default: 95)",
+        default=90,
+        help="browser input and WebSocket output JPEG quality (1-100; default: 90)",
+    )
+    parser.add_argument(
+        "--capture-max-width",
+        type=int,
+        default=640,
+        help="browser capture cap; 640 matches the detector and avoids expensive camera JPEG encoding",
     )
     return parser.parse_args()
 
@@ -1212,12 +1222,13 @@ def main() -> None:
         or not 0 < args.swapper_trt_workspace_gib <= 4
         or args.swap_debug_frames < 1
         or not 1 <= args.stream_jpeg_quality <= 100
+        or args.capture_max_width < 320
     ):
         raise SystemExit(
             "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
             "swap-ort-mem-gib in (0, 8], swap-min-mask-area-px >= 1, "
             "swapper-trt-workspace-gib in (0, 4], swap-debug-frames >= 1, and "
-            "stream-jpeg-quality in [1, 100] are required"
+            "stream-jpeg-quality in [1, 100], capture-max-width >= 320 are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -1243,13 +1254,14 @@ def main() -> None:
         args.swap_debug_dir.expanduser().resolve() if args.swap_debug_dir else None,
         args.swap_debug_frames,
         args.stream_jpeg_quality,
+        args.capture_max_width,
     )
     import uvicorn
 
     uvicorn.run(create_app(settings), host=args.host, port=args.port)
 
 
-_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas'),ctx=c.getContext('2d');let busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,displayMs=0,frames=0,windowAt=performance.now();navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280,max:1280},height:{ideal:720,max:720}},audio:false}).then(s=>v.srcObject=s);function report(){const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;const fps=frames*1000/elapsed;m.textContent=JSON.stringify({...lastMeta,client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+(receivedAt-sentAt).toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_fps:+fps.toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);frames=0;windowAt=now}ws.onmessage=e=>{if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return}receivedAt=performance.now();if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report()};o.src=lastUrl};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;const scale=Math.min(1,1280/v.videoWidth,720/v.videoHeight);c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);ctx.drawImage(v,0,0,c.width,c.height);const captureAt=performance.now();c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b)}else busy=false},'image/jpeg',__JPEG_QUALITY__)},16)</script>"""
+_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__;let busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,displayMs=0,frames=0,windowAt=performance.now();navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false}).then(s=>v.srcObject=s);function report(){const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;const fps=frames*1000/elapsed;m.textContent=JSON.stringify({...lastMeta,client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+(receivedAt-sentAt).toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_fps:+fps.toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);frames=0;windowAt=now}ws.onmessage=e=>{if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return}receivedAt=performance.now();if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report()};o.src=lastUrl};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;const scale=Math.min(1,captureWidth/v.videoWidth);c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);ctx.drawImage(v,0,0,c.width,c.height);const captureAt=performance.now();c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b)}else busy=false},'image/jpeg',__JPEG_QUALITY__)},16)</script>"""
 
 
 if __name__ == "__main__":
