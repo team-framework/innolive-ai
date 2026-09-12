@@ -48,12 +48,12 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 ## 얼굴 품질 진단
 
-먼저 JPEG/브라우저 표시가 아닌 raw 128×128 결과를 비교한다. `--swap-debug-dir`를 지정하면 TensorRT 실행 결과는 그대로 유지하면서, 같은 blob과 mapped latent를 CPU ONNX Runtime reference에 한 번 더 넣어 최신 얼굴 하나의 진단 묶음을 저장한다.
+먼저 JPEG/브라우저 표시가 아닌 raw 128×128 결과를 비교한다. `--swap-debug-dir`를 지정하면 TensorRT 실행 결과는 그대로 유지하면서, 같은 blob과 mapped latent를 CPU ONNX Runtime reference에 한 번 더 넣어 진단 묶음을 저장한다. 기본값은 **첫 swap 1회만** 저장한다. 매 프레임 ONNX reference와 PNG dump를 실행하면 성능 측정이 무효해지므로 일반 실행에는 이 옵션을 넣지 않는다.
 
 ```bash
 python -m experiments.trt_swap_client.app \
   --swapper-backend tensorrt \
-  --swap-debug-dir /tmp/inswapper-debug \
+  --swap-debug-dir /tmp/inswapper-debug --swap-debug-frames 1 \
   --stream-jpeg-quality 100
 ```
 

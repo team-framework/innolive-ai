@@ -64,6 +64,7 @@ class Settings:
     input_video: Path | None
     hls_dir: Path
     swap_debug_dir: Path | None = None
+    swap_debug_frames: int = 1
     stream_jpeg_quality: int = 100
 
 
@@ -305,14 +306,15 @@ class TensorRtInSwapperGenerator:
         bgr_fake = _prediction_to_bgr(prediction)
         if not paste_back:
             return bgr_fake
-        artifacts: dict[str, np.ndarray] | None = {} if self.debug_dumper is not None else None
+        debugger = self.debug_dumper if self.debug_dumper and self.debug_dumper.consume() else None
+        artifacts: dict[str, np.ndarray] | None = {} if debugger is not None else None
         result = _paste_inswapper(img, aimg, bgr_fake, matrix, artifacts=artifacts)
-        if self.debug_dumper is not None:
+        if debugger is not None:
             # The metadata model has an explicit CPU ORT session solely for this
             # opt-in comparison.  It never participates in the live TRT result.
             try:
                 ort_prediction = _ort_raw_prediction(self.metadata, blob, latent)
-                self.debug_dumper.dump(
+                debugger.dump(
                     original=img,
                     landmarks=np.asarray(target_face.kps),
                     aligned=aimg,
@@ -401,9 +403,20 @@ def _paste_inswapper(
 class SwapDebugDumper:
     """Write a stable, inspectable latest-frame bundle without affecting inference."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, max_dumps: int):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
+        self._remaining = max_dumps
+        self._lock = threading.Lock()
+
+    def consume(self) -> bool:
+        """Reserve one opt-in diagnostic snapshot without taxing every frame."""
+
+        with self._lock:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+            return True
 
     @staticmethod
     def _write(path: Path, image: np.ndarray) -> None:
@@ -481,6 +494,7 @@ class InSwapper:
         target_aligner: str,
         target_yunet: Path,
         debug_dir: Path | None,
+        debug_frames: int,
     ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
@@ -504,7 +518,7 @@ class InSwapper:
             self.model = model_zoo.get_model(str(model_path), providers=["CPUExecutionProvider"])
             self.generator: Any = TensorRtInSwapperGenerator(self.model, engine_path, device)
             if debug_dir is not None:
-                self.generator.debug_dumper = SwapDebugDumper(debug_dir)
+                self.generator.debug_dumper = SwapDebugDumper(debug_dir, max_dumps=debug_frames)
         else:
             self.model = model_zoo.get_model(
                 str(model_path), providers=_swap_providers(device, 2.0)
@@ -658,6 +672,7 @@ class SwapLab:
             target_aligner=settings.target_aligner,
             target_yunet=settings.target_yunet,
             debug_dir=settings.swap_debug_dir,
+            debug_frames=settings.swap_debug_frames,
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -1081,7 +1096,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--swap-debug-dir",
         type=Path,
-        help="save latest ORT/TRT raw and paste-back diagnostics here (TensorRT backend only)",
+        help="save a limited ORT/TRT raw and paste-back diagnostic bundle here (TensorRT only)",
+    )
+    parser.add_argument(
+        "--swap-debug-frames",
+        type=int,
+        default=1,
+        help="number of diagnostic swaps to save; debug is disabled when --swap-debug-dir is absent",
     )
     parser.add_argument(
         "--stream-jpeg-quality",
@@ -1101,12 +1122,14 @@ def main() -> None:
         or not 0 < args.swap_ort_mem_gib <= 8
         or args.swap_min_mask_area_px < 1
         or not 0 < args.swapper_trt_workspace_gib <= 4
+        or args.swap_debug_frames < 1
         or not 1 <= args.stream_jpeg_quality <= 100
     ):
         raise SystemExit(
             "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
             "swap-ort-mem-gib in (0, 8], swap-min-mask-area-px >= 1, "
-            "swapper-trt-workspace-gib in (0, 4], and stream-jpeg-quality in [1, 100] are required"
+            "swapper-trt-workspace-gib in (0, 4], swap-debug-frames >= 1, and "
+            "stream-jpeg-quality in [1, 100] are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -1130,6 +1153,7 @@ def main() -> None:
         input_video,
         args.hls_dir.expanduser().resolve(),
         args.swap_debug_dir.expanduser().resolve() if args.swap_debug_dir else None,
+        args.swap_debug_frames,
         args.stream_jpeg_quality,
     )
     import uvicorn
