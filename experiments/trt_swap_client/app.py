@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
-DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11.engine"
+DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 

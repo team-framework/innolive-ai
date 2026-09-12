@@ -15,7 +15,7 @@ python -m experiments.trt_swap_client.export_detector \
 
 python -m experiments.trt_swap_client.export_swapper \
   --onnx models/face_swap/inswapper_128.onnx \
-  --output models/face_swap/inswapper_128_trt11.engine \
+  --output models/face_swap/inswapper_128_trt11_fp32.engine \
   --workspace 2 --precision fp32 --force
 ```
 
@@ -23,7 +23,7 @@ python -m experiments.trt_swap_client.export_swapper \
 python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
   --detector models/best_swap_b4.engine \
   --swapper models/face_swap/inswapper_128.onnx \
-  --swapper-engine models/face_swap/inswapper_128_trt11.engine \
+  --swapper-engine models/face_swap/inswapper_128_trt11_fp32.engine \
   --source ~/Documents/input.png
 ```
 
