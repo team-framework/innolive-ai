@@ -310,7 +310,7 @@ class TensorRtInSwapperGenerator:
             # The metadata model has an explicit CPU ORT session solely for this
             # opt-in comparison.  It never participates in the live TRT result.
             try:
-                ort_prediction = self.metadata.forward(blob, latent)
+                ort_prediction = _ort_raw_prediction(self.metadata, blob, latent)
                 self.debug_dumper.dump(
                     original=img,
                     landmarks=np.asarray(target_face.kps),
@@ -350,6 +350,18 @@ def _prediction_to_bgr(prediction: np.ndarray) -> np.ndarray:
     if not np.isfinite(output).all():
         raise ValueError("InSwapper output contains NaN or infinity")
     return np.clip(255.0 * output.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
+
+
+def _ort_raw_prediction(metadata: Any, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+    """Match InsightFace INSwapper.get() without applying forward() normalization again."""
+
+    return metadata.session.run(
+        metadata.output_names,
+        {
+            metadata.input_names[0]: blob,
+            metadata.input_names[1]: latent,
+        },
+    )[0]
 
 
 def _paste_inswapper(

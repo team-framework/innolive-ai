@@ -13,6 +13,7 @@ from experiments.trt_swap_client.app import (
     _iou,
     _mapped_latent,
     _objects,
+    _ort_raw_prediction,
     _paste_inswapper,
     _prediction_to_bgr,
     _require_current_swapper_engine,
@@ -196,3 +197,21 @@ def test_swapper_engine_manifest_rejects_legacy_or_wrong_model(tmp_path: Path) -
         )
     )
     _require_current_swapper_engine(engine, model)
+
+
+def test_ort_reference_does_not_apply_a_second_input_normalization() -> None:
+    class Session:
+        def run(self, names: list[str], inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+            assert names == ["output"]
+            assert inputs["target"][0, 0, 0, 0] == 0.5
+            assert inputs["source"][0, 0] == 1.0
+            return [inputs["target"]]
+
+    metadata = type(
+        "Metadata",
+        (),
+        {"session": Session(), "output_names": ["output"], "input_names": ["target", "source"]},
+    )()
+    blob = np.full((1, 3, 128, 128), 0.5, dtype=np.float32)
+    latent = np.ones((1, 512), dtype=np.float32)
+    assert np.array_equal(_ort_raw_prediction(metadata, blob, latent), blob)
