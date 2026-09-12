@@ -32,14 +32,14 @@ binding wheel은 제공되지 않는다. 위의 Python 3.11 environment는 이 l
 ```bash
 LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 .venv-trt10-swap/bin/python -m experiments.trt_swap_client.export_detector \
-  --checkpoint models/best.pt --output models/best_swap_b4.engine \
+  --checkpoint models/best.pt --output models/best_swap_b4_trt10.engine \
   --max-batch 4 --workspace 8 --device 0 --force
 ```
 
 ```bash
 LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 .venv-trt10-swap/bin/python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
-  --detector models/best_swap_b4.engine \
+  --detector models/best_swap_b4_trt10.engine \
   --swapper models/face_swap/inswapper_128.onnx \
   --source ~/Documents/input.png
 ```
@@ -80,4 +80,4 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - `models/face_swap/inswapper_128.onnx`는 완전한 유효 ONNX 파일이어야 합니다. 이 repository의 무시된 model artifact는 자동으로 내려받거나 교체하지 않습니다.
 - 이 client는 quality를 낮추는 resize, frame-skip을 추가하지 않습니다. 작은 mask fallback은 privacy-first 처리이며, 큰 face의 generator model과 input size는 유지합니다. 실제 10 clients × 30fps는 3090 host에서 browser 및 NVDEC file workload를 나누어 실측해야 합니다.
 
-`models/best_swap_b4.engine`은 3090 Linux에서 현재 `models/best.pt`로 새로 만들어야 하며 Git에 넣지 않습니다.
+`models/best_swap_b4_trt10.engine`은 3090 Linux에서 현재 `models/best.pt`로 새로 만들어야 하며 Git에 넣지 않습니다. 기존 TensorRT 11 engine(`best_swap_b4.engine`)은 TensorRT 10 lab에서 사용하지 않습니다.

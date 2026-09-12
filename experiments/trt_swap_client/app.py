@@ -33,7 +33,7 @@ from service.runtime import IMAGE_SIZE, MAX_DETECTIONS, MAX_POLYGON_POINTS
 from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
+DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4_trt10.engine"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
