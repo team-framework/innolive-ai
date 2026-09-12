@@ -23,7 +23,7 @@ from service.detection import EXPECTED_CLASS_NAMES  # noqa: E402
 from service.runtime import IMAGE_SIZE  # noqa: E402
 
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4_trt10.engine"
+DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 
 
 def parse_args() -> argparse.Namespace:
