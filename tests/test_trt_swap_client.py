@@ -74,6 +74,8 @@ def test_cuda_generator_provider_keeps_ort_memory_cap(tmp_path: Path) -> None:
         swapper_backend="cuda",
         swapper_trt_cache=tmp_path / "cache",
         swapper_trt_workspace_gib=1.0,
+        target_aligner="yunet_roi",
+        target_yunet=tmp_path / "yunet.onnx",
         input_video=None,
         hls_dir=tmp_path / "hls",
     )
@@ -94,6 +96,8 @@ def test_tensorrt_generator_provider_enables_cache_and_cuda_graph(tmp_path: Path
         swapper_backend="tensorrt",
         swapper_trt_cache=tmp_path / "cache",
         swapper_trt_workspace_gib=1.0,
+        target_aligner="yunet_roi",
+        target_yunet=tmp_path / "yunet.onnx",
         input_video=None,
         hls_dir=tmp_path / "hls",
     )
@@ -153,6 +157,7 @@ def test_swapper_analyzes_one_frame_once_for_multiple_yolo_faces() -> None:
     swapper.analysis = Analysis()
     swapper.model = Model()
     swapper.source_face = object()
+    swapper.yunet = None
     output, succeeded = swapper.apply_many(
         np.zeros((4, 4, 3), dtype=np.uint8), [[0, 0, 20, 20], [40, 40, 60, 60]]
     )

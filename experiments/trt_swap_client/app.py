@@ -25,7 +25,7 @@ from experiments.trt_swap_client.video_io import (
     probe_video,
     require_nvcodec_ffmpeg,
 )
-from service.adaface_model import AdaFaceConfig, AdaFaceRuntime
+from service.adaface_model import DEFAULT_FACE_DETECTOR, AdaFaceConfig, AdaFaceRuntime
 from service.detection import is_face_object, is_number_plate_object
 from service.mosaic import DEFAULT_BLUR_RADIUS, DEFAULT_PIXEL_SIZE, MASK_FEATHER_RADIUS
 from service.recognition import RecognitionConfig, SessionRegistry, StreamRecognition
@@ -54,6 +54,8 @@ class Settings:
     swapper_backend: str
     swapper_trt_cache: Path
     swapper_trt_workspace_gib: float
+    target_aligner: str
+    target_yunet: Path
     input_video: Path | None
     hls_dir: Path
 
@@ -162,6 +164,9 @@ class InSwapper:
         model_path: Path,
         analysis_providers: list[Any],
         generator_providers: list[Any],
+        *,
+        target_aligner: str,
+        target_yunet: Path,
     ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
@@ -178,6 +183,16 @@ class InSwapper:
         )
         self.analysis.prepare(ctx_id=0, det_size=(640, 640))
         self.model = model_zoo.get_model(str(model_path), providers=generator_providers)
+        self.target_aligner = target_aligner
+        self.yunet = None
+        if target_aligner == "yunet_roi":
+            if not target_yunet.is_file():
+                raise FileNotFoundError(f"YuNet target aligner is missing: {target_yunet}")
+            self.yunet = cv2.FaceDetectorYN.create(
+                str(target_yunet), "", (320, 320), score_threshold=0.6, nms_threshold=0.3, top_k=32
+            )
+        self.last_alignment_ms = 0.0
+        self.last_generator_ms = 0.0
         faces = self.analysis.get(source)
         if not faces:
             raise ValueError("no source face found")
@@ -193,7 +208,11 @@ class InSwapper:
                 analysis.update(session.get_providers())
         session = getattr(self.model, "session", None)
         generator = session.get_providers() if session is not None else []
-        return {"analysis": sorted(analysis), "generator": list(generator)}
+        return {
+            "analysis": sorted(analysis),
+            "generator": list(generator),
+            "target_aligner": [self.target_aligner],
+        }
 
     def apply(self, frame: np.ndarray, bbox: list[float]) -> np.ndarray:
         output, succeeded = self.apply_many(frame, [bbox])
@@ -206,26 +225,88 @@ class InSwapper:
     ) -> tuple[np.ndarray, set[int]]:
         """Run FaceAnalysis once per frame, then map only YOLO class-0 boxes to it."""
 
-        faces = self.analysis.get(frame)
-        if not faces:
-            return frame, set()
+        alignment_started = time.perf_counter()
+        targets = self._target_faces(frame, boxes)
+        self.last_alignment_ms = (time.perf_counter() - alignment_started) * 1_000
         output = frame
-        available = set(range(len(faces)))
         succeeded: set[int] = set()
-        for index, bbox in enumerate(boxes):
-            if not available:
-                break
-            target_index = max(available, key=lambda candidate: _iou(faces[candidate].bbox, bbox))
-            target = faces[target_index]
-            if _iou(target.bbox, bbox) < 0.2:
+        generator_started = time.perf_counter()
+        for index, target in targets.items():
+            if target is None:
                 continue
             try:
                 output = self.model.get(output, target, self.source_face, paste_back=True)
             except Exception:
                 continue
-            available.remove(target_index)
             succeeded.add(index)
+        self.last_generator_ms = (time.perf_counter() - generator_started) * 1_000
         return output, succeeded
+
+    def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
+        targets: dict[int, Any] = {}
+        if self.yunet is not None:
+            for index, box in enumerate(boxes):
+                target = self._target_from_yunet(frame, box)
+                if target is not None:
+                    targets[index] = target
+        missing = [index for index in range(len(boxes)) if index not in targets]
+        if not missing:
+            return targets
+        faces = self.analysis.get(frame)
+        available = set(range(len(faces)))
+        for index in missing:
+            if not available:
+                break
+            target_index = max(
+                available, key=lambda candidate: _iou(faces[candidate].bbox, boxes[index])
+            )
+            target = faces[target_index]
+            if _iou(target.bbox, boxes[index]) < 0.2:
+                continue
+            available.remove(target_index)
+            targets[index] = target
+        return targets
+
+    def _target_from_yunet(self, frame: np.ndarray, box: list[float]) -> Any | None:
+        if self.yunet is None:
+            return None
+        x1, y1, x2, y2 = (float(value) for value in box)
+        padding_x = (x2 - x1) * 0.35
+        padding_y = (y2 - y1) * 0.35
+        left = max(0, int(np.floor(x1 - padding_x)))
+        top = max(0, int(np.floor(y1 - padding_y)))
+        right = min(frame.shape[1], int(np.ceil(x2 + padding_x)))
+        bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
+        if right - left < 32 or bottom - top < 32:
+            return None
+        roi = frame[top:bottom, left:right]
+        try:
+            self.yunet.setInputSize((roi.shape[1], roi.shape[0]))
+            _, detections = self.yunet.detect(roi)
+        except cv2.error:
+            return None
+        if detections is None or not len(detections):
+            return None
+        candidate = max(
+            detections,
+            key=lambda row: _iou(
+                [row[0] + left, row[1] + top, row[0] + row[2] + left, row[1] + row[3] + top], box
+            ),
+        )
+        candidate_box = [
+            float(candidate[0] + left),
+            float(candidate[1] + top),
+            float(candidate[0] + candidate[2] + left),
+            float(candidate[1] + candidate[3] + top),
+        ]
+        if _iou(candidate_box, box) < 0.2:
+            return None
+        from insightface.app.common import Face
+
+        landmarks = np.asarray(candidate[5:15], dtype=np.float32).reshape((5, 2))
+        landmarks[:, 0] += left
+        landmarks[:, 1] += top
+        return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
 
 
 class SwapLab:
@@ -254,6 +335,8 @@ class SwapLab:
             settings.swapper,
             _swap_providers(settings.device, settings.swap_ort_mem_gib),
             _generator_providers(settings),
+            target_aligner=settings.target_aligner,
+            target_yunet=settings.target_yunet,
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -408,6 +491,8 @@ class SwapLab:
             "fallback_blurs": fallback,
             "small_face_fallbacks": small_face_fallbacks,
             "swap_ms": round(swap_ms, 2),
+            "swap_alignment_ms": round(self.swapper.last_alignment_ms, 2),
+            "swap_generator_ms": round(self.swapper.last_generator_ms, 2),
             "yolo_batch": batch_size,
             "adaface": recognition,
             "tracking": temporal,
@@ -549,6 +634,8 @@ def create_app(settings: Settings) -> FastAPI:
             "queue": lab.queue.qsize(),
             "p50_ms": float(np.percentile(lab.latencies, 50)) if lab.latencies else None,
             "swapper_providers": lab.swapper.provider_summary(),
+            "last_swap_alignment_ms": round(lab.swapper.last_alignment_ms, 2),
+            "last_swap_generator_ms": round(lab.swapper.last_generator_ms, 2),
         }
 
     @app.post("/api/enroll/{session_id}")
@@ -636,6 +723,13 @@ def parse_args() -> argparse.Namespace:
         help="TensorRT EP workspace cap for the 128 swap generator",
     )
     parser.add_argument(
+        "--target-aligner",
+        choices=("yunet_roi", "insightface"),
+        default="yunet_roi",
+        help="target five-point landmark path; insightface is the exact legacy comparison path",
+    )
+    parser.add_argument("--target-yunet", type=Path, default=DEFAULT_FACE_DETECTOR)
+    parser.add_argument(
         "--input-video",
         type=Path,
         help="optional compressed input decoded by NVDEC and written as /hls/live.m3u8 via NVENC",
@@ -675,6 +769,8 @@ def main() -> None:
         args.swapper_backend,
         args.swapper_trt_cache.expanduser().resolve(),
         args.swapper_trt_workspace_gib,
+        args.target_aligner,
+        args.target_yunet.expanduser().resolve(),
         input_video,
         args.hls_dir.expanduser().resolve(),
     )
