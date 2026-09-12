@@ -1309,8 +1309,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--swap-min-mask-area-px",
         type=float,
-        default=16_384,
-        help="face segmentation mask area below which the client uses protected blur",
+        default=10_000,
+        help="face segmentation mask area below which the client uses protected blur (default: 10000px²)",
     )
     parser.add_argument("--swapper-backend", choices=("tensorrt", "cuda"), default="tensorrt")
     parser.add_argument("--swapper-trt-cache", type=Path, default=DEFAULT_SWAPPER_TRT_CACHE)
