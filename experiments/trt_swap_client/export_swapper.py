@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onnx", type=Path, default=DEFAULT_ONNX)
     parser.add_argument("--output", type=Path, default=DEFAULT_ENGINE)
     parser.add_argument("--workspace", type=float, default=2.0, help="workspace GiB")
+    parser.add_argument(
+        "--precision",
+        choices=("fp16", "fp32"),
+        default="fp16",
+        help="FP16 inserts explicit ONNX casts for TensorRT 11 strong typing",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -34,25 +41,40 @@ def main() -> None:
     except ImportError as error:
         raise SystemExit("install requirements-tensorrt.txt in the TensorRT 11 environment") from error
 
-    logger = trt.Logger(trt.Logger.INFO)
-    builder = trt.Builder(logger)
-    # TensorRT 10+ is always explicit-batch; the EXPLICIT_BATCH flag was removed.
-    network = builder.create_network(0)
-    parser = trt.OnnxParser(network, logger)
-    if not parser.parse_from_file(str(onnx_path)):
-        errors = "\n".join(str(parser.get_error(index)) for index in range(parser.num_errors))
-        raise SystemExit(f"could not parse {onnx_path}:\n{errors}")
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace * 1024**3))
-    # TensorRT 11 uses strongly typed networks and removed BuilderFlag.FP16.
-    # Keep the ONNX model's FP32 type rather than introducing a quality-changing
-    # conversion at export time.
-    serialized = builder.build_serialized_network(network, config)
+    with tempfile.TemporaryDirectory(prefix=".inswapper-trt-") as directory:
+        parsed_onnx = _prepare_onnx(onnx_path, Path(directory), args.precision)
+        logger = trt.Logger(trt.Logger.INFO)
+        builder = trt.Builder(logger)
+        # TensorRT 10+ is always explicit-batch; the EXPLICIT_BATCH flag was removed.
+        network = builder.create_network(0)
+        parser = trt.OnnxParser(network, logger)
+        if not parser.parse_from_file(str(parsed_onnx)):
+            errors = "\n".join(str(parser.get_error(index)) for index in range(parser.num_errors))
+            raise SystemExit(f"could not parse {parsed_onnx}:\n{errors}")
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace * 1024**3))
+        serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise SystemExit("TensorRT InSwapper engine build failed; inspect TensorRT logs")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(bytes(serialized))
-    print(f"created {output} with TensorRT {trt.__version__}")
+    print(f"created {output} with TensorRT {trt.__version__} ({args.precision})")
+
+
+def _prepare_onnx(onnx_path: Path, directory: Path, precision: str) -> Path:
+    if precision == "fp32":
+        return onnx_path
+    try:
+        import onnx
+        from onnxconverter_common.float16 import convert_float_to_float16_model_path
+    except ImportError as error:
+        raise SystemExit(
+            "FP16 export requires onnxconverter-common; install requirements-trt-swap-client.txt"
+        ) from error
+    converted = convert_float_to_float16_model_path(str(onnx_path), keep_io_types=True)
+    output = directory / "inswapper_128_fp16.onnx"
+    onnx.save(converted, output)
+    return output
 
 
 if __name__ == "__main__":

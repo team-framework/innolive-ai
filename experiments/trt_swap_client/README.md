@@ -16,7 +16,7 @@ python -m experiments.trt_swap_client.export_detector \
 python -m experiments.trt_swap_client.export_swapper \
   --onnx models/face_swap/inswapper_128.onnx \
   --output models/face_swap/inswapper_128_trt11.engine \
-  --workspace 2 --force
+  --workspace 2 --precision fp16 --force
 ```
 
 ```bash
@@ -44,7 +44,7 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 응답 metadata에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`, `swap_generator_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_generator_ms`가 크면 generator model이 병목이고, `swap_alignment_ms`가 크면 target landmark 경로가 병목이다.
 
-`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT 11에서 만든 direct engine으로 실행한다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
+`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT 11에서 만든 direct engine으로 실행한다. TensorRT 11의 strong typing 때문에 `--precision fp16`은 explicit ONNX cast를 넣어 FP16 engine을 만든다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
 
 ## NVDEC/NVENC file test
 
