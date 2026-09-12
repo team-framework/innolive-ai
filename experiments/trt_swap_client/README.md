@@ -5,8 +5,7 @@
 3090 Linux host에서 먼저 현재 checkpoint로 **이 클라이언트 전용** dynamic FP16 engine을 만듭니다. 기존 `best_b1.engine`을 대체하지 않습니다.
 
 ```bash
-pip install -r requirements-export.txt -r requirements-tensorrt.txt \
-  'insightface>=0.7,<0.8' 'onnxruntime-gpu>=1.24,<2'
+pip install -r requirements-trt-swap-client.txt
 python -m experiments.trt_swap_client.export_detector \
   --checkpoint models/best.pt --output models/best_swap_b16.engine \
   --max-batch 16 --workspace 8 --device 0
