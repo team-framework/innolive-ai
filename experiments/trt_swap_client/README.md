@@ -33,7 +33,7 @@ binding wheel은 제공되지 않는다. 위의 Python 3.11 environment는 이 l
 LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 .venv-trt10-swap/bin/python -m experiments.trt_swap_client.export_detector \
   --checkpoint models/best.pt --output models/best_swap_b4.engine \
-  --max-batch 4 --workspace 8 --device 0
+  --max-batch 4 --workspace 8 --device 0 --force
 ```
 
 ```bash
