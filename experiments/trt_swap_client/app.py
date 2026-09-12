@@ -1084,18 +1084,30 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             while True:
                 payload = await websocket.receive_bytes()
+                received_at = time.perf_counter()
                 frame = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
+                decoded_at = time.perf_counter()
                 try:
                     output, metadata = await lab.submit(frame, state)
                 except RuntimeError as error:
                     await websocket.send_json({"error": str(error), "dropped": True})
                     continue
+                submitted_at = time.perf_counter()
                 ok, encoded = cv2.imencode(
                     ".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, settings.stream_jpeg_quality]
                 )
                 if ok:
+                    encoded_at = time.perf_counter()
+                    metadata["wire"] = {
+                        "input_bytes": len(payload),
+                        "output_bytes": int(encoded.size),
+                        "input_decode_ms": round((decoded_at - received_at) * 1_000, 2),
+                        "submit_wait_ms": round((submitted_at - decoded_at) * 1_000, 2),
+                        "output_encode_ms": round((encoded_at - submitted_at) * 1_000, 2),
+                        "server_e2e_ms": round((encoded_at - received_at) * 1_000, 2),
+                    }
                     await websocket.send_json(metadata)
                     await websocket.send_bytes(encoded.tobytes())
         except WebSocketDisconnect:
