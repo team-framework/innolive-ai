@@ -35,9 +35,12 @@ except ImportError as error:  # pragma: no cover - platform-specific failure
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_MODEL = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
-MODEL_GEOMETRIC = "Geometric preview (no AI)"
+DEFAULT_YUNET_MODEL = ROOT / "models" / "face_detection_yunet_2023mar.onnx"
+DEFAULT_LANDMARK_MODEL = Path.home() / ".insightface" / "models" / "buffalo_l" / "2d106det.onnx"
+MODEL_MESH_MAPPING = "Landmark mask mapping (YuNet + 106-point ONNX)"
+MODEL_GEOMETRIC = "Ellipse mask mapping fallback (OpenCV)"
 MODEL_INSWAPPER = "InSwapper 128 (CoreML/CPU)"
-MODEL_CHOICES = (MODEL_GEOMETRIC, MODEL_INSWAPPER)
+MODEL_CHOICES = (MODEL_MESH_MAPPING, MODEL_GEOMETRIC, MODEL_INSWAPPER)
 SESSION_CHOICES = (1, 4, 16)
 MAX_SAMPLE_COUNT = 180
 
@@ -80,6 +83,14 @@ def mps_status() -> str:
     return "MPS available" if torch.backends.mps.is_available() else "MPS unavailable"
 
 
+def preferred_preview_model() -> str:
+    """Prefer the local non-generative mapper when its two small assets exist."""
+
+    if DEFAULT_YUNET_MODEL.is_file() and DEFAULT_LANDMARK_MODEL.is_file():
+        return MODEL_MESH_MAPPING
+    return MODEL_GEOMETRIC
+
+
 def read_bgr(path: Path) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
@@ -101,7 +112,7 @@ def preview_caption(model: str, multiplier: int) -> str:
 
 
 class GeometricPreviewSwapper:
-    """Always-available non-AI baseline for webcam, masking, and load-path validation."""
+    """Always-available fallback for webcam, alpha-mask, and load-path validation."""
 
     name = MODEL_GEOMETRIC
 
@@ -149,6 +160,146 @@ class GeometricPreviewSwapper:
         return output, min(max_faces, 1)
 
 
+class YuNetFaceDetector:
+    """Small OpenCV face detector used for every source and target frame."""
+
+    def __init__(self, model_path: Path):
+        if not model_path.is_file():
+            raise FileNotFoundError(f"YuNet model is missing: {model_path}")
+        self.detector = cv2.FaceDetectorYN.create(str(model_path), "", (320, 320), 0.65, 0.3, 5000)
+
+    def detect(self, frame: np.ndarray, max_faces: int) -> list[np.ndarray]:
+        self.detector.setInputSize((frame.shape[1], frame.shape[0]))
+        _, faces = self.detector.detect(frame)
+        if faces is None:
+            return []
+        ordered = sorted(faces, key=lambda face: float(face[2] * face[3]), reverse=True)
+        return ordered[:max_faces]
+
+
+class Landmark106:
+    """InsightFace's compact 106-point landmark model through CoreML-preferred ONNX."""
+
+    def __init__(self, model_path: Path):
+        if not model_path.is_file():
+            raise FileNotFoundError(f"106-point landmark model is missing: {model_path}")
+        try:
+            import onnxruntime as ort
+        except ImportError as error:
+            raise RuntimeError("install onnxruntime for landmark mask mapping") from error
+        providers, self.provider_status = coreml_providers()
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+
+    def points(self, frame: np.ndarray, face: np.ndarray) -> np.ndarray:
+        x, y, width, height = (float(value) for value in face[:4])
+        center = np.asarray((x + width / 2.0, y + height / 2.0), dtype=np.float32)
+        scale = 192.0 / (max(width, height) * 1.5)
+        matrix = np.asarray(
+            ((scale, 0.0, 96.0 - center[0] * scale), (0.0, scale, 96.0 - center[1] * scale)),
+            dtype=np.float32,
+        )
+        crop = cv2.warpAffine(frame, matrix, (192, 192), borderValue=0.0)
+        blob = cv2.dnn.blobFromImage(crop, 1.0, (192, 192), (0.0, 0.0, 0.0), swapRB=True)
+        points = self.session.run(None, {self.input_name: blob})[0][0].reshape(-1, 2)
+        points = (points + 1.0) * 96.0
+        return cv2.transform(points[None, :, :], cv2.invertAffineTransform(matrix))[0]
+
+
+class LandmarkMaskMappingSwapper:
+    """Fast face texture mapping using YuNet and a 106-point landmark model.
+
+    This always detects every target frame, then aligns the source face with a
+    similarity transform. A feathered target-face hull preserves target hair
+    and background. It does not synthesize profiles, teeth, or occlusions.
+    """
+
+    name = MODEL_MESH_MAPPING
+
+    def __init__(self, source: np.ndarray):
+        self.source = source
+        self.detector = YuNetFaceDetector(DEFAULT_YUNET_MODEL)
+        self.landmarks = Landmark106(DEFAULT_LANDMARK_MODEL)
+        source_faces = self.detector.detect(source, max_faces=1)
+        if not source_faces:
+            raise ValueError("no face found in source image")
+        self.source_points = self.landmarks.points(source, source_faces[0])
+
+    @staticmethod
+    def _face_mask(points: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+        mask = np.zeros(shape[:2], dtype=np.uint8)
+        hull = cv2.convexHull(np.rint(points).astype(np.int32))
+        cv2.fillConvexPoly(mask, hull, 255)
+        # Keep hair and ears from the target frame while softening only the face edge.
+        mask = cv2.erode(mask, np.ones((9, 9), dtype=np.uint8), iterations=1)
+        return cv2.GaussianBlur(mask, (0, 0), 5.0)
+
+    @staticmethod
+    def _color_match(mapped: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        selected = mask > 24
+        if selected.sum() < 100:
+            return mapped
+        mapped_lab = cv2.cvtColor(mapped, cv2.COLOR_BGR2LAB).astype(np.float32)
+        target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+        for channel in range(3):
+            source_values = mapped_lab[:, :, channel][selected]
+            target_values = target_lab[:, :, channel][selected]
+            source_std = max(float(source_values.std()), 1.0)
+            mapped_lab[:, :, channel] = (
+                mapped_lab[:, :, channel] - float(source_values.mean())
+            ) * (float(target_values.std()) / source_std) + float(target_values.mean())
+        return cv2.cvtColor(np.clip(mapped_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    @staticmethod
+    def _roi(points: np.ndarray, frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+        """Return a padded, clipped face region so blending stays off the 1080p full frame."""
+
+        x, y, width, height = cv2.boundingRect(np.rint(points).astype(np.int32))
+        padding = max(16, int(max(width, height) * 0.08))
+        x0 = max(0, x - padding)
+        y0 = max(0, y - padding)
+        x1 = min(frame_shape[1], x + width + padding)
+        y1 = min(frame_shape[0], y + height + padding)
+        return x0, y0, x1, y1
+
+    def swap(self, frame: np.ndarray, *, max_faces: int) -> tuple[np.ndarray, int]:
+        faces = self.detector.detect(frame, max_faces=max_faces)
+        if not faces:
+            return frame.copy(), 0
+        output = frame.copy()
+        completed = 0
+        for face in faces:
+            target_points = self.landmarks.points(frame, face)
+            matrix, _ = cv2.estimateAffinePartial2D(
+                self.source_points,
+                target_points,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=4.0,
+            )
+            if matrix is None:
+                continue
+            x0, y0, x1, y1 = self._roi(target_points, frame.shape)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            matrix_roi = matrix.copy()
+            matrix_roi[:, 2] -= (x0, y0)
+            mapped = cv2.warpAffine(
+                self.source,
+                matrix_roi,
+                (x1 - x0, y1 - y0),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            region = output[y0:y1, x0:x1]
+            local_points = target_points - np.asarray((x0, y0), dtype=np.float32)
+            mask = self._face_mask(local_points, region.shape)
+            mapped = self._color_match(mapped, region, mask)
+            alpha = (mask.astype(np.float32) / 255.0)[..., None]
+            output[y0:y1, x0:x1] = (mapped * alpha + region * (1.0 - alpha)).astype(np.uint8)
+            completed += 1
+        return output, completed
+
+
 class InSwapper128:
     """InsightFace adapter with a cached source embedding and CoreML-preferred ONNX sessions."""
 
@@ -191,8 +342,11 @@ class InSwapper128:
 
 def build_swapper(model_name: str, source_path: Path, model_path: Path):
     source = read_bgr(source_path)
+    if model_name == MODEL_MESH_MAPPING:
+        swapper = LandmarkMaskMappingSwapper(source)
+        return swapper, f"{swapper.landmarks.provider_status}; no generative face model"
     if model_name == MODEL_GEOMETRIC:
-        return GeometricPreviewSwapper(source), "OpenCV CPU baseline"
+        return GeometricPreviewSwapper(source), "OpenCV ellipse fallback; no generative face model"
     if model_name == MODEL_INSWAPPER:
         swapper = InSwapper128(source, model_path)
         return swapper, swapper.provider_status
@@ -248,7 +402,7 @@ class FaceSwapLabApp:
         self.raw_photo: ImageTk.PhotoImage | None = None
         self.output_photo: ImageTk.PhotoImage | None = None
 
-        self.model_var = tk.StringVar(value=MODEL_GEOMETRIC)
+        self.model_var = tk.StringVar(value=preferred_preview_model())
         self.session_var = tk.StringVar(value="1")
         self.max_faces_var = tk.StringVar(value="1")
         self.camera_var = tk.StringVar(value=str(camera))
@@ -374,6 +528,10 @@ class FaceSwapLabApp:
 
     def stop(self) -> None:
         self.running = False
+        if self.swapper is not None:
+            close = getattr(self.swapper, "close", None)
+            if callable(close):
+                close()
         if self.camera is not None:
             self.camera.release()
             self.camera = None

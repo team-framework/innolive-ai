@@ -14,8 +14,19 @@ python3 -m venv .venv-face-swap-lab
 .venv-face-swap-lab/bin/pip install -r requirements-face-swap-lab.txt
 ```
 
-AI model 없이 webcam·mask·부하 UI를 먼저 확인하려면 아래 command로 실행하고
-`Geometric preview (no AI)`를 선택합니다.
+생성형 face-swap model 없이 webcam·mask·부하 UI를 먼저 확인하려면 아래 command로 실행하고
+기본값인 `Landmark mask mapping (YuNet + 106-point ONNX)`를 선택합니다. 이 모드는
+매 frame YuNet으로 target face를 탐지하고 source의 얼굴 질감을 106개 landmark에 정렬한 뒤
+feathered mask로 합성합니다. 표정·옆모습·가림을 생성하지는
+않지만, 생성형 model보다 훨씬 가볍고 mask 경계와 frame-rate의 기준선으로 적합합니다.
+
+아래 두 model asset이 있어야 합니다. 이 repository에는 YuNet이 포함되어 있고,
+`2d106det.onnx`는 InsightFace `buffalo_l` bundle에서 별도로 준비합니다.
+
+```text
+models/face_detection_yunet_2023mar.onnx
+~/.insightface/models/buffalo_l/2d106det.onnx
+```
 
 ```bash
 .venv-face-swap-lab/bin/python experiments/face_swap_lab.py
@@ -40,10 +51,11 @@ source image와 webcam 대상에는 모두 사용 권한을 확보해야 합니�
 
 ## 실험 순서
 
-1. session `1`, `Geometric preview`로 camera·source·저장 버튼을 확인합니다.
+1. session `1`, `Landmark mask mapping`으로 camera·source·mask 품질·저장 버튼을 확인합니다.
 2. session `1`, `InSwapper 128`으로 기본 결과와 frame p50/p95를 저장합니다.
 3. 같은 장면에서 session `4`, `16`을 순서대로 선택합니다.
 4. 큰 얼굴, 측면 얼굴, 안경/손/머리카락 가림 장면을 `Save pair`로 저장해 비교합니다.
 
+`Ellipse mask mapping fallback (OpenCV)`은 YuNet 또는 landmark asset이 없을 때만 사용합니다.
 `face_swap_lab_output/`은 Git에서 제외됩니다. 128px model은 큰 1080p 얼굴의 최종 품질
 후보가 아니라 속도와 합성 경계의 기준선입니다.
