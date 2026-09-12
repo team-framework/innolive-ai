@@ -80,7 +80,14 @@ class _ConnectionBOTSORT(BOTSORT):
 class StreamTracker:
     """One ordered tracker and mask cache owned by one client stream."""
 
-    def __init__(self, config: Path = DEFAULT_CONFIG, device: str = "0"):
+    def __init__(
+        self,
+        config: Path = DEFAULT_CONFIG,
+        device: str = "0",
+        *,
+        mask_hold_frames: int = MAX_MASK_HOLD_FRAMES,
+        gmc_method: str | None = None,
+    ):
         config_path = config.expanduser().resolve()
         if not config_path.is_file():
             raise FileNotFoundError(f"tracker config not found: {config_path}")
@@ -95,9 +102,14 @@ class StreamTracker:
             raise ValueError(f"new_track_thresh must be {ACTIVATION_CONFIDENCE}")
         values["with_reid"] = False
         values["device"] = device
+        if gmc_method is not None:
+            values["gmc_method"] = gmc_method
+        if mask_hold_frames < 0 or mask_hold_frames > MAX_MASK_HOLD_FRAMES:
+            raise ValueError(f"mask_hold_frames must be in [0, {MAX_MASK_HOLD_FRAMES}]")
         self.config_path = config_path
         self._tracker = _ConnectionBOTSORT(IterableSimpleNamespace(**values))
         self._masks: dict[int, _MaskState] = {}
+        self._mask_hold_frames = mask_hold_frames
 
     @property
     def frame_id(self) -> int:
@@ -115,7 +127,11 @@ class StreamTracker:
         current, current_ids, current_boxes, low_confidence_continuations = self._record_current(
             objects
         )
-        held = self._held_objects(current_ids, current_boxes, width, height)
+        held = (
+            self._held_objects(current_ids, current_boxes, width, height)
+            if self._mask_hold_frames
+            else []
+        )
         self._prune_masks()
         return current + held, {
             "detector_backed_tracks": len(objects),
@@ -170,7 +186,7 @@ class StreamTracker:
             if state is None or track_id in current_ids:
                 continue
             gap = self.frame_id - state.last_detection_frame
-            if gap != MAX_MASK_HOLD_FRAMES:
+            if gap != self._mask_hold_frames:
                 continue
             target = np.asarray(lost.xyxy, dtype=np.float32).reshape(4)
             target[[0, 2]] = np.clip(target[[0, 2]], 0, width - 1)

@@ -1,0 +1,6 @@
+# Independent TensorRT 11 face-swap lab only; production gRPC dependencies stay unchanged.
+-r requirements-tensorrt.txt
+-r requirements-export.txt
+insightface>=0.7,<0.8
+onnxconverter-common>=1.14,<2
+aiortc>=1.9,<2
