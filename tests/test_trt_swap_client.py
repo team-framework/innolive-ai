@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from experiments.trt_swap_client.app import _blur_objects, _iou
+from experiments.trt_swap_client.app import _blur_objects, _iou, _swap_providers
 from experiments.trt_swap_client.video_io import VideoSpec
 from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
@@ -40,3 +40,11 @@ def test_fallback_composition_matches_existing_mosaic_mechanism() -> None:
 def test_iou_and_video_spec() -> None:
     assert _iou([0, 0, 10, 10], [5, 5, 15, 15]) == 25 / 175
     assert VideoSpec(1920, 1080, 30.0) == VideoSpec(1920, 1080, 30.0)
+
+
+def test_swap_provider_memory_cap() -> None:
+    cuda, cpu = _swap_providers("0", 2.0)
+    assert cuda[0] == "CUDAExecutionProvider"
+    assert cuda[1]["gpu_mem_limit"] == 2 * 1024**3
+    assert cuda[1]["arena_extend_strategy"] == "kSameAsRequested"
+    assert cpu == "CPUExecutionProvider"

@@ -32,7 +32,7 @@ from service.runtime import IMAGE_SIZE, MAX_DETECTIONS, MAX_POLYGON_POINTS
 from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b16.engine"
+DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
@@ -47,6 +47,7 @@ class Settings:
     max_batch: int
     batch_wait_ms: float
     max_queue: int
+    swap_ort_mem_gib: float
     input_video: Path | None
     hls_dir: Path
 
@@ -66,10 +67,27 @@ class FrameJob:
     future: asyncio.Future[tuple[np.ndarray, dict[str, Any]]]
 
 
+def _swap_providers(device: str, memory_gib: float) -> list[Any]:
+    """Bound ONNX Runtime's per-session CUDA arena without changing model outputs."""
+
+    return [
+        (
+            "CUDAExecutionProvider",
+            {
+                "device_id": int(device),
+                "gpu_mem_limit": int(memory_gib * 1024**3),
+                "arena_extend_strategy": "kSameAsRequested",
+                "do_copy_in_default_stream": True,
+            },
+        ),
+        "CPUExecutionProvider",
+    ]
+
+
 class InSwapper:
     """Keep the established generator/face-analysis behavior, isolated from server code."""
 
-    def __init__(self, source_path: Path, model_path: Path, providers: list[str]):
+    def __init__(self, source_path: Path, model_path: Path, providers: list[Any]):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
         from insightface import model_zoo
@@ -78,7 +96,11 @@ class InSwapper:
         source = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
         if source is None:
             raise ValueError(f"could not read swap source: {source_path}")
-        self.analysis = FaceAnalysis(name="buffalo_l", providers=providers)
+        self.analysis = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=["detection", "recognition"],
+            providers=providers,
+        )
         self.analysis.prepare(ctx_id=0, det_size=(640, 640))
         self.model = model_zoo.get_model(str(model_path), providers=providers)
         faces = self.analysis.get(source)
@@ -111,9 +133,9 @@ class SwapLab:
             raise RuntimeError(f"expected class 0=face and 1=number_plate, got {self.names}")
         import onnxruntime as ort
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             raise RuntimeError("CUDAExecutionProvider is required for this GPU test client")
+        providers = _swap_providers(settings.device, settings.swap_ort_mem_gib)
         self.swapper = InSwapper(settings.source, settings.swapper, providers)
         self.sessions = SessionRegistry()
         self.adaface = AdaFaceRuntime(
@@ -435,9 +457,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swapper", type=Path, default=DEFAULT_SWAPPER)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--device", default="0")
-    parser.add_argument("--max-batch", type=int, default=16)
+    parser.add_argument("--max-batch", type=int, default=4)
     parser.add_argument("--batch-wait-ms", type=float, default=3.0)
-    parser.add_argument("--max-queue", type=int, default=64)
+    parser.add_argument("--max-queue", type=int, default=16)
+    parser.add_argument(
+        "--swap-ort-mem-gib",
+        type=float,
+        default=2.0,
+        help="per-session ONNX Runtime CUDA arena limit for InSwapper (default: 2 GiB)",
+    )
     parser.add_argument(
         "--input-video",
         type=Path,
@@ -449,9 +477,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.max_batch < 1 or args.max_queue < args.max_batch or args.batch_wait_ms < 0:
+    if (
+        args.max_batch < 1
+        or args.max_queue < args.max_batch
+        or args.batch_wait_ms < 0
+        or not 0 < args.swap_ort_mem_gib <= 8
+    ):
         raise SystemExit(
-            "max-batch >= 1, max-queue >= max-batch, and batch-wait-ms >= 0 are required"
+            "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
+            "and swap-ort-mem-gib in (0, 8] are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -464,6 +498,7 @@ def main() -> None:
         args.max_batch,
         args.batch_wait_ms,
         args.max_queue,
+        args.swap_ort_mem_gib,
         input_video,
         args.hls_dir.expanduser().resolve(),
     )

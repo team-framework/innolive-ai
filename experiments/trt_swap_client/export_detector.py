@@ -23,14 +23,14 @@ from service.detection import EXPECTED_CLASS_NAMES  # noqa: E402
 from service.runtime import IMAGE_SIZE  # noqa: E402
 
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b16.engine"
+DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=DEFAULT_ENGINE)
-    parser.add_argument("--max-batch", type=int, default=16)
+    parser.add_argument("--max-batch", type=int, default=4)
     parser.add_argument("--workspace", type=float, default=8.0, help="TensorRT workspace GiB")
     parser.add_argument("--device", default="0")
     parser.add_argument("--force", action="store_true")
