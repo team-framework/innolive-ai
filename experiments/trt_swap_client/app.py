@@ -211,6 +211,7 @@ class TensorRtInSwapperGenerator:
         self.output_dtype = self.engine.get_tensor_dtype(self.output)
         self._validate_static_bindings()
         self.debug_dumper: SwapDebugDumper | None = None
+        self.last_timing_ms: dict[str, float] = {}
 
     def _validate_static_bindings(self) -> None:
         """Fail early for a stale/wrong engine instead of producing plausible garbage."""
@@ -293,6 +294,7 @@ class TensorRtInSwapperGenerator:
     def get(self, img: np.ndarray, target_face: Any, source_face: Any, *, paste_back: bool) -> np.ndarray:
         from insightface.utils import face_align
 
+        started = time.perf_counter()
         aimg, matrix = face_align.norm_crop2(img, target_face.kps, self.metadata.input_size[0])
         blob = cv2.dnn.blobFromImage(
             aimg,
@@ -302,13 +304,26 @@ class TensorRtInSwapperGenerator:
             swapRB=True,
         )
         latent = _mapped_latent(source_face, self.metadata.emap)
+        prepared_at = time.perf_counter()
         prediction = self._forward(blob, latent)
+        forwarded_at = time.perf_counter()
         bgr_fake = _prediction_to_bgr(prediction)
         if not paste_back:
+            self.last_timing_ms = {
+                "prepare": (prepared_at - started) * 1_000,
+                "forward": (forwarded_at - prepared_at) * 1_000,
+                "paste": 0.0,
+            }
             return bgr_fake
         debugger = self.debug_dumper if self.debug_dumper and self.debug_dumper.consume() else None
         artifacts: dict[str, np.ndarray] | None = {} if debugger is not None else None
         result = _paste_inswapper(img, aimg, bgr_fake, matrix, artifacts=artifacts)
+        pasted_at = time.perf_counter()
+        self.last_timing_ms = {
+            "prepare": (prepared_at - started) * 1_000,
+            "forward": (forwarded_at - prepared_at) * 1_000,
+            "paste": (pasted_at - forwarded_at) * 1_000,
+        }
         if debugger is not None:
             # The metadata model has an explicit CPU ORT session solely for this
             # opt-in comparison.  It never participates in the live TRT result.
@@ -375,29 +390,58 @@ def _paste_inswapper(
     *,
     artifacts: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Exact paste-back behavior from InsightFace INSwapper.get()."""
+    """Paste only the face ROI; full-frame warps made 1080p swaps unnecessarily slow."""
 
     inverse = cv2.invertAffineTransform(matrix)
-    fake = cv2.warpAffine(fake, inverse, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
-    white = cv2.warpAffine(
-        np.full(aligned.shape[:2], 255, dtype=np.float32),
+    corners = cv2.transform(
+        np.asarray([[[0, 0], [aligned.shape[1], 0], [aligned.shape[1], aligned.shape[0]], [0, aligned.shape[0]]]], dtype=np.float32),
         inverse,
-        (target_img.shape[1], target_img.shape[0]),
-        borderValue=0.0,
+    )[0]
+    minimum = np.floor(corners.min(axis=0)).astype(np.int32)
+    maximum = np.ceil(corners.max(axis=0)).astype(np.int32)
+    # Erosion/feathering can extend beyond the warped patch.  Keep an ample
+    # local border so the result is equivalent to a full-frame operation.
+    padding = max(16, int(np.ceil(max(maximum - minimum) * 0.2)))
+    left = max(0, int(minimum[0]) - padding)
+    top = max(0, int(minimum[1]) - padding)
+    right = min(target_img.shape[1], int(maximum[0]) + padding)
+    bottom = min(target_img.shape[0], int(maximum[1]) + padding)
+    if right <= left or bottom <= top:
+        raise RuntimeError("empty InSwapper paste ROI")
+    roi_inverse = inverse.copy()
+    roi_inverse[:, 2] -= (left, top)
+    roi_size = (right - left, bottom - top)
+    # Build the feather in the 128px aligned domain, then warp BGR+alpha in a
+    # single operation.  The old implementation did erosion, blur, and two
+    # warps over a large 1080p ROI for every face.
+    projected_size = max(1.0, float(np.sqrt(np.prod(maximum - minimum))))
+    aligned_scale = projected_size / max(aligned.shape[:2])
+    erode_size = max(1, round(max(projected_size // 10, 10) / aligned_scale))
+    aligned_mask = cv2.erode(
+        np.full(aligned.shape[:2], 255, dtype=np.uint8),
+        np.ones((erode_size, erode_size), dtype=np.uint8),
+        iterations=1,
     )
-    white[white > 20] = 255
-    mask_h, mask_w = np.where(white == 255)
-    if not len(mask_h) or not len(mask_w):
-        raise RuntimeError("empty InSwapper paste mask")
-    mask_size = int(np.sqrt((np.max(mask_h) - np.min(mask_h)) * (np.max(mask_w) - np.min(mask_w))))
-    mask = cv2.erode(white, np.ones((max(mask_size // 10, 10),) * 2, np.uint8), iterations=1)
-    blur = tuple(2 * value + 1 for value in (max(mask_size // 20, 5),) * 2)
-    mask = cv2.GaussianBlur(mask, blur, 0).reshape((*target_img.shape[:2], 1)) / 255
+    blur_radius = max(1, round(max(projected_size // 20, 5) / aligned_scale))
+    aligned_mask = cv2.GaussianBlur(aligned_mask, (2 * blur_radius + 1,) * 2, 0)
+    rgba = np.dstack((fake, aligned_mask))
+    warped_rgba = cv2.warpAffine(rgba, roi_inverse, roi_size, borderValue=0.0)
+    fake = warped_rgba[:, :, :3]
+    mask = warped_rgba[:, :, 3:4].astype(np.float32) / 255.0
+    result = target_img.copy()
+    target_roi = target_img[top:bottom, left:right]
+    result[top:bottom, left:right] = (
+        mask * fake + (1 - mask) * target_roi.astype(np.float32)
+    ).astype(np.uint8)
     if artifacts is not None:
-        artifacts["inverse_warp_swap"] = fake
-        artifacts["swap_mask"] = np.rint(mask[:, :, 0] * 255).astype(np.uint8)
+        warped = np.zeros_like(target_img)
+        warped[top:bottom, left:right] = fake
+        debug_mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
+        debug_mask[top:bottom, left:right] = np.rint(mask[:, :, 0] * 255).astype(np.uint8)
+        artifacts["inverse_warp_swap"] = warped
+        artifacts["swap_mask"] = debug_mask
         artifacts["paste_before_blend"] = target_img
-    return (mask * fake + (1 - mask) * target_img.astype(np.float32)).astype(np.uint8)
+    return result
 
 
 class SwapDebugDumper:
@@ -534,6 +578,7 @@ class InSwapper:
             )
         self.last_alignment_ms = 0.0
         self.last_generator_ms = 0.0
+        self.last_generator_timing: dict[str, float] = {}
         faces = self.analysis.get(source)
         if not faces:
             raise ValueError("no source face found")
@@ -595,6 +640,7 @@ class InSwapper:
                 continue
             succeeded.add(index)
         self.last_generator_ms = (time.perf_counter() - generator_started) * 1_000
+        self.last_generator_timing = dict(getattr(self.generator, "last_timing_ms", {}))
         return output, succeeded
 
     def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
@@ -865,6 +911,9 @@ class SwapLab:
             "swap_ms": round(swap_ms, 2),
             "swap_alignment_ms": round(self.swapper.last_alignment_ms, 2),
             "swap_generator_ms": round(self.swapper.last_generator_ms, 2),
+            "swap_generator_timing_ms": {
+                name: round(value, 2) for name, value in self.swapper.last_generator_timing.items()
+            },
             "yolo_batch": batch_size,
             "adaface": recognition,
             "tracking": temporal,
