@@ -37,6 +37,7 @@ DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
+DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,9 @@ class Settings:
     max_queue: int
     swap_ort_mem_gib: float
     swap_min_mask_area_px: float
+    swapper_backend: str
+    swapper_trt_cache: Path
+    swapper_trt_workspace_gib: float
     input_video: Path | None
     hls_dir: Path
 
@@ -125,10 +129,40 @@ def _swap_providers(device: str, memory_gib: float) -> list[Any]:
     ]
 
 
+def _generator_providers(settings: Settings) -> list[Any]:
+    cuda = _swap_providers(settings.device, settings.swap_ort_mem_gib)
+    if settings.swapper_backend == "cuda":
+        return cuda
+    cache = settings.swapper_trt_cache
+    cache.mkdir(parents=True, exist_ok=True)
+    return [
+        (
+            "TensorrtExecutionProvider",
+            {
+                "device_id": int(settings.device),
+                "trt_fp16_enable": True,
+                "trt_max_workspace_size": int(settings.swapper_trt_workspace_gib * 1024**3),
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache),
+                "trt_timing_cache_enable": True,
+                "trt_timing_cache_path": str(cache),
+                "trt_cuda_graph_enable": True,
+            },
+        ),
+        *cuda,
+    ]
+
+
 class InSwapper:
     """Keep the established generator/face-analysis behavior, isolated from server code."""
 
-    def __init__(self, source_path: Path, model_path: Path, providers: list[Any]):
+    def __init__(
+        self,
+        source_path: Path,
+        model_path: Path,
+        analysis_providers: list[Any],
+        generator_providers: list[Any],
+    ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
         from insightface import model_zoo
@@ -140,16 +174,26 @@ class InSwapper:
         self.analysis = FaceAnalysis(
             name="buffalo_l",
             allowed_modules=["detection", "recognition"],
-            providers=providers,
+            providers=analysis_providers,
         )
         self.analysis.prepare(ctx_id=0, det_size=(640, 640))
-        self.model = model_zoo.get_model(str(model_path), providers=providers)
+        self.model = model_zoo.get_model(str(model_path), providers=generator_providers)
         faces = self.analysis.get(source)
         if not faces:
             raise ValueError("no source face found")
         self.source_face = max(
             faces, key=lambda face: float(np.prod(face.bbox[2:] - face.bbox[:2]))
         )
+
+    def provider_summary(self) -> dict[str, list[str]]:
+        analysis: set[str] = set()
+        for model in self.analysis.models.values():
+            session = getattr(model, "session", None)
+            if session is not None:
+                analysis.update(session.get_providers())
+        session = getattr(self.model, "session", None)
+        generator = session.get_providers() if session is not None else []
+        return {"analysis": sorted(analysis), "generator": list(generator)}
 
     def apply(self, frame: np.ndarray, bbox: list[float]) -> np.ndarray:
         output, succeeded = self.apply_many(frame, [bbox])
@@ -197,8 +241,20 @@ class SwapLab:
 
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             raise RuntimeError("CUDAExecutionProvider is required for this GPU test client")
-        providers = _swap_providers(settings.device, settings.swap_ort_mem_gib)
-        self.swapper = InSwapper(settings.source, settings.swapper, providers)
+        if (
+            settings.swapper_backend == "tensorrt"
+            and "TensorrtExecutionProvider" not in ort.get_available_providers()
+        ):
+            raise RuntimeError(
+                "TensorrtExecutionProvider is unavailable; install an ONNX Runtime GPU build "
+                "compatible with the installed TensorRT or use --swapper-backend cuda"
+            )
+        self.swapper = InSwapper(
+            settings.source,
+            settings.swapper,
+            _swap_providers(settings.device, settings.swap_ort_mem_gib),
+            _generator_providers(settings),
+        )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
             AdaFaceConfig(device=f"cuda:{settings.device}", queue_capacity=32),
@@ -492,6 +548,7 @@ def create_app(settings: Settings) -> FastAPI:
             "frames": lab.frames,
             "queue": lab.queue.qsize(),
             "p50_ms": float(np.percentile(lab.latencies, 50)) if lab.latencies else None,
+            "swapper_providers": lab.swapper.provider_summary(),
         }
 
     @app.post("/api/enroll/{session_id}")
@@ -570,6 +627,14 @@ def parse_args() -> argparse.Namespace:
         default=16_384,
         help="face segmentation mask area below which the client uses protected blur",
     )
+    parser.add_argument("--swapper-backend", choices=("tensorrt", "cuda"), default="tensorrt")
+    parser.add_argument("--swapper-trt-cache", type=Path, default=DEFAULT_SWAPPER_TRT_CACHE)
+    parser.add_argument(
+        "--swapper-trt-workspace-gib",
+        type=float,
+        default=1.0,
+        help="TensorRT EP workspace cap for the 128 swap generator",
+    )
     parser.add_argument(
         "--input-video",
         type=Path,
@@ -587,10 +652,12 @@ def main() -> None:
         or args.batch_wait_ms < 0
         or not 0 < args.swap_ort_mem_gib <= 8
         or args.swap_min_mask_area_px < 1
+        or not 0 < args.swapper_trt_workspace_gib <= 4
     ):
         raise SystemExit(
             "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
-            "swap-ort-mem-gib in (0, 8], and swap-min-mask-area-px >= 1 are required"
+            "swap-ort-mem-gib in (0, 8], swap-min-mask-area-px >= 1, and "
+            "swapper-trt-workspace-gib in (0, 4] are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -605,6 +672,9 @@ def main() -> None:
         args.max_queue,
         args.swap_ort_mem_gib,
         args.swap_min_mask_area_px,
+        args.swapper_backend,
+        args.swapper_trt_cache.expanduser().resolve(),
+        args.swapper_trt_workspace_gib,
         input_video,
         args.hls_dir.expanduser().resolve(),
     )

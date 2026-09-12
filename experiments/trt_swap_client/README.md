@@ -23,6 +23,7 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - YOLO26n-seg는 dynamic TensorRT engine을 사용하며 class `0=face`, `1=number_plate`만 유지한다. 이 클래스 계약이 아니면 시작을 거부한다.
 - 기본 baseline은 dynamic B4 engine과 최대 4개 frame batch다. model quality는 그대로이며, B8/B16은 B4의 실측 GPU 여유가 확인된 경우에만 별도 engine으로 export한다.
 - InSwapper ONNX Runtime CUDA arena는 session당 2GiB 상한(`--swap-ort-mem-gib`)과 exact-request growth를 사용한다. swap에 필요하지 않은 age/gender/106-landmark InsightFace session은 만들지 않는다.
+- 기본 `--swapper-backend tensorrt`는 128 swap generator만 ONNX Runtime TensorRT EP FP16·engine/timing cache·CUDA graph로 실행한다. face analysis는 CUDA EP로 유지한다. 초기 실행은 cache build 때문에 느릴 수 있으며, 이후 재기동부터 cache를 재사용한다.
 - queue가 가득 차면 오래된 처리를 쌓지 않고 해당 browser frame을 drop한다.
 - AdaFace whitelist가 확인된 face는 원본을 유지한다. class 0의 비화이트리스트 face만 InSwapper에 전달한다.
 - class 0 mask가 `16,384px`(기본값)보다 작거나 tracking hold 상태면 generator를 실행하지 않고 local Gaussian blur fallback을 적용한다. `--swap-min-mask-area-px`로 조정할 수 있다.
@@ -32,6 +33,8 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - Browser WebSocket은 request/response backpressure를 적용해 처리하지 못할 frame을 계속 전송하지 않는다.
 
 응답 metadata에는 `detector_batch_ms`, `swap_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_ms`가 크면 InSwapper가 병목이고, `detector_batch_ms`가 크면 TensorRT engine profile이 병목이다.
+
+`/health`의 `swapper_providers.generator` 첫 값이 `TensorrtExecutionProvider`인지 확인한다. 호환되는 ONNX Runtime TensorRT EP가 없으면 시작을 거부하며, 비교용 CUDA 경로는 `--swapper-backend cuda`를 사용한다.
 
 ## NVDEC/NVENC file test
 

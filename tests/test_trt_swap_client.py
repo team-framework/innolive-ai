@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from experiments.trt_swap_client.app import (
     InSwapper,
+    Settings,
     _blur_objects,
+    _generator_providers,
     _iou,
     _objects,
     _swap_providers,
@@ -54,6 +58,50 @@ def test_swap_provider_memory_cap() -> None:
     assert cuda[1]["gpu_mem_limit"] == 2 * 1024**3
     assert cuda[1]["arena_extend_strategy"] == "kSameAsRequested"
     assert cpu == "CPUExecutionProvider"
+
+
+def test_cuda_generator_provider_keeps_ort_memory_cap(tmp_path: Path) -> None:
+    settings = Settings(
+        detector=tmp_path / "detector.engine",
+        swapper=tmp_path / "swapper.onnx",
+        source=tmp_path / "source.png",
+        device="0",
+        max_batch=4,
+        batch_wait_ms=3.0,
+        max_queue=16,
+        swap_ort_mem_gib=2.0,
+        swap_min_mask_area_px=16_384,
+        swapper_backend="cuda",
+        swapper_trt_cache=tmp_path / "cache",
+        swapper_trt_workspace_gib=1.0,
+        input_video=None,
+        hls_dir=tmp_path / "hls",
+    )
+    assert _generator_providers(settings) == _swap_providers("0", 2.0)
+
+
+def test_tensorrt_generator_provider_enables_cache_and_cuda_graph(tmp_path: Path) -> None:
+    settings = Settings(
+        detector=tmp_path / "detector.engine",
+        swapper=tmp_path / "swapper.onnx",
+        source=tmp_path / "source.png",
+        device="0",
+        max_batch=4,
+        batch_wait_ms=3.0,
+        max_queue=16,
+        swap_ort_mem_gib=2.0,
+        swap_min_mask_area_px=16_384,
+        swapper_backend="tensorrt",
+        swapper_trt_cache=tmp_path / "cache",
+        swapper_trt_workspace_gib=1.0,
+        input_video=None,
+        hls_dir=tmp_path / "hls",
+    )
+    providers = _generator_providers(settings)
+    assert providers[0][0] == "TensorrtExecutionProvider"
+    assert providers[0][1]["trt_cuda_graph_enable"] is True
+    assert providers[0][1]["trt_engine_cache_enable"] is True
+    assert settings.swapper_trt_cache.is_dir()
 
 
 def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:
