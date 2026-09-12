@@ -65,7 +65,7 @@ class Settings:
     hls_dir: Path
     swap_debug_dir: Path | None = None
     swap_debug_frames: int = 1
-    stream_jpeg_quality: int = 100
+    stream_jpeg_quality: int = 95
 
 
 @dataclass(slots=True)
@@ -1183,8 +1183,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stream-jpeg-quality",
         type=int,
-        default=100,
-        help="browser input and WebSocket output JPEG quality (1-100; default: 100 for diagnosis)",
+        default=95,
+        help="browser input and WebSocket output JPEG quality (1-100; default: 95)",
     )
     return parser.parse_args()
 
@@ -1237,7 +1237,7 @@ def main() -> None:
     uvicorn.run(create_app(settings), host=args.host, port=args.port)
 
 
-_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false,lastUrl='';navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){m.textContent=e.data;return}if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.src=lastUrl;busy=false};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(b=>{if(b)ws.send(b);else busy=false},'image/jpeg',__JPEG_QUALITY__)},33)</script>"""
+_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false,lastUrl='',sentAt=0,lastMeta={},frames=0,windowAt=performance.now();navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return}const now=performance.now(),roundTrip=now-sentAt;if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.src=lastUrl;busy=false;frames++;const elapsed=now-windowAt;if(elapsed>=1000){const fps=frames*1000/elapsed;m.textContent=JSON.stringify({...lastMeta,client_round_trip_ms:+roundTrip.toFixed(1),client_fps:+fps.toFixed(1)},null,2);frames=0;windowAt=now}};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);const captureAt=performance.now();c.toBlob(b=>{if(b){sentAt=captureAt;ws.send(b)}else busy=false},'image/jpeg',__JPEG_QUALITY__)},16)</script>"""
 
 
 if __name__ == "__main__":
