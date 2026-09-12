@@ -212,6 +212,10 @@ class TensorRtInSwapperGenerator:
         self._validate_static_bindings()
         self.debug_dumper: SwapDebugDumper | None = None
         self.last_timing_ms: dict[str, float] = {}
+        self._image_tensor: Any | None = None
+        self._latent_tensor: Any | None = None
+        self._output_tensor: Any | None = None
+        self._host_output: Any | None = None
 
     def _validate_static_bindings(self) -> None:
         """Fail early for a stale/wrong engine instead of producing plausible garbage."""
@@ -263,30 +267,35 @@ class TensorRtInSwapperGenerator:
         if not np.isfinite(image).all() or not np.isfinite(latent).all():
             raise ValueError("InSwapper input contains NaN or infinity")
 
-        image_tensor = torch.from_numpy(np.ascontiguousarray(image)).to(
-            device=f"cuda:{self.device}", dtype=self._torch_dtype(self.image_dtype, torch)
-        )
-        latent_tensor = torch.from_numpy(np.ascontiguousarray(latent)).to(
-            device=f"cuda:{self.device}", dtype=self._torch_dtype(self.latent_dtype, torch)
-        )
+        image_dtype = self._torch_dtype(self.image_dtype, torch)
+        latent_dtype = self._torch_dtype(self.latent_dtype, torch)
+        output_dtype = self._torch_dtype(self.output_dtype, torch)
+        device = torch.device(f"cuda:{self.device}")
+        if self._image_tensor is None:
+            self._image_tensor = torch.empty(image.shape, device=device, dtype=image_dtype)
+            self._latent_tensor = torch.empty(latent.shape, device=device, dtype=latent_dtype)
+        image_tensor, latent_tensor = self._image_tensor, self._latent_tensor
+        image_tensor.copy_(torch.from_numpy(image))
+        latent_tensor.copy_(torch.from_numpy(latent))
         self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
         self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
         output_shape = tuple(self.context.get_tensor_shape(self.output))
         expected_output = (1, 3, self.metadata.input_size[1], self.metadata.input_size[0])
         if output_shape != expected_output:
             raise RuntimeError(f"unresolved or unexpected TensorRT output shape: {output_shape}")
-        output_tensor = torch.empty(
-            output_shape,
-            device=image_tensor.device,
-            dtype=self._torch_dtype(self.output_dtype, torch),
-        )
+        if self._output_tensor is None:
+            self._output_tensor = torch.empty(output_shape, device=device, dtype=output_dtype)
+            self._host_output = torch.empty(output_shape, dtype=torch.float32, pin_memory=True)
+        output_tensor = self._output_tensor
         self.context.set_tensor_address(self.image_input, image_tensor.data_ptr())
         self.context.set_tensor_address(self.latent_input, latent_tensor.data_ptr())
         self.context.set_tensor_address(self.output, output_tensor.data_ptr())
         stream = torch.cuda.current_stream(self.device)
         if not self.context.execute_async_v3(stream.cuda_stream):
             raise RuntimeError("TensorRT InSwapper execution failed")
-        output = output_tensor.float().cpu().numpy()
+        self._host_output.copy_(output_tensor, non_blocking=True)
+        stream.synchronize()
+        output = self._host_output.numpy()
         if not np.isfinite(output).all():
             raise RuntimeError("TensorRT InSwapper output contains NaN or infinity")
         return output
@@ -1124,9 +1133,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swapper-engine", type=Path, default=DEFAULT_SWAPPER_ENGINE)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--device", default="0")
-    parser.add_argument("--max-batch", type=int, default=4)
-    parser.add_argument("--batch-wait-ms", type=float, default=3.0)
-    parser.add_argument("--max-queue", type=int, default=16)
+    parser.add_argument("--max-batch", type=int, default=1, help="latency-first default; raise only after throughput measurement")
+    parser.add_argument("--batch-wait-ms", type=float, default=0.0, help="do not delay a live frame for batching by default")
+    parser.add_argument("--max-queue", type=int, default=2, help="drop stale live frames instead of accumulating latency")
     parser.add_argument(
         "--swap-ort-mem-gib",
         type=float,
@@ -1228,7 +1237,7 @@ def main() -> None:
     uvicorn.run(create_app(settings), host=args.host, port=args.port)
 
 
-_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → batched YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false;navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){m.textContent=e.data;return}o.src=URL.createObjectURL(e.data);busy=false};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(b=>{if(b)ws.send(b);else busy=false},'image/jpeg',__JPEG_QUALITY__)},33)</script>"""
+_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false,lastUrl='';navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){m.textContent=e.data;return}if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.src=lastUrl;busy=false};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(b=>{if(b)ws.send(b);else busy=false},'image/jpeg',__JPEG_QUALITY__)},33)</script>"""
 
 
 if __name__ == "__main__":
