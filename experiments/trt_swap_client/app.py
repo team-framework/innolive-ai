@@ -171,30 +171,55 @@ class TensorRtInSwapperGenerator:
             latent_inputs[0],
             self.outputs[0],
         )
+        self.image_dtype = self.engine.get_tensor_dtype(self.image_input)
+        self.latent_dtype = self.engine.get_tensor_dtype(self.latent_input)
+        self.output_dtype = self.engine.get_tensor_dtype(self.output)
 
     def provider_summary(self) -> list[str]:
-        return ["TensorRTDirect"]
+        return [
+            "TensorRTDirect",
+            f"input={self.image_dtype}",
+            f"latent={self.latent_dtype}",
+            f"output={self.output_dtype}",
+        ]
+
+    @staticmethod
+    def _torch_dtype(trt_dtype: Any, torch: Any) -> Any:
+        import tensorrt as trt
+
+        mapping = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF: torch.float16,
+        }
+        try:
+            return mapping[trt_dtype]
+        except KeyError as error:
+            raise RuntimeError(f"unsupported TensorRT InSwapper tensor dtype: {trt_dtype}") from error
 
     def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
         import torch
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(image)).to(
-            device=f"cuda:{self.device}", dtype=torch.float32
+            device=f"cuda:{self.device}", dtype=self._torch_dtype(self.image_dtype, torch)
         )
         latent_tensor = torch.from_numpy(np.ascontiguousarray(latent)).to(
-            device=f"cuda:{self.device}", dtype=torch.float32
+            device=f"cuda:{self.device}", dtype=self._torch_dtype(self.latent_dtype, torch)
         )
         self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
         self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
         output_shape = tuple(self.context.get_tensor_shape(self.output))
-        output_tensor = torch.empty(output_shape, device=image_tensor.device, dtype=torch.float32)
+        output_tensor = torch.empty(
+            output_shape,
+            device=image_tensor.device,
+            dtype=self._torch_dtype(self.output_dtype, torch),
+        )
         self.context.set_tensor_address(self.image_input, image_tensor.data_ptr())
         self.context.set_tensor_address(self.latent_input, latent_tensor.data_ptr())
         self.context.set_tensor_address(self.output, output_tensor.data_ptr())
         stream = torch.cuda.current_stream(self.device)
         if not self.context.execute_async_v3(stream.cuda_stream):
             raise RuntimeError("TensorRT InSwapper execution failed")
-        return output_tensor.cpu().numpy()
+        return output_tensor.float().cpu().numpy()
 
     def get(self, img: np.ndarray, target_face: Any, source_face: Any, *, paste_back: bool) -> np.ndarray:
         from insightface.utils import face_align
