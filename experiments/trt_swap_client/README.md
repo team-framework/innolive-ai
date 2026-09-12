@@ -5,42 +5,25 @@
 3090 Linux host에서 먼저 현재 checkpoint로 **이 클라이언트 전용** dynamic FP16 engine을 만듭니다. 기존 `best_b1.engine`을 대체하지 않습니다.
 
 ```bash
-python3.11 -m venv .venv-trt10-swap
-.venv-trt10-swap/bin/python -m pip install --upgrade pip
-.venv-trt10-swap/bin/python -m pip install -r requirements-trt-swap-client.txt
-TRT_LIB_DIR="$(.venv-trt10-swap/bin/python - <<'PY'
-import sysconfig
-from pathlib import Path
-
-site = Path(sysconfig.get_paths()["purelib"])
-paths = list(site.rglob("libnvinfer.so.10"))
-assert paths, f"TensorRT 10 runtime was not installed below {site}"
-print(paths[0].parent)
-PY
- )"
-echo "$TRT_LIB_DIR"
-test -n "$TRT_LIB_DIR"
-```
-
-`requirements-tensorrt.txt`의 TensorRT 11은 이 lab과 함께 사용하지 않는다. ONNX Runtime
-1.22 TensorRT EP는 TensorRT 10.9/CUDA 12 조합을 사용하며, Python 3.14용 TensorRT 10
-binding wheel은 제공되지 않는다. 위의 Python 3.11 environment는 이 lab 전용이다.
-
-라이브러리 경로는 위에서 찾은 경로만 현재 실행에 전달한다. system CUDA/TensorRT나
-기존 TensorRT 11 environment는 변경하지 않는다.
-
-```bash
-LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-.venv-trt10-swap/bin/python -m experiments.trt_swap_client.export_detector \
-  --checkpoint models/best.pt --output models/best_swap_b4_trt10.engine \
-  --max-batch 4 --workspace 8 --device 0 --force
+python -m pip install -r requirements-trt-swap-client.txt
 ```
 
 ```bash
-LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-.venv-trt10-swap/bin/python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
-  --detector models/best_swap_b4_trt10.engine \
+python -m experiments.trt_swap_client.export_detector \
+  --checkpoint models/best.pt --output models/best_swap_b4.engine \
+  --max-batch 4 --workspace 8 --device 0
+
+python -m experiments.trt_swap_client.export_swapper \
+  --onnx models/face_swap/inswapper_128.onnx \
+  --output models/face_swap/inswapper_128_trt11.engine \
+  --workspace 2 --force
+```
+
+```bash
+python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
+  --detector models/best_swap_b4.engine \
   --swapper models/face_swap/inswapper_128.onnx \
+  --swapper-engine models/face_swap/inswapper_128_trt11.engine \
   --source ~/Documents/input.png
 ```
 
@@ -61,7 +44,7 @@ LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 
 응답 metadata에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`, `swap_generator_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_generator_ms`가 크면 generator model이 병목이고, `swap_alignment_ms`가 크면 target landmark 경로가 병목이다.
 
-`/health`의 `swapper_providers.generator` 첫 값이 `TensorrtExecutionProvider`인지 확인한다. TensorRT library가 누락되어 CUDA EP로 fallback되면 client는 시작을 거부한다. 비교용 CUDA 경로만 `--swapper-backend cuda`를 명시한다.
+`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT 11에서 만든 direct engine으로 실행한다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
 
 ## NVDEC/NVENC file test
 
@@ -80,4 +63,4 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - `models/face_swap/inswapper_128.onnx`는 완전한 유효 ONNX 파일이어야 합니다. 이 repository의 무시된 model artifact는 자동으로 내려받거나 교체하지 않습니다.
 - 이 client는 quality를 낮추는 resize, frame-skip을 추가하지 않습니다. 작은 mask fallback은 privacy-first 처리이며, 큰 face의 generator model과 input size는 유지합니다. 실제 10 clients × 30fps는 3090 host에서 browser 및 NVDEC file workload를 나누어 실측해야 합니다.
 
-`models/best_swap_b4_trt10.engine`은 3090 Linux에서 현재 `models/best.pt`로 새로 만들어야 하며 Git에 넣지 않습니다. 기존 TensorRT 11 engine(`best_swap_b4.engine`)은 TensorRT 10 lab에서 사용하지 않습니다.
+`models/best_swap_b4.engine`과 `models/face_swap/inswapper_128_trt11.engine`은 동일한 3090 Linux TensorRT 11 environment에서 만들어야 하며 Git에 넣지 않습니다.

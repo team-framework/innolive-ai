@@ -33,9 +33,10 @@ from service.runtime import IMAGE_SIZE, MAX_DETECTIONS, MAX_POLYGON_POINTS
 from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4_trt10.engine"
+DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
+DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 
@@ -44,6 +45,7 @@ DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 class Settings:
     detector: Path
     swapper: Path
+    swapper_engine: Path
     source: Path
     device: str
     max_batch: int
@@ -131,43 +133,114 @@ def _swap_providers(device: str, memory_gib: float) -> list[Any]:
     ]
 
 
-def _generator_providers(settings: Settings) -> list[Any]:
-    cuda = _swap_providers(settings.device, settings.swap_ort_mem_gib)
-    if settings.swapper_backend == "cuda":
-        return cuda
-    cache = settings.swapper_trt_cache
-    cache.mkdir(parents=True, exist_ok=True)
-    return [
-        (
-            "TensorrtExecutionProvider",
-            {
-                "device_id": int(settings.device),
-                "trt_fp16_enable": True,
-                "trt_max_workspace_size": int(settings.swapper_trt_workspace_gib * 1024**3),
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": str(cache),
-                "trt_timing_cache_enable": True,
-                "trt_timing_cache_path": str(cache),
-                "trt_cuda_graph_enable": True,
-            },
-        ),
-        *cuda,
-    ]
+class TensorRtInSwapperGenerator:
+    """TensorRT 11 runner that preserves InsightFace's crop and paste-back math."""
 
+    def __init__(self, metadata: Any, engine_path: Path, device: str):
+        if not engine_path.is_file():
+            raise FileNotFoundError(
+                f"TensorRT swap engine is missing: {engine_path}. Build it with "
+                "python -m experiments.trt_swap_client.export_swapper"
+            )
+        import tensorrt as trt
 
-def _require_requested_generator_provider(backend: str, providers: list[str]) -> None:
-    """Do not silently measure CUDA fallback as a TensorRT run."""
-
-    if backend == "tensorrt" and (
-        not providers or providers[0] != "TensorrtExecutionProvider"
-    ):
-        applied = ", ".join(providers) or "none"
-        raise RuntimeError(
-            "TensorRT generator startup failed and ONNX Runtime fell back to "
-            f"{applied}. Install a TensorRT 10 runtime exposing libnvinfer.so.10, "
-            "then restart with --swapper-backend tensorrt; use "
-            "--swapper-backend cuda only for an intentional CUDA comparison."
+        self.metadata = metadata
+        self.device = int(device)
+        self.logger = trt.Logger(trt.Logger.ERROR)
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        if self.engine is None:
+            raise RuntimeError(f"could not deserialize TensorRT swap engine: {engine_path}")
+        self.context = self.engine.create_execution_context()
+        self.inputs = [
+            self.engine.get_tensor_name(index)
+            for index in range(self.engine.num_io_tensors)
+            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index)) == trt.TensorIOMode.INPUT
+        ]
+        self.outputs = [
+            self.engine.get_tensor_name(index)
+            for index in range(self.engine.num_io_tensors)
+            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index)) == trt.TensorIOMode.OUTPUT
+        ]
+        image_inputs = [name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 4]
+        latent_inputs = [name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 2]
+        if len(image_inputs) != 1 or len(latent_inputs) != 1 or len(self.outputs) != 1:
+            raise RuntimeError(f"unexpected InSwapper TensorRT bindings: {self.inputs} -> {self.outputs}")
+        self.image_input, self.latent_input, self.output = (
+            image_inputs[0],
+            latent_inputs[0],
+            self.outputs[0],
         )
+
+    def provider_summary(self) -> list[str]:
+        return ["TensorRTDirect"]
+
+    def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
+        import torch
+
+        image_tensor = torch.from_numpy(np.ascontiguousarray(image)).to(
+            device=f"cuda:{self.device}", dtype=torch.float32
+        )
+        latent_tensor = torch.from_numpy(np.ascontiguousarray(latent)).to(
+            device=f"cuda:{self.device}", dtype=torch.float32
+        )
+        self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
+        self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
+        output_shape = tuple(self.context.get_tensor_shape(self.output))
+        output_tensor = torch.empty(output_shape, device=image_tensor.device, dtype=torch.float32)
+        self.context.set_tensor_address(self.image_input, image_tensor.data_ptr())
+        self.context.set_tensor_address(self.latent_input, latent_tensor.data_ptr())
+        self.context.set_tensor_address(self.output, output_tensor.data_ptr())
+        stream = torch.cuda.current_stream(self.device)
+        if not self.context.execute_async_v3(stream.cuda_stream):
+            raise RuntimeError("TensorRT InSwapper execution failed")
+        return output_tensor.cpu().numpy()
+
+    def get(self, img: np.ndarray, target_face: Any, source_face: Any, *, paste_back: bool) -> np.ndarray:
+        from insightface.utils import face_align
+
+        aimg, matrix = face_align.norm_crop2(img, target_face.kps, self.metadata.input_size[0])
+        blob = cv2.dnn.blobFromImage(
+            aimg,
+            1.0 / self.metadata.input_std,
+            self.metadata.input_size,
+            (self.metadata.input_mean,) * 3,
+            swapRB=True,
+        )
+        latent = source_face.normed_embedding.reshape((1, -1))
+        latent = np.dot(latent, self.metadata.emap)
+        latent /= np.linalg.norm(latent)
+        prediction = self._forward(blob, latent.astype(np.float32, copy=False))
+        bgr_fake = np.clip(255 * prediction.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[
+            :, :, ::-1
+        ]
+        if not paste_back:
+            return bgr_fake
+        return _paste_inswapper(img, aimg, bgr_fake, matrix)
+
+
+def _paste_inswapper(target_img: np.ndarray, aligned: np.ndarray, fake: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Exact paste-back behavior from InsightFace INSwapper.get()."""
+
+    fake_diff = np.abs(fake.astype(np.float32) - aligned.astype(np.float32)).mean(axis=2)
+    fake_diff[:2, :], fake_diff[-2:, :], fake_diff[:, :2], fake_diff[:, -2:] = 0, 0, 0, 0
+    inverse = cv2.invertAffineTransform(matrix)
+    fake = cv2.warpAffine(fake, inverse, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    white = cv2.warpAffine(
+        np.full(aligned.shape[:2], 255, dtype=np.float32),
+        inverse,
+        (target_img.shape[1], target_img.shape[0]),
+        borderValue=0.0,
+    )
+    white[white > 20] = 255
+    mask_h, mask_w = np.where(white == 255)
+    if not len(mask_h) or not len(mask_w):
+        raise RuntimeError("empty InSwapper paste mask")
+    mask_size = int(np.sqrt((np.max(mask_h) - np.min(mask_h)) * (np.max(mask_w) - np.min(mask_w))))
+    mask = cv2.erode(white, np.ones((max(mask_size // 10, 10),) * 2, np.uint8), iterations=1)
+    blur = tuple(2 * value + 1 for value in (max(mask_size // 20, 5),) * 2)
+    mask = cv2.GaussianBlur(mask, blur, 0).reshape((*target_img.shape[:2], 1)) / 255
+    return (mask * fake + (1 - mask) * target_img.astype(np.float32)).astype(np.uint8)
 
 
 class InSwapper:
@@ -178,8 +251,10 @@ class InSwapper:
         source_path: Path,
         model_path: Path,
         analysis_providers: list[Any],
-        generator_providers: list[Any],
         *,
+        backend: str,
+        engine_path: Path,
+        device: str,
         target_aligner: str,
         target_yunet: Path,
     ):
@@ -197,7 +272,17 @@ class InSwapper:
             providers=analysis_providers,
         )
         self.analysis.prepare(ctx_id=0, det_size=(640, 640))
-        self.model = model_zoo.get_model(str(model_path), providers=generator_providers)
+        # TensorRT 11 cannot be loaded by ONNX Runtime's TensorRT 10 EP.  Keep
+        # ONNX Runtime only for the explicit CUDA comparison path; the default
+        # uses a direct TensorRT engine for the generator.
+        if backend == "tensorrt":
+            self.model = model_zoo.get_model(str(model_path), providers=["CPUExecutionProvider"])
+            self.generator: Any = TensorRtInSwapperGenerator(self.model, engine_path, device)
+        else:
+            self.model = model_zoo.get_model(
+                str(model_path), providers=_swap_providers(device, 2.0)
+            )
+            self.generator = self.model
         self.target_aligner = target_aligner
         self.yunet = None
         if target_aligner == "yunet_roi":
@@ -221,8 +306,7 @@ class InSwapper:
             session = getattr(model, "session", None)
             if session is not None:
                 analysis.update(session.get_providers())
-        session = getattr(self.model, "session", None)
-        generator = session.get_providers() if session is not None else []
+        generator = self.generator.provider_summary()
         return {
             "analysis": sorted(analysis),
             "generator": list(generator),
@@ -250,7 +334,7 @@ class InSwapper:
             if target is None:
                 continue
             try:
-                output = self.model.get(output, target, self.source_face, paste_back=True)
+                output = self.generator.get(output, target, self.source_face, paste_back=True)
             except Exception:
                 continue
             succeeded.add(index)
@@ -337,25 +421,15 @@ class SwapLab:
 
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             raise RuntimeError("CUDAExecutionProvider is required for this GPU test client")
-        if (
-            settings.swapper_backend == "tensorrt"
-            and "TensorrtExecutionProvider" not in ort.get_available_providers()
-        ):
-            raise RuntimeError(
-                "TensorrtExecutionProvider is unavailable; install an ONNX Runtime GPU build "
-                "compatible with the installed TensorRT or use --swapper-backend cuda"
-            )
         self.swapper = InSwapper(
             settings.source,
             settings.swapper,
             _swap_providers(settings.device, settings.swap_ort_mem_gib),
-            _generator_providers(settings),
+            backend=settings.swapper_backend,
+            engine_path=settings.swapper_engine,
+            device=settings.device,
             target_aligner=settings.target_aligner,
             target_yunet=settings.target_yunet,
-        )
-        _require_requested_generator_provider(
-            settings.swapper_backend,
-            self.swapper.provider_summary()["generator"],
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -716,6 +790,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--detector", type=Path, default=DEFAULT_ENGINE)
     parser.add_argument("--swapper", type=Path, default=DEFAULT_SWAPPER)
+    parser.add_argument("--swapper-engine", type=Path, default=DEFAULT_SWAPPER_ENGINE)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--device", default="0")
     parser.add_argument("--max-batch", type=int, default=4)
@@ -778,6 +853,7 @@ def main() -> None:
     settings = Settings(
         args.detector.expanduser().resolve(),
         args.swapper.expanduser().resolve(),
+        args.swapper_engine.expanduser().resolve(),
         args.source.expanduser().resolve(),
         args.device,
         args.max_batch,

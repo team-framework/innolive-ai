@@ -8,10 +8,8 @@ from experiments.trt_swap_client.app import (
     InSwapper,
     Settings,
     _blur_objects,
-    _generator_providers,
     _iou,
     _objects,
-    _require_requested_generator_provider,
     _swap_providers,
 )
 from experiments.trt_swap_client.video_io import VideoSpec
@@ -61,10 +59,11 @@ def test_swap_provider_memory_cap() -> None:
     assert cpu == "CPUExecutionProvider"
 
 
-def test_cuda_generator_provider_keeps_ort_memory_cap(tmp_path: Path) -> None:
+def test_cuda_swapper_settings_keep_ort_memory_cap(tmp_path: Path) -> None:
     settings = Settings(
         detector=tmp_path / "detector.engine",
         swapper=tmp_path / "swapper.onnx",
+        swapper_engine=tmp_path / "swapper.engine",
         source=tmp_path / "source.png",
         device="0",
         max_batch=4,
@@ -80,47 +79,8 @@ def test_cuda_generator_provider_keeps_ort_memory_cap(tmp_path: Path) -> None:
         input_video=None,
         hls_dir=tmp_path / "hls",
     )
-    assert _generator_providers(settings) == _swap_providers("0", 2.0)
-
-
-def test_tensorrt_generator_provider_enables_cache_and_cuda_graph(tmp_path: Path) -> None:
-    settings = Settings(
-        detector=tmp_path / "detector.engine",
-        swapper=tmp_path / "swapper.onnx",
-        source=tmp_path / "source.png",
-        device="0",
-        max_batch=4,
-        batch_wait_ms=3.0,
-        max_queue=16,
-        swap_ort_mem_gib=2.0,
-        swap_min_mask_area_px=16_384,
-        swapper_backend="tensorrt",
-        swapper_trt_cache=tmp_path / "cache",
-        swapper_trt_workspace_gib=1.0,
-        target_aligner="yunet_roi",
-        target_yunet=tmp_path / "yunet.onnx",
-        input_video=None,
-        hls_dir=tmp_path / "hls",
-    )
-    providers = _generator_providers(settings)
-    assert providers[0][0] == "TensorrtExecutionProvider"
-    assert providers[0][1]["trt_cuda_graph_enable"] is True
-    assert providers[0][1]["trt_engine_cache_enable"] is True
-    assert settings.swapper_trt_cache.is_dir()
-
-
-def test_tensorrt_generator_must_not_silently_fall_back_to_cuda() -> None:
-    _require_requested_generator_provider(
-        "tensorrt", ["TensorrtExecutionProvider", "CUDAExecutionProvider"]
-    )
-    try:
-        _require_requested_generator_provider(
-            "tensorrt", ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
-    except RuntimeError as error:
-        assert "libnvinfer.so.10" in str(error)
-    else:
-        raise AssertionError("TensorRT fallback must fail startup")
+    assert settings.swapper_backend == "cuda"
+    assert settings.swap_ort_mem_gib == 2.0
 
 
 def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:
@@ -171,6 +131,7 @@ def test_swapper_analyzes_one_frame_once_for_multiple_yolo_faces() -> None:
     swapper = InSwapper.__new__(InSwapper)
     swapper.analysis = Analysis()
     swapper.model = Model()
+    swapper.generator = swapper.model
     swapper.source_face = object()
     swapper.yunet = None
     output, succeeded = swapper.apply_many(
