@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a static FP16 TensorRT engine for inswapper_128 on the current host."""
+"""Build a static TensorRT 11 engine for inswapper_128 on the current host."""
 
 from __future__ import annotations
 
@@ -36,15 +36,17 @@ def main() -> None:
 
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    # TensorRT 10+ is always explicit-batch; the EXPLICIT_BATCH flag was removed.
+    network = builder.create_network(0)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(str(onnx_path)):
         errors = "\n".join(str(parser.get_error(index)) for index in range(parser.num_errors))
         raise SystemExit(f"could not parse {onnx_path}:\n{errors}")
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace * 1024**3))
-    if builder.platform_has_fast_fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
+    # TensorRT 11 uses strongly typed networks and removed BuilderFlag.FP16.
+    # Keep the ONNX model's FP32 type rather than introducing a quality-changing
+    # conversion at export time.
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise SystemExit("TensorRT InSwapper engine build failed; inspect TensorRT logs")
