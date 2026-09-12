@@ -27,6 +27,14 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
   --source ~/Documents/input.png
 ```
 
+동일한 기본 설정은 저장소 루트에서 실행할 수 있다. 첫 번째 인자 또는 `PORT` 환경 변수로 포트를 바꾼다.
+
+```bash
+./run.sh             # 8088
+./run.sh 9090        # 9090
+PORT=9090 ./run.sh   # 9090
+```
+
 브라우저에서 `http://SERVER_IP:8088`로 접근합니다. 신뢰할 수 있는 사설망에서만 실행하세요.
 
 기본 browser 경로는 WebRTC 영상 트랙이다. 카메라 JPEG를 WebSocket으로 왕복하지 않으므로,
