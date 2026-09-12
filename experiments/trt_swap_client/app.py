@@ -540,6 +540,21 @@ class InSwapper:
         self.source_face = max(
             faces, key=lambda face: float(np.prod(face.bbox[2:] - face.bbox[:2]))
         )
+        # Initialize CUDA kernels, TensorRT tactics, and allocator state before
+        # the first camera frame.  This removes one-time latency from the live
+        # swap generator metric.
+        if backend == "tensorrt":
+            self._warmup(source)
+
+    def _warmup(self, source: np.ndarray) -> None:
+        started = time.perf_counter()
+        debug_dumper = self.generator.debug_dumper
+        self.generator.debug_dumper = None
+        try:
+            self.generator.get(source, self.source_face, self.source_face, paste_back=False)
+        finally:
+            self.generator.debug_dumper = debug_dumper
+        print(f"InSwapper TensorRT warm-up completed in {(time.perf_counter() - started) * 1_000:.1f}ms")
 
     def provider_summary(self) -> dict[str, list[str]]:
         analysis: set[str] = set()
@@ -715,7 +730,10 @@ class SwapLab:
         self.sessions.get_or_create(session_id)
         return StreamState(
             session_id=session_id,
-            tracker=StreamTracker(device=self.settings.device),
+            # The prior one-frame mask hold visibly lags fast movement.  This
+            # live renderer always uses the current detector polygon; tracking
+            # remains enabled for stable identity association only.
+            tracker=StreamTracker(device=self.settings.device, mask_hold_frames=0),
             recognition=StreamRecognition(self.adaface, RecognitionConfig(), owner=session_id),
         )
 
