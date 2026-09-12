@@ -71,7 +71,9 @@ def _prepare_onnx(onnx_path: Path, directory: Path, precision: str) -> Path:
         raise SystemExit(
             "FP16 export requires onnxconverter-common; install requirements-trt-swap-client.txt"
         ) from error
-    converted = convert_float_to_float16_model_path(str(onnx_path), keep_io_types=True)
+    # The direct runner reads engine tensor dtypes and uploads/downloads matching
+    # buffers, so keep the boundary in FP16 as well as the graph weights.
+    converted = convert_float_to_float16_model_path(str(onnx_path), keep_io_types=False)
     output = directory / "inswapper_128_fp16.onnx"
     onnx.save(converted, output)
     return output
