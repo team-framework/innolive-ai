@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -119,6 +119,7 @@ class SwapVideoTrack(VideoStreamTrack):
         self._output_ready = asyncio.Event()
         self._reader: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
+        self.on_metrics: Callable[[dict[str, Any]], None] | None = None
 
     def _start_workers(self) -> None:
         if self._reader is None:
@@ -148,13 +149,15 @@ class SwapVideoTrack(VideoStreamTrack):
                     continue
                 image = frame.to_ndarray(format="bgr24")
                 try:
-                    output, _ = await self.lab.submit(image, self.stream)
+                    output, metrics = await self.lab.submit(image, self.stream)
                 except RuntimeError:
                     # Queue saturation means a newer camera frame is already
                     # available. Do not emit stale output or grow a backlog.
                     continue
                 self._latest_output = np.ascontiguousarray(output)
                 self._output_ready.set()
+                if self.on_metrics is not None:
+                    self.on_metrics(metrics)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -895,7 +898,14 @@ class SwapLab:
             # The prior one-frame mask hold visibly lags fast movement.  This
             # live renderer always uses the current detector polygon; tracking
             # remains enabled for stable identity association only.
-            tracker=StreamTracker(device=self.settings.device, mask_hold_frames=0),
+            tracker=StreamTracker(
+                device=self.settings.device,
+                mask_hold_frames=0,
+                # WebRTC cameras may renegotiate resolution. Sparse optical
+                # flow requires equal-sized consecutive frames and otherwise
+                # emits GMC warnings; identity motion is safer for this path.
+                gmc_method="none",
+            ),
             recognition=StreamRecognition(self.adaface, RecognitionConfig(), owner=session_id),
         )
 
@@ -1198,11 +1208,24 @@ def create_app(settings: Settings) -> FastAPI:
         peer = RTCPeerConnection(RTCConfiguration(iceServers=_webrtc_ice_servers()))
         peer_connections.add(peer)
         stream = lab.create_stream(session_id)
+        metrics_channel: Any | None = None
+
+        def send_metrics(metrics: dict[str, Any]) -> None:
+            if metrics_channel is not None and metrics_channel.readyState == "open":
+                metrics_channel.send(json.dumps({"transport": "webrtc", **metrics}))
+
+        @peer.on("datachannel")
+        def on_datachannel(channel: Any) -> None:
+            nonlocal metrics_channel
+            if channel.label == "metrics":
+                metrics_channel = channel
 
         @peer.on("track")
         def on_track(track: MediaStreamTrack) -> None:
             if track.kind == "video":
-                peer.addTrack(SwapVideoTrack(track, lab, stream))
+                output_track = SwapVideoTrack(track, lab, stream)
+                output_track.on_metrics = send_metrics
+                peer.addTrack(output_track)
 
         @peer.on("connectionstatechange")
         async def on_connection_state_change() -> None:
@@ -1309,8 +1332,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--swap-min-mask-area-px",
         type=float,
-        default=10_000,
-        help="face segmentation mask area below which the client uses protected blur (default: 10000px²)",
+        default=2_500,
+        help="face segmentation mask area below which the client uses protected blur (default: 2500px²)",
     )
     parser.add_argument("--swapper-backend", choices=("tensorrt", "cuda"), default="tensorrt")
     parser.add_argument("--swapper-trt-cache", type=Path, default=DEFAULT_SWAPPER_TRT_CACHE)
@@ -1425,7 +1448,13 @@ _HTML = """<!doctype html>
 const id=crypto.randomUUID();
 const v=document.querySelector('#v'),rtcOutput=document.querySelector('#rtc-output'),wsOutput=document.querySelector('#ws-output'),m=document.querySelector('#m');
 const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__,decoder=new TextDecoder();
-let ws=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now();
+let ws=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false;
+function reportWebRtc(){
+  const now=performance.now(),elapsed=now-rtcWindowAt;if(elapsed<1000)return;
+  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_render_fps:+(rtcFrames*1000/elapsed).toFixed(1),capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
+  rtcFrames=0;rtcWindowAt=now;
+}
+function countWebRtcFrame(){rtcFrames++;reportWebRtc();rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
 function report(){
   const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;
   const networkServerMs=Math.max(0,receivedAt-sentAt),serverE2eMs=lastMeta.wire?.server_e2e_ms??0;
@@ -1451,9 +1480,11 @@ function iceComplete(peer){return new Promise(resolve=>{if(peer.iceGatheringStat
 async function startWebRtc(stream){
   if(!window.RTCPeerConnection)throw new Error('WebRTC unavailable');
   const peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  const metrics=peer.createDataChannel('metrics');
+  metrics.onmessage=e=>{lastMeta=JSON.parse(e.data);reportWebRtc();};
   const sender=peer.addTrack(stream.getVideoTracks()[0],stream);
   try{const parameters=sender.getParameters();parameters.encodings=parameters.encodings?.length?parameters.encodings:[{}];parameters.encodings[0].maxBitrate=12000000;parameters.encodings[0].maxFramerate=30;await sender.setParameters(parameters);}catch(error){console.warn('Unable to set FHD WebRTC sender bitrate',error);}
-  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;m.textContent=JSON.stringify({transport:'webrtc',capture_resolution:`${v.videoWidth}x${v.videoHeight}`,status:'connected'},null,2);};
+  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;rtcConnected=true;rtcOutput.requestVideoFrameCallback(countWebRtcFrame);reportWebRtc();};
   const offer=await peer.createOffer({offerToReceiveVideo:true});await peer.setLocalDescription(offer);await iceComplete(peer);
   const response=await fetch(`/webrtc/offer/${id}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(peer.localDescription)});
   if(!response.ok)throw new Error(`WebRTC signaling failed: ${response.status}`);

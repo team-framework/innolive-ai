@@ -86,6 +86,7 @@ class StreamTracker:
         device: str = "0",
         *,
         mask_hold_frames: int = MAX_MASK_HOLD_FRAMES,
+        gmc_method: str | None = None,
     ):
         config_path = config.expanduser().resolve()
         if not config_path.is_file():
@@ -101,6 +102,8 @@ class StreamTracker:
             raise ValueError(f"new_track_thresh must be {ACTIVATION_CONFIDENCE}")
         values["with_reid"] = False
         values["device"] = device
+        if gmc_method is not None:
+            values["gmc_method"] = gmc_method
         if mask_hold_frames < 0 or mask_hold_frames > MAX_MASK_HOLD_FRAMES:
             raise ValueError(f"mask_hold_frames must be in [0, {MAX_MASK_HOLD_FRAMES}]")
         self.config_path = config_path

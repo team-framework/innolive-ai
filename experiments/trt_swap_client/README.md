@@ -47,7 +47,7 @@ export WEBRTC_TURN_CREDENTIAL='...'
 - 기본 `--target-aligner yunet_roi`는 YOLO face box 주변에서 YuNet 5-point landmark만 다시 구한다. landmark를 못 찾거나 YOLO box와 맞지 않으면 기존 InsightFace 640 analysis로 fallback한다. 시각 품질 비교용 legacy 경로는 `--target-aligner insightface`다.
 - queue가 가득 차면 오래된 처리를 쌓지 않고 해당 browser frame을 drop한다.
 - AdaFace whitelist가 확인된 face는 원본을 유지한다. class 0의 비화이트리스트 face만 InSwapper에 전달한다.
-- class 0 mask가 `10,000px²`(기본값)보다 작거나 tracking hold 상태면 generator를 실행하지 않고 local Gaussian blur fallback을 적용한다. 이전 16,384px²보다 낮춰 더 많은 중간 크기 얼굴은 합성한다. `--swap-min-mask-area-px`로 조정할 수 있다.
+- class 0 mask가 `2,500px²`(기본값, 약 50×50)보다 작거나 tracking hold 상태면 generator를 실행하지 않고 local Gaussian blur fallback을 적용한다. `--swap-min-mask-area-px`로 조정할 수 있다.
 - number plate와 swap 실패 face는 즉시 local Gaussian blur fallback을 적용한다.
 - 한 frame의 여러 swap 후보는 InsightFace face analysis를 한 번만 실행한 뒤 YOLO box와 일대일 매칭한다.
 - AdaFace는 실제 whitelist enrollment가 시작될 때만 GPU model을 load한다. whitelist가 없는 익명 swap stream은 AdaFace VRAM을 예약하지 않는다.
