@@ -281,16 +281,19 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
         index = int(row[-1])
         if not 0 <= index < len(prediction.boxes):
             continue
-        polygon = (
-            np.asarray(polygons[index], dtype=np.float32)
-            if index < len(polygons)
-            else np.empty((0, 2))
-        )
-        if len(polygon) < 3:
+        try:
+            polygon = (
+                np.asarray(polygons[index], dtype=np.float32).reshape((-1, 2))
+                if index < len(polygons)
+                else np.empty((0, 2), dtype=np.float32)
+            )
+        except (TypeError, ValueError):
+            polygon = np.empty((0, 2), dtype=np.float32)
+        if len(polygon) < 3 or not np.isfinite(polygon).all():
             x1, y1, x2, y2 = row[:4]
             polygon = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)), dtype=np.float32)
         stride = max(1, int(np.ceil(len(polygon) / MAX_POLYGON_POINTS)))
-        polygon = polygon[::stride][:MAX_POLYGON_POINTS]
+        polygon = np.ascontiguousarray(polygon[::stride][:MAX_POLYGON_POINTS], dtype=np.float32)
         class_id = int(row[6])
         objects.append(
             {
@@ -300,10 +303,20 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
                 "confidence": float(row[5]),
                 "bbox": [float(value) for value in row[:4]],
                 "mask_polygon": polygon.tolist(),
-                "mask_area_px": float(cv2.contourArea(polygon)),
+                "mask_area_px": _polygon_area(polygon),
             }
         )
     return objects
+
+
+def _polygon_area(polygon: np.ndarray) -> float:
+    """Compute a finite contour area without requiring an OpenCV contour layout."""
+
+    points = np.asarray(polygon, dtype=np.float32).reshape((-1, 2))
+    if len(points) < 3 or not np.isfinite(points).all():
+        return 0.0
+    x, y = points[:, 0], points[:, 1]
+    return float(abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))) * 0.5)
 
 
 def _blur_objects(image: np.ndarray, items: list[dict[str, Any]]) -> np.ndarray:

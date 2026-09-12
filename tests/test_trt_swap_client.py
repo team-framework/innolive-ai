@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from experiments.trt_swap_client.app import _blur_objects, _iou, _swap_providers
+from experiments.trt_swap_client.app import _blur_objects, _iou, _objects, _swap_providers
 from experiments.trt_swap_client.video_io import VideoSpec
 from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
@@ -48,3 +48,28 @@ def test_swap_provider_memory_cap() -> None:
     assert cuda[1]["gpu_mem_limit"] == 2 * 1024**3
     assert cuda[1]["arena_extend_strategy"] == "kSameAsRequested"
     assert cpu == "CPUExecutionProvider"
+
+
+def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:
+    polygon = np.asarray(
+        [[0, 0], [99, 99], [6, 0], [99, 99], [6, 6], [99, 99], [0, 6]],
+        dtype=np.float32,
+    )[::2]
+
+    class Masks:
+        def __init__(self) -> None:
+            self.xy = [polygon]
+
+    class Prediction:
+        def __init__(self) -> None:
+            self.masks = Masks()
+            self.boxes = [object()]
+
+    objects = _objects(
+        Prediction(),
+        np.asarray([[0, 0, 6, 6, 1, 0.9, 0, 0]], dtype=np.float32),
+        {0: "face", 1: "number_plate"},
+        8,
+        8,
+    )
+    assert objects[0]["mask_area_px"] == 36.0
