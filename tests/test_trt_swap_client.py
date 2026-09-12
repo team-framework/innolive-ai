@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +15,7 @@ from experiments.trt_swap_client.app import (
     _objects,
     _paste_inswapper,
     _prediction_to_bgr,
+    _require_current_swapper_engine,
     _swap_providers,
 )
 from experiments.trt_swap_client.video_io import VideoSpec
@@ -176,3 +179,20 @@ def test_paste_back_exposes_mask_and_warp_artifacts() -> None:
     assert result.shape == target.shape
     assert artifacts["swap_mask"].shape == target.shape[:2]
     assert artifacts["inverse_warp_swap"].shape == target.shape
+
+
+def test_swapper_engine_manifest_rejects_legacy_or_wrong_model(tmp_path: Path) -> None:
+    model, engine = tmp_path / "swapper.onnx", tmp_path / "swapper.engine"
+    model.write_bytes(b"model")
+    engine.write_bytes(b"engine")
+    engine.with_suffix(".engine.json").write_text(
+        json.dumps(
+            {
+                "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+                "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
+                "preserve_onnx_fp32_io": True,
+                "precision": "fp32",
+            }
+        )
+    )
+    _require_current_swapper_engine(engine, model)

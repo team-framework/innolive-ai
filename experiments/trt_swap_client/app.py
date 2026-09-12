@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -134,6 +135,35 @@ def _swap_providers(device: str, memory_gib: float) -> list[Any]:
         ),
         "CPUExecutionProvider",
     ]
+
+
+def _require_current_swapper_engine(engine_path: Path, model_path: Path) -> None:
+    """Reject legacy full-FP16 ONNX conversion engines before they can blur output."""
+
+    manifest_path = engine_path.with_suffix(engine_path.suffix + ".json")
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"TensorRT swap engine manifest is missing: {manifest_path}. "
+            "Rebuild the engine with python -m experiments.trt_swap_client.export_swapper --force"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid TensorRT swap engine manifest: {manifest_path}") from error
+    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    if manifest.get("model_sha256") != model_hash:
+        raise RuntimeError("TensorRT swap engine was built from a different ONNX model; rebuild it")
+    if manifest.get("preserve_onnx_fp32_io") is not True:
+        raise RuntimeError(
+            "legacy TensorRT swap engine converted ONNX I/O to FP16; rebuild it with the current exporter"
+        )
+    if manifest.get("precision") != "fp32":
+        raise RuntimeError(
+            "InSwapper FP16 TensorRT output has unacceptable raw error; rebuild with --precision fp32"
+        )
+    engine_hash = hashlib.sha256(engine_path.read_bytes()).hexdigest()
+    if manifest.get("engine_sha256") != engine_hash:
+        raise RuntimeError("TensorRT swap engine does not match its manifest; rebuild it")
 
 
 class TensorRtInSwapperGenerator:
@@ -457,6 +487,7 @@ class InSwapper:
         # ONNX Runtime only for the explicit CUDA comparison path; the default
         # uses a direct TensorRT engine for the generator.
         if backend == "tensorrt":
+            _require_current_swapper_engine(engine_path, model_path)
             self.model = model_zoo.get_model(str(model_path), providers=["CPUExecutionProvider"])
             self.generator: Any = TensorRtInSwapperGenerator(self.model, engine_path, device)
             if debug_dir is not None:

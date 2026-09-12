@@ -16,7 +16,7 @@ python -m experiments.trt_swap_client.export_detector \
 python -m experiments.trt_swap_client.export_swapper \
   --onnx models/face_swap/inswapper_128.onnx \
   --output models/face_swap/inswapper_128_trt11.engine \
-  --workspace 2 --precision fp16 --force
+  --workspace 2 --precision fp32 --force
 ```
 
 ```bash
@@ -44,7 +44,7 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 응답 metadata에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`, `swap_generator_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_generator_ms`가 크면 generator model이 병목이고, `swap_alignment_ms`가 크면 target landmark 경로가 병목이다.
 
-`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. 이어지는 `input=DataType.HALF`, `latent=DataType.HALF`, `output=DataType.HALF` 표시는 full FP16 binding engine이 적용된 상태다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT 11에서 만든 direct engine으로 실행한다. TensorRT 11의 strong typing 때문에 `--precision fp16`은 explicit ONNX cast를 넣어 FP16 engine을 만든다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
+`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT에서 만든 direct **FP32** engine으로 실행한다. 이 모델은 FP16 TensorRT raw output이 ONNXRuntime과 크게 달라져 화질이 무너지는 것이 확인됐으므로, runtime은 FP16 engine을 거부한다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
 
 ## 얼굴 품질 진단
 
@@ -59,7 +59,7 @@ python -m experiments.trt_swap_client.app \
 
 `/tmp/inswapper-debug/05_onnx_raw_swap.png`와 `06_trt_raw_swap.png`가 처음 비교할 파일이며, `debug.json`에는 input/latent 통계와 ORT-vs-TRT MAE·RMSE·MAX error가 기록된다. 이어서 `07_swap_mask.png`, `08_inverse_warp_swap.png`, `10_after_blend.png`을 보면 paste-back에서 문제가 시작되는지 확인할 수 있다. 덤프가 실패해도 live swap은 blur fallback으로 바뀌지 않는다.
 
-이 저장소의 공식 `inswapper_128.onnx`는 InsightFace metadata상 `input_mean=0`, `input_std=255`를 사용한다. 따라서 target tensor 범위는 **`[0,1]`** 이며, 다른 InSwapper 변형의 `[-1,1]` normalization을 적용하면 안 된다. 시작 시 engine binding의 이름·shape·dtype도 검증하므로, 잘못된/stale engine은 화질이 깨진 상태로 실행하지 않고 오류로 중단한다.
+이 저장소의 공식 `inswapper_128.onnx`는 InsightFace metadata상 `input_mean=0`, `input_std=255`를 사용한다. 따라서 target tensor 범위는 **`[0,1]`** 이며, 다른 InSwapper 변형의 `[-1,1]` normalization을 적용하면 안 된다. 시작 시 engine binding의 이름·shape·dtype도 검증하므로, 잘못된/stale 또는 FP16 engine은 화질이 깨진 상태로 실행하지 않고 오류로 중단한다.
 
 ## NVDEC/NVENC file test
 
