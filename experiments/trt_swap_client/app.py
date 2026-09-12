@@ -66,7 +66,7 @@ class Settings:
     swap_debug_dir: Path | None = None
     swap_debug_frames: int = 1
     stream_jpeg_quality: int = 90
-    capture_max_width: int = 640
+    capture_max_width: int = 1920
 
 
 @dataclass(slots=True)
@@ -1112,8 +1112,9 @@ def create_app(settings: Settings) -> FastAPI:
                         "output_encode_ms": round((encoded_at - submitted_at) * 1_000, 2),
                         "server_e2e_ms": round((encoded_at - received_at) * 1_000, 2),
                     }
-                    await websocket.send_json(metadata)
-                    await websocket.send_bytes(encoded.tobytes())
+                    header = json.dumps(metadata, separators=(",", ":")).encode()
+                    packet = len(header).to_bytes(4, "big") + header + encoded.tobytes()
+                    await websocket.send_bytes(packet)
         except WebSocketDisconnect:
             state.recognition.close()
             state.tracker.reset()
@@ -1205,8 +1206,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capture-max-width",
         type=int,
-        default=640,
-        help="browser capture cap; 640 matches the detector and avoids expensive camera JPEG encoding",
+        default=1920,
+        help="browser capture cap; default is FHD width",
     )
     return parser.parse_args()
 
@@ -1261,7 +1262,49 @@ def main() -> None:
     uvicorn.run(create_app(settings), host=args.host, port=args.port)
 
 
-_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → low-latency YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__;let busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,displayMs=0,frames=0,windowAt=performance.now();navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false}).then(s=>v.srcObject=s);function report(){const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;const fps=frames*1000/elapsed;m.textContent=JSON.stringify({...lastMeta,client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+(receivedAt-sentAt).toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_fps:+fps.toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);frames=0;windowAt=now}ws.onmessage=e=>{if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return}receivedAt=performance.now();if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(e.data);o.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report()};o.src=lastUrl};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;const scale=Math.min(1,captureWidth/v.videoWidth);c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);ctx.drawImage(v,0,0,c.width,c.height);const captureAt=performance.now();c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b)}else busy=false},'image/jpeg',__JPEG_QUALITY__)},16)</script>"""
+_HTML = """<!doctype html>
+<meta charset="utf-8"><title>TensorRT Swap Lab</title>
+<style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style>
+<h1>TensorRT Face Swap Lab</h1><p>Browser webcam → TensorRT YOLO → face swap</p>
+<video id="v" autoplay muted playsinline></video><img id="o"><pre id="m">starting…</pre>
+<script>
+const id=crypto.randomUUID();
+const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`);
+const v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m');
+const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__;
+const decoder=new TextDecoder();
+let busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now();
+navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false}).then(s=>v.srcObject=s);
+function report(){
+  const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;
+  const networkServerMs=Math.max(0,receivedAt-sentAt);
+  const serverE2eMs=lastMeta.wire?.server_e2e_ms ?? 0;
+  m.textContent=JSON.stringify({...lastMeta,client_capture_encode_ms:+captureMs.toFixed(1),client_network_server_ms:+networkServerMs.toFixed(1),client_transport_ms:+Math.max(0,networkServerMs-serverE2eMs).toFixed(1),client_packet_parse_ms:+packetParseMs.toFixed(1),client_display_decode_ms:+displayMs.toFixed(1),client_fps:+(frames*1000/elapsed).toFixed(1),capture_resolution:`${c.width}x${c.height}`},null,2);
+  frames=0;windowAt=now;
+}
+ws.onmessage=async e=>{
+  if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return;}
+  receivedAt=performance.now();
+  const packet=await e.data.arrayBuffer();
+  const headerLength=new DataView(packet).getUint32(0);
+  lastMeta=JSON.parse(decoder.decode(packet.slice(4,4+headerLength)));
+  const jpeg=new Blob([packet.slice(4+headerLength)],{type:'image/jpeg'});
+  packetParseMs=performance.now()-receivedAt;
+  if(lastUrl)URL.revokeObjectURL(lastUrl);
+  lastUrl=URL.createObjectURL(jpeg);
+  o.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};
+  o.src=lastUrl;
+};
+setInterval(()=>{
+  if(busy||!v.videoWidth||ws.readyState!==1)return;
+  busy=true;
+  const scale=Math.min(1,captureWidth/v.videoWidth);
+  c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);
+  ctx.drawImage(v,0,0,c.width,c.height);
+  const captureAt=performance.now();
+  c.toBlob(b=>{captureMs=performance.now()-captureAt;if(b){sentAt=performance.now();ws.send(b);}else busy=false;},'image/jpeg',__JPEG_QUALITY__);
+},16);
+</script>"""
 
 
 if __name__ == "__main__":
