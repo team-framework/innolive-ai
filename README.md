@@ -61,7 +61,8 @@ App client는 gRPC를 직접 호출하고, 브라우저 demo만 `server.py`의 W
   - ONNX: YuNet artifact와 TensorRT export pipeline의 model format
 - **서빙 · 검증**
   - Python 3.12+ · `grpc.aio` · Protocol Buffers
-  - FastAPI · Uvicorn · WebSocket: 선택적 browser demo
+  - FastAPI · Uvicorn · WebSocket: browser demo와 테스트 endpoint
+  - aiortc · WebRTC: 독립 FHD TensorRT 얼굴 합성 실험의 저지연 미디어 경로
   - Ruff · unittest · Node.js test · transport benchmark
 
 ## 빠른 실행
@@ -123,6 +124,53 @@ Linux x86_64 NVIDIA 장비에서 저장소의 `models/best.pt`로 매번 생성�
 Export 단계가 `best_b1.engine`과 `best_b1.engine.json`을 생성하고, runtime은 local
 manifest의 serving profile·engine/checkpoint hash와 TensorRT version을 검증합니다.
 두 파일은 배포 호스트에서만 유지되며 기존 engine을 교체할 때는 `--force`를 사용합니다.
+
+### FHD TensorRT 얼굴 합성 실험
+
+`experiments/trt_swap_client`는 기존 gRPC 비식별화 서버와 분리된 얼굴 합성 실험 서버입니다.
+카메라의 1920×1080 프레임을 WebRTC로 받고 YOLO26-seg TensorRT FP16으로 얼굴/번호판 mask를
+검출한 뒤, 얼굴 mask가 기본 `5,625px²`(약 75×75) 이상인 얼굴에 InSwapper 128 TensorRT FP32를
+적용합니다. 그보다 작은 얼굴과 번호판, 합성 실패 영역은 Gaussian blur로 보호합니다.
+
+실시간 경로는 WebRTC 카메라 track → 최신 프레임 mailbox → TensorRT 처리 worker → WebRTC
+반환 track입니다. mailbox는 프레임 하나만 유지하므로 새 프레임이 오면 아직 처리하지 않은
+오래된 프레임을 대체합니다. 별도 RTP 송출 clock은 완료된 최신 결과를 전달하고, 다음 합성이
+끝날 때까지는 직전 결과를 반복 송출합니다. 따라서 화면 송출 FPS와 새 얼굴 합성이 완료되는
+FPS는 서로 다를 수 있습니다. WebRTC 연결 실패 시 JPEG/WebSocket 경로로 fallback합니다.
+
+BoT-SORT는 stream별로 유지하며 WebRTC 경로에서 GMC(카메라 움직임 보정)를 끕니다. 입력 해상도가
+바뀌어도 sparse optical flow pyramid 크기 불일치가 발생하지 않도록 하기 위한 설정입니다.
+브라우저 통계에는 `client_render_fps`, 입력/출력 해상도, 연결 상태가 나오며, WebRTC data
+channel의 처리 통계에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`,
+`swap_generator_ms`, generator의 prepare/forward/paste 시간, `total_ms`가 포함됩니다.
+
+Linux NVIDIA GPU에서 전용 의존성과 엔진을 준비합니다. TensorRT 엔진은 runtime/GPU 환경에
+결합되므로 대상 장비에서 생성해야 합니다. InSwapper는 FP16에서 출력 차이가 확인되어 FP32를
+사용합니다.
+
+```bash
+python -m pip install -r requirements-trt-swap-client.txt
+python -m experiments.trt_swap_client.export_detector \
+  --checkpoint models/best.pt --output models/best_swap_b4.engine \
+  --max-batch 4 --workspace 4 --device 0 --force
+python -m experiments.trt_swap_client.export_swapper \
+  --onnx models/face_swap/inswapper_128.onnx \
+  --output models/face_swap/inswapper_128_trt11_fp32.engine \
+  --workspace 2 --precision fp32 --force
+```
+
+`models/face_swap/inswapper_128.onnx`와 `~/Documents/input.png`를 준비한 뒤 저장소 루트에서
+실행합니다. `run.sh`의 기본 port는 8088이며 인자 또는 `PORT`로 변경할 수 있습니다.
+
+```bash
+./run.sh
+./run.sh 9090
+PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
+```
+
+브라우저에서 `http://SERVER_IP:8088`을 엽니다. WebRTC는 UDP 연결이 필요합니다. NAT/방화벽으로
+직접 연결할 수 없는 환경은 TURN을 구성하고, signaling과 ICE 후보를 교환할 수 있도록 서버와
+네트워크를 설정해야 합니다.
 
 ## API 요약
 
@@ -194,6 +242,7 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 ├── ai_processor_server.py   # AI gRPC server와 session lifecycle
 ├── grpc_client.py           # bounded async Python client
 ├── server.py                # browser ↔ gRPC demo gateway
+├── run.sh                   # 독립 TensorRT 얼굴 합성 실험 실행기
 ├── service/
 │   ├── runtime.py           # YOLO 및 TensorRT/PyTorch backend 선택
 │   ├── tracking.py          # stream-local BoT-SORT
@@ -207,6 +256,7 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 ├── models/                  # checkpoint와 runtime artifact 안내
 ├── config/                  # BoT-SORT 설정
 ├── scripts/                 # TensorRT export와 acceptance benchmark
+├── experiments/trt_swap_client/ # FHD WebRTC/TensorRT 얼굴 합성 실험
 ├── tests/                   # Python·Node 회귀 테스트
 ├── web/                     # browser demo client
 ```
