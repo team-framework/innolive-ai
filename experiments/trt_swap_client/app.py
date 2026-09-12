@@ -155,6 +155,21 @@ def _generator_providers(settings: Settings) -> list[Any]:
     ]
 
 
+def _require_requested_generator_provider(backend: str, providers: list[str]) -> None:
+    """Do not silently measure CUDA fallback as a TensorRT run."""
+
+    if backend == "tensorrt" and (
+        not providers or providers[0] != "TensorrtExecutionProvider"
+    ):
+        applied = ", ".join(providers) or "none"
+        raise RuntimeError(
+            "TensorRT generator startup failed and ONNX Runtime fell back to "
+            f"{applied}. Install a TensorRT 10 runtime exposing libnvinfer.so.10, "
+            "then restart with --swapper-backend tensorrt; use "
+            "--swapper-backend cuda only for an intentional CUDA comparison."
+        )
+
+
 class InSwapper:
     """Keep the established generator/face-analysis behavior, isolated from server code."""
 
@@ -337,6 +352,10 @@ class SwapLab:
             _generator_providers(settings),
             target_aligner=settings.target_aligner,
             target_yunet=settings.target_yunet,
+        )
+        _require_requested_generator_provider(
+            settings.swapper_backend,
+            self.swapper.provider_summary()["generator"],
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(

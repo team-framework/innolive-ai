@@ -1,5 +1,8 @@
-# Independent TensorRT face-swap lab only; production gRPC dependencies stay unchanged.
--r requirements-tensorrt.txt
--r requirements-export.txt
+# Independent TensorRT 10 face-swap lab only; production gRPC dependencies stay unchanged.
+# Do not include requirements-tensorrt.txt: it pins TensorRT 11, while the
+# ONNX Runtime TensorRT EP used by this lab links against libnvinfer.so.10.
+-r requirements.txt
+nvidia-ml-py>=13,<14
 insightface>=0.7,<0.8
-onnxruntime-gpu>=1.24,<2
+onnxruntime-gpu==1.22.0
+tensorrt-cu12==10.9.0.34; platform_system == "Linux" and platform_machine == "x86_64"

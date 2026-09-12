@@ -11,6 +11,7 @@ from experiments.trt_swap_client.app import (
     _generator_providers,
     _iou,
     _objects,
+    _require_requested_generator_provider,
     _swap_providers,
 )
 from experiments.trt_swap_client.video_io import VideoSpec
@@ -106,6 +107,20 @@ def test_tensorrt_generator_provider_enables_cache_and_cuda_graph(tmp_path: Path
     assert providers[0][1]["trt_cuda_graph_enable"] is True
     assert providers[0][1]["trt_engine_cache_enable"] is True
     assert settings.swapper_trt_cache.is_dir()
+
+
+def test_tensorrt_generator_must_not_silently_fall_back_to_cuda() -> None:
+    _require_requested_generator_provider(
+        "tensorrt", ["TensorrtExecutionProvider", "CUDAExecutionProvider"]
+    )
+    try:
+        _require_requested_generator_provider(
+            "tensorrt", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+    except RuntimeError as error:
+        assert "libnvinfer.so.10" in str(error)
+    else:
+        raise AssertionError("TensorRT fallback must fail startup")
 
 
 def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:

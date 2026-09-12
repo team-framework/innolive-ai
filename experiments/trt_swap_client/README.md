@@ -5,14 +5,40 @@
 3090 Linux host에서 먼저 현재 checkpoint로 **이 클라이언트 전용** dynamic FP16 engine을 만듭니다. 기존 `best_b1.engine`을 대체하지 않습니다.
 
 ```bash
-pip install -r requirements-trt-swap-client.txt
-python -m experiments.trt_swap_client.export_detector \
+python3.11 -m venv .venv-trt10-swap
+.venv-trt10-swap/bin/python -m pip install --upgrade pip
+.venv-trt10-swap/bin/python -m pip install -r requirements-trt-swap-client.txt
+TRT_LIB_DIR="$(.venv-trt10-swap/bin/python - <<'PY'
+import sysconfig
+from pathlib import Path
+
+site = Path(sysconfig.get_paths()["purelib"])
+paths = list(site.rglob("libnvinfer.so.10"))
+assert paths, f"TensorRT 10 runtime was not installed below {site}"
+print(paths[0].parent)
+PY
+ )"
+echo "$TRT_LIB_DIR"
+test -n "$TRT_LIB_DIR"
+```
+
+`requirements-tensorrt.txt`의 TensorRT 11은 이 lab과 함께 사용하지 않는다. ONNX Runtime
+1.22 TensorRT EP는 TensorRT 10.9/CUDA 12 조합을 사용하며, Python 3.14용 TensorRT 10
+binding wheel은 제공되지 않는다. 위의 Python 3.11 environment는 이 lab 전용이다.
+
+라이브러리 경로는 위에서 찾은 경로만 현재 실행에 전달한다. system CUDA/TensorRT나
+기존 TensorRT 11 environment는 변경하지 않는다.
+
+```bash
+LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+.venv-trt10-swap/bin/python -m experiments.trt_swap_client.export_detector \
   --checkpoint models/best.pt --output models/best_swap_b4.engine \
   --max-batch 4 --workspace 8 --device 0
 ```
 
 ```bash
-python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
+LD_LIBRARY_PATH="$TRT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+.venv-trt10-swap/bin/python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
   --detector models/best_swap_b4.engine \
   --swapper models/face_swap/inswapper_128.onnx \
   --source ~/Documents/input.png
@@ -35,7 +61,7 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 응답 metadata에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`, `swap_generator_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_generator_ms`가 크면 generator model이 병목이고, `swap_alignment_ms`가 크면 target landmark 경로가 병목이다.
 
-`/health`의 `swapper_providers.generator` 첫 값이 `TensorrtExecutionProvider`인지 확인한다. 호환되는 ONNX Runtime TensorRT EP가 없으면 시작을 거부하며, 비교용 CUDA 경로는 `--swapper-backend cuda`를 사용한다.
+`/health`의 `swapper_providers.generator` 첫 값이 `TensorrtExecutionProvider`인지 확인한다. TensorRT library가 누락되어 CUDA EP로 fallback되면 client는 시작을 거부한다. 비교용 CUDA 경로만 `--swapper-backend cuda`를 명시한다.
 
 ## NVDEC/NVENC file test
 
