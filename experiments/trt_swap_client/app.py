@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ class Settings:
     batch_wait_ms: float
     max_queue: int
     swap_ort_mem_gib: float
+    swap_min_mask_area_px: float
     input_video: Path | None
     hls_dir: Path
 
@@ -65,6 +67,45 @@ class FrameJob:
     frame: np.ndarray
     stream: StreamState
     future: asyncio.Future[tuple[np.ndarray, dict[str, Any]]]
+
+
+class LazyAdaFaceRuntime:
+    """Do not reserve AdaFace VRAM until a session actually enrolls a face."""
+
+    def __init__(self, config: AdaFaceConfig, *, fallback_device: str):
+        self._config = config
+        self._fallback_device = fallback_device
+        self._runtime: AdaFaceRuntime | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def ready(self) -> bool:
+        return self._runtime is not None and self._runtime.ready
+
+    @property
+    def load_error(self) -> str | None:
+        return None if self._runtime is None else self._runtime.load_error
+
+    def ensure(self) -> None:
+        with self._lock:
+            if self._runtime is None:
+                self._runtime = AdaFaceRuntime(self._config, fallback_device=self._fallback_device)
+            if not self._runtime.ready:
+                raise RuntimeError(f"AdaFace unavailable: {self._runtime.load_error}")
+
+    def submit(self, image: np.ndarray, *, owner: str) -> asyncio.Future[np.ndarray] | None:
+        return None if self._runtime is None else self._runtime.submit(image, owner=owner)
+
+    def submit_enrollment(
+        self, image: np.ndarray, *, owner: str
+    ) -> asyncio.Future[np.ndarray] | None:
+        return (
+            None if self._runtime is None else self._runtime.submit_enrollment(image, owner=owner)
+        )
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.close()
 
 
 def _swap_providers(device: str, memory_gib: float) -> list[Any]:
@@ -111,15 +152,36 @@ class InSwapper:
         )
 
     def apply(self, frame: np.ndarray, bbox: list[float]) -> np.ndarray:
-        """Swap only a class-0 YOLO ROI; detector results are never passed here."""
+        output, succeeded = self.apply_many(frame, [bbox])
+        if not succeeded:
+            raise RuntimeError("swapper could not align detected face")
+        return output
+
+    def apply_many(
+        self, frame: np.ndarray, boxes: list[list[float]]
+    ) -> tuple[np.ndarray, set[int]]:
+        """Run FaceAnalysis once per frame, then map only YOLO class-0 boxes to it."""
 
         faces = self.analysis.get(frame)
         if not faces:
-            raise RuntimeError("swapper could not align detected face")
-        target = max(faces, key=lambda face: _iou(face.bbox, bbox))
-        if _iou(target.bbox, bbox) < 0.2:
-            raise RuntimeError("swapper alignment does not match YOLO face")
-        return self.model.get(frame, target, self.source_face, paste_back=True)
+            return frame, set()
+        output = frame
+        available = set(range(len(faces)))
+        succeeded: set[int] = set()
+        for index, bbox in enumerate(boxes):
+            if not available:
+                break
+            target_index = max(available, key=lambda candidate: _iou(faces[candidate].bbox, bbox))
+            target = faces[target_index]
+            if _iou(target.bbox, bbox) < 0.2:
+                continue
+            try:
+                output = self.model.get(output, target, self.source_face, paste_back=True)
+            except Exception:
+                continue
+            available.remove(target_index)
+            succeeded.add(index)
+        return output, succeeded
 
 
 class SwapLab:
@@ -138,7 +200,7 @@ class SwapLab:
         providers = _swap_providers(settings.device, settings.swap_ort_mem_gib)
         self.swapper = InSwapper(settings.source, settings.swapper, providers)
         self.sessions = SessionRegistry()
-        self.adaface = AdaFaceRuntime(
+        self.adaface = LazyAdaFaceRuntime(
             AdaFaceConfig(device=f"cuda:{settings.device}", queue_capacity=32),
             fallback_device=settings.device,
         )
@@ -148,8 +210,6 @@ class SwapLab:
         self.latencies: deque[float] = deque(maxlen=300)
 
     async def start(self) -> None:
-        if not self.adaface.ready:
-            raise RuntimeError(f"AdaFace unavailable: {self.adaface.load_error}")
         self.worker = asyncio.create_task(self._batch_loop(), name="yolo-swap-batcher")
 
     async def close(self) -> None:
@@ -178,6 +238,7 @@ class SwapLab:
         return await future
 
     async def enroll(self, session_id: str, image: np.ndarray) -> dict[str, Any]:
+        await asyncio.to_thread(self.adaface.ensure)
         future = self.adaface.submit_enrollment(image, owner=f"enroll:{session_id}")
         if future is None:
             raise HTTPException(503, "AdaFace queue is full")
@@ -199,9 +260,12 @@ class SwapLab:
                 except TimeoutError:
                     break
             try:
+                inference_started = time.perf_counter()
                 results = await asyncio.to_thread(self._predict, [job.frame for job in jobs])
+                detector_batch_ms = (time.perf_counter() - inference_started) * 1_000
                 for job, prediction in zip(jobs, results, strict=True):
                     output, meta = await self._compose(job.frame, prediction, job.stream, len(jobs))
+                    meta["detector_batch_ms"] = round(detector_batch_ms, 2)
                     job.future.set_result((output, meta))
             except Exception as error:
                 for job in jobs:
@@ -223,7 +287,7 @@ class SwapLab:
                 max_det=MAX_DETECTIONS,
                 retina_masks=True,
                 device=self.settings.device,
-                half=True,
+                quantize=16,
                 verbose=False,
             )
         )
@@ -243,7 +307,9 @@ class SwapLab:
         output = frame.copy()
         swapped = 0
         fallback = 0
+        small_face_fallbacks = 0
         fallback_objects: list[dict[str, Any]] = []
+        swap_candidates: list[dict[str, Any]] = []
         for item in objects:
             if is_number_plate_object(item):
                 fallback_objects.append(item)
@@ -251,13 +317,30 @@ class SwapLab:
                 continue
             if not is_face_object(item) or item.get("whitelisted") is True:
                 continue
-            # Class-0 faces alone can reach the generator. Any failure stays protected.
-            try:
-                output = self.swapper.apply(output, item["bbox"])
-                swapped += 1
-            except Exception:
+            if (
+                item.get("held")
+                or float(item.get("mask_area_px", 0.0)) < self.settings.swap_min_mask_area_px
+            ):
                 fallback_objects.append(item)
                 fallback += 1
+                small_face_fallbacks += 1
+                continue
+            swap_candidates.append(item)
+        swap_started = time.perf_counter()
+        if swap_candidates:
+            try:
+                output, succeeded = self.swapper.apply_many(
+                    output, [item["bbox"] for item in swap_candidates]
+                )
+            except Exception:
+                succeeded = set()
+            for index, item in enumerate(swap_candidates):
+                if index in succeeded:
+                    swapped += 1
+                else:
+                    fallback_objects.append(item)
+                    fallback += 1
+        swap_ms = (time.perf_counter() - swap_started) * 1_000
         if fallback_objects:
             output = _blur_objects(output, fallback_objects)
         elapsed = (time.perf_counter() - started) * 1_000
@@ -267,6 +350,8 @@ class SwapLab:
             "detections": len(objects),
             "swap_faces": swapped,
             "fallback_blurs": fallback,
+            "small_face_fallbacks": small_face_fallbacks,
+            "swap_ms": round(swap_ms, 2),
             "yolo_batch": batch_size,
             "adaface": recognition,
             "tracking": temporal,
@@ -480,6 +565,12 @@ def parse_args() -> argparse.Namespace:
         help="per-session ONNX Runtime CUDA arena limit for InSwapper (default: 2 GiB)",
     )
     parser.add_argument(
+        "--swap-min-mask-area-px",
+        type=float,
+        default=16_384,
+        help="face segmentation mask area below which the client uses protected blur",
+    )
+    parser.add_argument(
         "--input-video",
         type=Path,
         help="optional compressed input decoded by NVDEC and written as /hls/live.m3u8 via NVENC",
@@ -495,10 +586,11 @@ def main() -> None:
         or args.max_queue < args.max_batch
         or args.batch_wait_ms < 0
         or not 0 < args.swap_ort_mem_gib <= 8
+        or args.swap_min_mask_area_px < 1
     ):
         raise SystemExit(
             "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
-            "and swap-ort-mem-gib in (0, 8] are required"
+            "swap-ort-mem-gib in (0, 8], and swap-min-mask-area-px >= 1 are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -512,6 +604,7 @@ def main() -> None:
         args.batch_wait_ms,
         args.max_queue,
         args.swap_ort_mem_gib,
+        args.swap_min_mask_area_px,
         input_video,
         args.hls_dir.expanduser().resolve(),
     )

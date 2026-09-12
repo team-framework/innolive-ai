@@ -25,8 +25,13 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - InSwapper ONNX Runtime CUDA arena는 session당 2GiB 상한(`--swap-ort-mem-gib`)과 exact-request growth를 사용한다. swap에 필요하지 않은 age/gender/106-landmark InsightFace session은 만들지 않는다.
 - queue가 가득 차면 오래된 처리를 쌓지 않고 해당 browser frame을 drop한다.
 - AdaFace whitelist가 확인된 face는 원본을 유지한다. class 0의 비화이트리스트 face만 InSwapper에 전달한다.
+- class 0 mask가 `16,384px`(기본값)보다 작거나 tracking hold 상태면 generator를 실행하지 않고 local Gaussian blur fallback을 적용한다. `--swap-min-mask-area-px`로 조정할 수 있다.
 - number plate와 swap 실패 face는 즉시 local Gaussian blur fallback을 적용한다.
+- 한 frame의 여러 swap 후보는 InsightFace face analysis를 한 번만 실행한 뒤 YOLO box와 일대일 매칭한다.
+- AdaFace는 실제 whitelist enrollment가 시작될 때만 GPU model을 load한다. whitelist가 없는 익명 swap stream은 AdaFace VRAM을 예약하지 않는다.
 - Browser WebSocket은 request/response backpressure를 적용해 처리하지 못할 frame을 계속 전송하지 않는다.
+
+응답 metadata에는 `detector_batch_ms`, `swap_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_ms`가 크면 InSwapper가 병목이고, `detector_batch_ms`가 크면 TensorRT engine profile이 병목이다.
 
 ## NVDEC/NVENC file test
 
@@ -43,6 +48,6 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 - dynamic engine은 export한 동일한 NVIDIA driver/CUDA/TensorRT 계열의 3090 host에서만 사용합니다. `best.pt` 변경 시 다시 export합니다.
 - `models/face_swap/inswapper_128.onnx`는 완전한 유효 ONNX 파일이어야 합니다. 이 repository의 무시된 model artifact는 자동으로 내려받거나 교체하지 않습니다.
-- 이 client는 quality를 낮추는 resize, face-skip, frame-skip을 추가하지 않습니다. 실제 10 clients × 30fps는 3090 host에서 browser 및 NVDEC file workload를 나누어 실측해야 합니다.
+- 이 client는 quality를 낮추는 resize, frame-skip을 추가하지 않습니다. 작은 mask fallback은 privacy-first 처리이며, 큰 face의 generator model과 input size는 유지합니다. 실제 10 clients × 30fps는 3090 host에서 browser 및 NVDEC file workload를 나누어 실측해야 합니다.
 
 `models/best_swap_b4.engine`은 3090 Linux에서 현재 `models/best.pt`로 새로 만들어야 하며 Git에 넣지 않습니다.

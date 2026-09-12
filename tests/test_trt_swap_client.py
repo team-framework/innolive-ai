@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from experiments.trt_swap_client.app import _blur_objects, _iou, _objects, _swap_providers
+from experiments.trt_swap_client.app import (
+    InSwapper,
+    _blur_objects,
+    _iou,
+    _objects,
+    _swap_providers,
+)
 from experiments.trt_swap_client.video_io import VideoSpec
 from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
@@ -73,3 +79,35 @@ def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:
         8,
     )
     assert objects[0]["mask_area_px"] == 36.0
+
+
+def test_swapper_analyzes_one_frame_once_for_multiple_yolo_faces() -> None:
+    class Face:
+        def __init__(self, bbox: list[float]) -> None:
+            self.bbox = np.asarray(bbox, dtype=np.float32)
+
+    class Analysis:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, image: np.ndarray) -> list[Face]:
+            self.calls += 1
+            return [Face([0, 0, 20, 20]), Face([40, 40, 60, 60])]
+
+    class Model:
+        def get(
+            self, image: np.ndarray, target: Face, source: object, *, paste_back: bool
+        ) -> np.ndarray:
+            assert paste_back is True
+            return image + 1
+
+    swapper = InSwapper.__new__(InSwapper)
+    swapper.analysis = Analysis()
+    swapper.model = Model()
+    swapper.source_face = object()
+    output, succeeded = swapper.apply_many(
+        np.zeros((4, 4, 3), dtype=np.uint8), [[0, 0, 20, 20], [40, 40, 60, 60]]
+    )
+    assert swapper.analysis.calls == 1
+    assert succeeded == {0, 1}
+    assert np.all(output == 2)
