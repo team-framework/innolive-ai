@@ -24,6 +24,7 @@ from aiortc import (
     RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
+    VideoStreamTrack,
 )
 from av import VideoFrame
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -102,8 +103,8 @@ class StreamState:
     sequence: int = 0
 
 
-class SwapVideoTrack(MediaStreamTrack):
-    """WebRTC return track that transforms each decoded camera frame once."""
+class SwapVideoTrack(VideoStreamTrack):
+    """Latest-frame WebRTC transformer with independent input, work, and output clocks."""
 
     kind = "video"
 
@@ -112,21 +113,74 @@ class SwapVideoTrack(MediaStreamTrack):
         self.source = source
         self.lab = lab
         self.stream = stream
+        self._latest_input: VideoFrame | None = None
+        self._latest_output: np.ndarray | None = None
+        self._input_ready = asyncio.Event()
+        self._output_ready = asyncio.Event()
+        self._reader: asyncio.Task[None] | None = None
+        self._worker: asyncio.Task[None] | None = None
+
+    def _start_workers(self) -> None:
+        if self._reader is None:
+            self._reader = asyncio.create_task(self._read_latest(), name="webrtc-video-reader")
+            self._worker = asyncio.create_task(self._process_latest(), name="webrtc-video-worker")
+
+    async def _read_latest(self) -> None:
+        try:
+            while self.readyState == "live":
+                # This is deliberately a one-item mailbox, not a FIFO. A live
+                # camera frame supersedes any unprocessed predecessor.
+                self._latest_input = await self.source.recv()
+                self._input_ready.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"WebRTC input track stopped: {error}")
+            self.stop()
+
+    async def _process_latest(self) -> None:
+        try:
+            while self.readyState == "live":
+                await self._input_ready.wait()
+                self._input_ready.clear()
+                frame = self._latest_input
+                if frame is None:
+                    continue
+                image = frame.to_ndarray(format="bgr24")
+                try:
+                    output, _ = await self.lab.submit(image, self.stream)
+                except RuntimeError:
+                    # Queue saturation means a newer camera frame is already
+                    # available. Do not emit stale output or grow a backlog.
+                    continue
+                self._latest_output = np.ascontiguousarray(output)
+                self._output_ready.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"WebRTC swap worker stopped: {error}")
+            self.stop()
 
     async def recv(self) -> VideoFrame:
-        frame = await self.source.recv()
-        image = frame.to_ndarray(format="bgr24")
-        try:
-            output, _ = await self.lab.submit(image, self.stream)
-        except RuntimeError:
-            # Preserve the source frame when the latency-first queue drops a
-            # frame. The next decoded frame is still processed; no stale face
-            # image is ever replayed.
-            output = image
-        result = VideoFrame.from_ndarray(np.ascontiguousarray(output), format="bgr24")
-        result.pts = frame.pts
-        result.time_base = frame.time_base
+        self._start_workers()
+        # The first output waits for a completed privacy-safe swap. Afterwards
+        # next_timestamp keeps RTP delivery paced even while a newer frame is
+        # being processed in parallel.
+        await self._output_ready.wait()
+        pts, time_base = await self.next_timestamp()
+        output = self._latest_output
+        if output is None:
+            raise RuntimeError("WebRTC swap output was not initialized")
+        result = VideoFrame.from_ndarray(output, format="bgr24")
+        result.pts = pts
+        result.time_base = time_base
         return result
+
+    def stop(self) -> None:
+        for task in (self._reader, self._worker):
+            if task is not None:
+                task.cancel()
+        super().stop()
 
 
 @dataclass(slots=True)
