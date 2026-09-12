@@ -46,6 +46,21 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 `/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. 이어지는 `input=DataType.HALF`, `latent=DataType.HALF`, `output=DataType.HALF` 표시는 full FP16 binding engine이 적용된 상태다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT 11에서 만든 direct engine으로 실행한다. TensorRT 11의 strong typing 때문에 `--precision fp16`은 explicit ONNX cast를 넣어 FP16 engine을 만든다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
 
+## 얼굴 품질 진단
+
+먼저 JPEG/브라우저 표시가 아닌 raw 128×128 결과를 비교한다. `--swap-debug-dir`를 지정하면 TensorRT 실행 결과는 그대로 유지하면서, 같은 blob과 mapped latent를 CPU ONNX Runtime reference에 한 번 더 넣어 최신 얼굴 하나의 진단 묶음을 저장한다.
+
+```bash
+python -m experiments.trt_swap_client.app \
+  --swapper-backend tensorrt \
+  --swap-debug-dir /tmp/inswapper-debug \
+  --stream-jpeg-quality 100
+```
+
+`/tmp/inswapper-debug/05_onnx_raw_swap.png`와 `06_trt_raw_swap.png`가 처음 비교할 파일이며, `debug.json`에는 input/latent 통계와 ORT-vs-TRT MAE·RMSE·MAX error가 기록된다. 이어서 `07_swap_mask.png`, `08_inverse_warp_swap.png`, `10_after_blend.png`을 보면 paste-back에서 문제가 시작되는지 확인할 수 있다. 덤프가 실패해도 live swap은 blur fallback으로 바뀌지 않는다.
+
+이 저장소의 공식 `inswapper_128.onnx`는 InsightFace metadata상 `input_mean=0`, `input_std=255`를 사용한다. 따라서 target tensor 범위는 **`[0,1]`** 이며, 다른 InSwapper 변형의 `[-1,1]` normalization을 적용하면 안 된다. 시작 시 engine binding의 이름·shape·dtype도 검증하므로, 잘못된/stale engine은 화질이 깨진 상태로 실행하지 않고 오류로 중단한다.
+
 ## NVDEC/NVENC file test
 
 FFmpeg가 `h264_nvenc`를 제공하는 3090 host에서는 같은 batcher에 file stream을 추가할 수 있습니다.

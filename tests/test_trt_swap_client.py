@@ -9,7 +9,10 @@ from experiments.trt_swap_client.app import (
     Settings,
     _blur_objects,
     _iou,
+    _mapped_latent,
     _objects,
+    _paste_inswapper,
+    _prediction_to_bgr,
     _swap_providers,
 )
 from experiments.trt_swap_client.video_io import VideoSpec
@@ -140,3 +143,36 @@ def test_swapper_analyzes_one_frame_once_for_multiple_yolo_faces() -> None:
     assert swapper.analysis.calls == 1
     assert succeeded == {0, 1}
     assert np.all(output == 2)
+
+
+def test_prediction_decoder_uses_official_zero_to_one_output_range() -> None:
+    prediction = np.full((1, 3, 128, 128), 0.5, dtype=np.float32)
+    decoded = _prediction_to_bgr(prediction)
+    assert decoded.shape == (128, 128, 3)
+    assert np.all(decoded == 127)
+
+
+def test_mapped_latent_is_float32_unit_vector() -> None:
+    class Source:
+        normed_embedding = np.ones(512, dtype=np.float32) / np.sqrt(512)
+
+    latent = _mapped_latent(Source(), np.eye(512, dtype=np.float32))
+    assert latent.shape == (1, 512)
+    assert latent.dtype == np.float32
+    assert np.isclose(np.linalg.norm(latent), 1.0)
+
+
+def test_paste_back_exposes_mask_and_warp_artifacts() -> None:
+    target = np.full((64, 64, 3), 100, dtype=np.uint8)
+    aligned = np.full((16, 16, 3), 200, dtype=np.uint8)
+    artifacts: dict[str, np.ndarray] = {}
+    result = _paste_inswapper(
+        target,
+        aligned,
+        aligned,
+        np.asarray(((1, 0, -24), (0, 1, -24)), dtype=np.float32),
+        artifacts=artifacts,
+    )
+    assert result.shape == target.shape
+    assert artifacts["swap_mask"].shape == target.shape[:2]
+    assert artifacts["inverse_warp_swap"].shape == target.shape

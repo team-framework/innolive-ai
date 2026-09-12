@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import threading
 import time
 from collections import deque
@@ -60,6 +61,8 @@ class Settings:
     target_yunet: Path
     input_video: Path | None
     hls_dir: Path
+    swap_debug_dir: Path | None = None
+    stream_jpeg_quality: int = 100
 
 
 @dataclass(slots=True)
@@ -174,6 +177,22 @@ class TensorRtInSwapperGenerator:
         self.image_dtype = self.engine.get_tensor_dtype(self.image_input)
         self.latent_dtype = self.engine.get_tensor_dtype(self.latent_input)
         self.output_dtype = self.engine.get_tensor_dtype(self.output)
+        self._validate_static_bindings()
+        self.debug_dumper: SwapDebugDumper | None = None
+
+    def _validate_static_bindings(self) -> None:
+        """Fail early for a stale/wrong engine instead of producing plausible garbage."""
+
+        image_shape = tuple(self.engine.get_tensor_shape(self.image_input))
+        latent_shape = tuple(self.engine.get_tensor_shape(self.latent_input))
+        output_shape = tuple(self.engine.get_tensor_shape(self.output))
+        expected_image = (1, 3, self.metadata.input_size[1], self.metadata.input_size[0])
+        if all(dimension >= 0 for dimension in image_shape) and image_shape != expected_image:
+            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected {expected_image}")
+        if all(dimension >= 0 for dimension in latent_shape) and latent_shape != (1, 512):
+            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (1, 512)")
+        if all(dimension >= 0 for dimension in output_shape) and output_shape != expected_image:
+            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected {expected_image}")
 
     def provider_summary(self) -> list[str]:
         return [
@@ -181,6 +200,9 @@ class TensorRtInSwapperGenerator:
             f"input={self.image_dtype}",
             f"latent={self.latent_dtype}",
             f"output={self.output_dtype}",
+            f"image_name={self.image_input}",
+            f"latent_name={self.latent_input}",
+            f"output_name={self.output}",
         ]
 
     @staticmethod
@@ -199,6 +221,15 @@ class TensorRtInSwapperGenerator:
     def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
         import torch
 
+        image = np.ascontiguousarray(image, dtype=np.float32)
+        latent = np.ascontiguousarray(latent, dtype=np.float32)
+        if image.shape != (1, 3, self.metadata.input_size[1], self.metadata.input_size[0]):
+            raise ValueError(f"unexpected InSwapper image tensor shape: {image.shape}")
+        if latent.shape != (1, 512):
+            raise ValueError(f"unexpected InSwapper latent tensor shape: {latent.shape}")
+        if not np.isfinite(image).all() or not np.isfinite(latent).all():
+            raise ValueError("InSwapper input contains NaN or infinity")
+
         image_tensor = torch.from_numpy(np.ascontiguousarray(image)).to(
             device=f"cuda:{self.device}", dtype=self._torch_dtype(self.image_dtype, torch)
         )
@@ -208,6 +239,9 @@ class TensorRtInSwapperGenerator:
         self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
         self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
         output_shape = tuple(self.context.get_tensor_shape(self.output))
+        expected_output = (1, 3, self.metadata.input_size[1], self.metadata.input_size[0])
+        if output_shape != expected_output:
+            raise RuntimeError(f"unresolved or unexpected TensorRT output shape: {output_shape}")
         output_tensor = torch.empty(
             output_shape,
             device=image_tensor.device,
@@ -219,7 +253,10 @@ class TensorRtInSwapperGenerator:
         stream = torch.cuda.current_stream(self.device)
         if not self.context.execute_async_v3(stream.cuda_stream):
             raise RuntimeError("TensorRT InSwapper execution failed")
-        return output_tensor.float().cpu().numpy()
+        output = output_tensor.float().cpu().numpy()
+        if not np.isfinite(output).all():
+            raise RuntimeError("TensorRT InSwapper output contains NaN or infinity")
+        return output
 
     def get(self, img: np.ndarray, target_face: Any, source_face: Any, *, paste_back: bool) -> np.ndarray:
         from insightface.utils import face_align
@@ -232,23 +269,69 @@ class TensorRtInSwapperGenerator:
             (self.metadata.input_mean,) * 3,
             swapRB=True,
         )
-        latent = source_face.normed_embedding.reshape((1, -1))
-        latent = np.dot(latent, self.metadata.emap)
-        latent /= np.linalg.norm(latent)
-        prediction = self._forward(blob, latent.astype(np.float32, copy=False))
-        bgr_fake = np.clip(255 * prediction.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[
-            :, :, ::-1
-        ]
+        latent = _mapped_latent(source_face, self.metadata.emap)
+        prediction = self._forward(blob, latent)
+        bgr_fake = _prediction_to_bgr(prediction)
         if not paste_back:
             return bgr_fake
-        return _paste_inswapper(img, aimg, bgr_fake, matrix)
+        artifacts: dict[str, np.ndarray] | None = {} if self.debug_dumper is not None else None
+        result = _paste_inswapper(img, aimg, bgr_fake, matrix, artifacts=artifacts)
+        if self.debug_dumper is not None:
+            # The metadata model has an explicit CPU ORT session solely for this
+            # opt-in comparison.  It never participates in the live TRT result.
+            try:
+                ort_prediction = self.metadata.forward(blob, latent)
+                self.debug_dumper.dump(
+                    original=img,
+                    landmarks=np.asarray(target_face.kps),
+                    aligned=aimg,
+                    blob=blob,
+                    latent=latent,
+                    ort_prediction=ort_prediction,
+                    trt_prediction=prediction,
+                    final=result,
+                    artifacts=artifacts or {},
+                )
+            except Exception as error:
+                # Diagnostics must not turn an otherwise-valid swap into a blur fallback.
+                print(f"InSwapper debug dump failed: {error}")
+        return result
 
 
-def _paste_inswapper(target_img: np.ndarray, aligned: np.ndarray, fake: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+def _mapped_latent(source_face: Any, emap: np.ndarray) -> np.ndarray:
+    """Apply the InSwapper mapping matrix with explicit shape/dtype checks."""
+
+    embedding = np.asarray(source_face.normed_embedding, dtype=np.float32).reshape(1, -1)
+    if embedding.shape != (1, 512):
+        raise ValueError(f"unexpected source embedding shape: {embedding.shape}")
+    latent = np.asarray(np.dot(embedding, emap), dtype=np.float32)
+    norm = float(np.linalg.norm(latent))
+    if not np.isfinite(norm) or norm <= np.finfo(np.float32).eps:
+        raise ValueError(f"invalid mapped source latent norm: {norm}")
+    return np.ascontiguousarray(latent / norm, dtype=np.float32)
+
+
+def _prediction_to_bgr(prediction: np.ndarray) -> np.ndarray:
+    """Decode this repository's official InSwapper output, whose range is [0, 1]."""
+
+    output = np.asarray(prediction, dtype=np.float32)
+    if output.shape != (1, 3, 128, 128):
+        raise ValueError(f"unexpected InSwapper output shape: {output.shape}")
+    if not np.isfinite(output).all():
+        raise ValueError("InSwapper output contains NaN or infinity")
+    return np.clip(255.0 * output.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
+
+
+def _paste_inswapper(
+    target_img: np.ndarray,
+    aligned: np.ndarray,
+    fake: np.ndarray,
+    matrix: np.ndarray,
+    *,
+    artifacts: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
     """Exact paste-back behavior from InsightFace INSwapper.get()."""
 
-    fake_diff = np.abs(fake.astype(np.float32) - aligned.astype(np.float32)).mean(axis=2)
-    fake_diff[:2, :], fake_diff[-2:, :], fake_diff[:, :2], fake_diff[:, -2:] = 0, 0, 0, 0
     inverse = cv2.invertAffineTransform(matrix)
     fake = cv2.warpAffine(fake, inverse, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
     white = cv2.warpAffine(
@@ -265,7 +348,79 @@ def _paste_inswapper(target_img: np.ndarray, aligned: np.ndarray, fake: np.ndarr
     mask = cv2.erode(white, np.ones((max(mask_size // 10, 10),) * 2, np.uint8), iterations=1)
     blur = tuple(2 * value + 1 for value in (max(mask_size // 20, 5),) * 2)
     mask = cv2.GaussianBlur(mask, blur, 0).reshape((*target_img.shape[:2], 1)) / 255
+    if artifacts is not None:
+        artifacts["inverse_warp_swap"] = fake
+        artifacts["swap_mask"] = np.rint(mask[:, :, 0] * 255).astype(np.uint8)
+        artifacts["paste_before_blend"] = target_img
     return (mask * fake + (1 - mask) * target_img.astype(np.float32)).astype(np.uint8)
+
+
+class SwapDebugDumper:
+    """Write a stable, inspectable latest-frame bundle without affecting inference."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _write(path: Path, image: np.ndarray) -> None:
+        if not cv2.imwrite(str(path), image):
+            raise RuntimeError(f"could not write swap debug image: {path}")
+
+    @staticmethod
+    def _stats(values: np.ndarray) -> dict[str, float]:
+        values = np.asarray(values, dtype=np.float32)
+        return {
+            "min": float(values.min()),
+            "max": float(values.max()),
+            "mean": float(values.mean()),
+            "std": float(values.std()),
+        }
+
+    def dump(
+        self,
+        *,
+        original: np.ndarray,
+        landmarks: np.ndarray,
+        aligned: np.ndarray,
+        blob: np.ndarray,
+        latent: np.ndarray,
+        ort_prediction: np.ndarray,
+        trt_prediction: np.ndarray,
+        final: np.ndarray,
+        artifacts: dict[str, np.ndarray],
+    ) -> None:
+        landmark_image = original.copy()
+        for x, y in landmarks:
+            cv2.circle(landmark_image, (round(float(x)), round(float(y))), 3, (0, 0, 255), -1)
+        reconstructed = np.clip(blob[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)[:, :, ::-1]
+        self._write(self.directory / "00_original.png", original)
+        self._write(self.directory / "02_landmarks.png", landmark_image)
+        self._write(self.directory / "03_aligned_target.png", aligned)
+        self._write(self.directory / "04_model_input_reconstructed.png", reconstructed)
+        self._write(self.directory / "05_onnx_raw_swap.png", _prediction_to_bgr(ort_prediction))
+        self._write(self.directory / "06_trt_raw_swap.png", _prediction_to_bgr(trt_prediction))
+        prefixes = {"swap_mask": "07", "inverse_warp_swap": "08", "paste_before_blend": "09"}
+        for name, prefix in prefixes.items():
+            image = artifacts.get(name)
+            if image is not None:
+                self._write(self.directory / f"{prefix}_{name}.png", image)
+        self._write(self.directory / "10_after_blend.png", final)
+        self._write(self.directory / "11_final_frame.png", final)
+        diff = np.asarray(trt_prediction, dtype=np.float32) - np.asarray(ort_prediction, dtype=np.float32)
+        report = {
+            "input": self._stats(blob),
+            "mapped_latent": {**self._stats(latent), "norm": float(np.linalg.norm(latent))},
+            "onnx": self._stats(ort_prediction),
+            "tensorrt": self._stats(trt_prediction),
+            "ort_vs_trt": {
+                "mae": float(np.mean(np.abs(diff))),
+                "rmse": float(np.sqrt(np.mean(diff**2))),
+                "max_error": float(np.max(np.abs(diff))),
+            },
+            "mask": self._stats(artifacts["swap_mask"] / 255.0) if "swap_mask" in artifacts else None,
+        }
+        (self.directory / "debug.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 class InSwapper:
@@ -282,6 +437,7 @@ class InSwapper:
         device: str,
         target_aligner: str,
         target_yunet: Path,
+        debug_dir: Path | None,
     ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
@@ -303,6 +459,8 @@ class InSwapper:
         if backend == "tensorrt":
             self.model = model_zoo.get_model(str(model_path), providers=["CPUExecutionProvider"])
             self.generator: Any = TensorRtInSwapperGenerator(self.model, engine_path, device)
+            if debug_dir is not None:
+                self.generator.debug_dumper = SwapDebugDumper(debug_dir)
         else:
             self.model = model_zoo.get_model(
                 str(model_path), providers=_swap_providers(device, 2.0)
@@ -455,6 +613,7 @@ class SwapLab:
             device=settings.device,
             target_aligner=settings.target_aligner,
             target_yunet=settings.target_yunet,
+            debug_dir=settings.swap_debug_dir,
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -742,7 +901,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
-        return _HTML
+        return _HTML.replace("__JPEG_QUALITY__", str(settings.stream_jpeg_quality / 100))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -779,7 +938,9 @@ def create_app(settings: Settings) -> FastAPI:
                 except RuntimeError as error:
                     await websocket.send_json({"error": str(error), "dropped": True})
                     continue
-                ok, encoded = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                ok, encoded = cv2.imencode(
+                    ".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, settings.stream_jpeg_quality]
+                )
                 if ok:
                     await websocket.send_json(metadata)
                     await websocket.send_bytes(encoded.tobytes())
@@ -854,6 +1015,17 @@ def parse_args() -> argparse.Namespace:
         help="optional compressed input decoded by NVDEC and written as /hls/live.m3u8 via NVENC",
     )
     parser.add_argument("--hls-dir", type=Path, default=DEFAULT_HLS_DIR)
+    parser.add_argument(
+        "--swap-debug-dir",
+        type=Path,
+        help="save latest ORT/TRT raw and paste-back diagnostics here (TensorRT backend only)",
+    )
+    parser.add_argument(
+        "--stream-jpeg-quality",
+        type=int,
+        default=100,
+        help="browser input and WebSocket output JPEG quality (1-100; default: 100 for diagnosis)",
+    )
     return parser.parse_args()
 
 
@@ -866,11 +1038,12 @@ def main() -> None:
         or not 0 < args.swap_ort_mem_gib <= 8
         or args.swap_min_mask_area_px < 1
         or not 0 < args.swapper_trt_workspace_gib <= 4
+        or not 1 <= args.stream_jpeg_quality <= 100
     ):
         raise SystemExit(
             "max-batch >= 1, max-queue >= max-batch, batch-wait-ms >= 0, "
-            "swap-ort-mem-gib in (0, 8], swap-min-mask-area-px >= 1, and "
-            "swapper-trt-workspace-gib in (0, 4] are required"
+            "swap-ort-mem-gib in (0, 8], swap-min-mask-area-px >= 1, "
+            "swapper-trt-workspace-gib in (0, 4], and stream-jpeg-quality in [1, 100] are required"
         )
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
@@ -893,13 +1066,15 @@ def main() -> None:
         args.target_yunet.expanduser().resolve(),
         input_video,
         args.hls_dir.expanduser().resolve(),
+        args.swap_debug_dir.expanduser().resolve() if args.swap_debug_dir else None,
+        args.stream_jpeg_quality,
     )
     import uvicorn
 
     uvicorn.run(create_app(settings), host=args.host, port=args.port)
 
 
-_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → batched YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false;navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){m.textContent=e.data;return}o.src=URL.createObjectURL(e.data);busy=false};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(b=>{if(b)ws.send(b);else busy=false},'image/jpeg',.9)},33)</script>"""
+_HTML = """<!doctype html><meta charset=utf-8><title>TensorRT Swap Lab</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style><h1>TensorRT Face Swap Lab</h1><p>Browser webcam → batched YOLO → class-0 swap / protected fallback</p><video id=v autoplay muted playsinline></video><img id=o><pre id=m>starting…</pre><script>const id=crypto.randomUUID(),ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`),v=document.querySelector('#v'),o=document.querySelector('#o'),m=document.querySelector('#m'),c=document.createElement('canvas');let busy=false;navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080},audio:false}).then(s=>v.srcObject=s);ws.onmessage=e=>{if(typeof e.data==='string'){m.textContent=e.data;return}o.src=URL.createObjectURL(e.data);busy=false};setInterval(()=>{if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(b=>{if(b)ws.send(b);else busy=false},'image/jpeg',__JPEG_QUALITY__)},33)</script>"""
 
 
 if __name__ == "__main__":
