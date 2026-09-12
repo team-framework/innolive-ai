@@ -76,3 +76,4 @@ Thumbs.db
 /models/*.engine.json
 /models/*.ckpt
 /models/*.onnx
+/face_swap_lab_output/
