@@ -111,6 +111,39 @@ def decode_image(encoded: bytes, limits: FrameLimits = DEFAULT_FRAME_LIMITS) -> 
     return _decode_bgr(encoded, limits, error_message="encoded image could not be decoded")
 
 
+def raw_yuv420p_size(width: int, height: int) -> int:
+    """Byte size of one yuv420p frame, matching the server's rawFrameSize (ceil chroma)."""
+
+    return width * height + 2 * ((width + 1) // 2) * ((height + 1) // 2)
+
+
+def decode_raw_yuv420p(
+    data: bytes, width: int, height: int, limits: FrameLimits = DEFAULT_FRAME_LIMITS
+) -> np.ndarray:
+    """Validate and reconstruct one raw yuv420p frame into a BGR image."""
+
+    if width <= 0 or height <= 0:
+        raise ValueError("raw frame requires positive width and height")
+    _validate_dimensions(width, height, limits)
+    if width % 2 or height % 2:
+        raise ValueError("raw yuv420p frame requires even dimensions")
+    expected = raw_yuv420p_size(width, height)
+    # Uncompressed frames can exceed the gRPC byte budget that JPEG never reached;
+    # reject them cleanly here rather than letting the transport tear down the stream.
+    if expected > limits.max_jpeg_bytes:
+        raise ValueError(
+            f"raw frame {expected} bytes exceeds the {limits.max_jpeg_bytes} byte limit"
+        )
+    if len(data) != expected:
+        raise ValueError(f"raw frame is {len(data)} bytes, expected {expected}")
+    planar = np.frombuffer(data, dtype=np.uint8).reshape((height * 3 // 2, width))
+    try:
+        image = cv2.cvtColor(planar, cv2.COLOR_YUV2BGR_I420)
+    except cv2.error as error:
+        raise ValueError("raw frame could not be converted from yuv420p") from error
+    return image
+
+
 def _decode_bgr(encoded: bytes, limits: FrameLimits, *, error_message: str) -> np.ndarray:
     """Decode an already format-validated image and enforce decoded dimensions."""
 
