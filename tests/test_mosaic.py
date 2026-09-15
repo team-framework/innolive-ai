@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 
 import service.mosaic as mosaic
-from service.mosaic import _feathered_mask, mosaic_jpeg
+from service.frame import raw_yuv420p_size
+from service.mosaic import _feathered_mask, mosaic_jpeg, mosaic_yuv420p
 
 
 def _decode(jpeg: bytes) -> np.ndarray:
@@ -211,6 +212,24 @@ class MosaicParamTests(unittest.TestCase):
         for kwargs, expected in cases:
             with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, expected):
                 mosaic_jpeg(self.image, self.objects, **kwargs)
+
+
+class MosaicRawTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.image = np.zeros((120, 160, 3), dtype=np.uint8)
+        self.image[:, ::2] = 255
+
+    def test_raw_output_has_expected_yuv420p_size(self):
+        payload = mosaic_yuv420p(
+            self.image,
+            [{"whitelisted": False, "mask_polygon": [[20, 20], [90, 20], [90, 100], [20, 100]]}],
+        )
+        self.assertEqual(len(payload), raw_yuv420p_size(160, 120))
+
+    def test_raw_output_rejects_odd_dimensions(self):
+        odd = np.zeros((120, 161, 3), dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            mosaic_yuv420p(odd, [])
 
 
 if __name__ == "__main__":

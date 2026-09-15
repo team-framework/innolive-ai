@@ -37,12 +37,20 @@ from service.adaface_model import (
     FaceTooSmallError,
 )
 from service.detection import is_number_plate_object
-from service.frame import MAX_LONG_EDGE, MIN_FRAME_DIMENSION, FrameLimits, decode_image, decode_jpeg
+from service.frame import (
+    MAX_LONG_EDGE,
+    MIN_FRAME_DIMENSION,
+    FrameLimits,
+    decode_image,
+    decode_jpeg,
+    decode_raw_yuv420p,
+)
 from service.grpc_config import listen_address, server_options
 from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
     DEFAULT_PIXEL_SIZE,
     mosaic_jpeg,
+    mosaic_yuv420p,
     validate_mosaic_params,
 )
 from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
@@ -299,13 +307,24 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     )
 
         try:
-            image = await asyncio.to_thread(
-                decode_jpeg,
-                bytes(request.data),
-                self.frame_limits,
-            )
+            if request.pix_fmt:
+                if request.pix_fmt != "yuv420p":
+                    raise ValueError(f"unsupported pix_fmt {request.pix_fmt!r}")
+                image = await asyncio.to_thread(
+                    decode_raw_yuv420p,
+                    bytes(request.data),
+                    request.width,
+                    request.height,
+                    self.frame_limits,
+                )
+            else:
+                image = await asyncio.to_thread(
+                    decode_jpeg,
+                    bytes(request.data),
+                    self.frame_limits,
+                )
         except (TypeError, ValueError):
-            LOGGER.info("frame %d JPEG decode rejected", request.frame_id)
+            LOGGER.info("frame %d decode rejected", request.frame_id)
             return FrameOutcome(
                 self._error_response(
                     request,
@@ -356,18 +375,28 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     item.get("whitelisted") is not True or is_number_plate_object(item)
                     for item in objects
                 ):
+                    if request.pix_fmt:
+                        compose = partial(
+                            mosaic_yuv420p,
+                            image,
+                            objects,
+                            blur_radius=blur_radius,
+                            pixel_size=pixel_size,
+                        )
+                    else:
+                        compose = partial(
+                            mosaic_jpeg,
+                            image,
+                            objects,
+                            blur_radius=blur_radius,
+                            pixel_size=pixel_size,
+                            max_bytes=self.settings.max_jpeg_bytes,
+                        )
                     async with self._mosaic_slots:
                         loop = asyncio.get_running_loop()
                         processed_data = await loop.run_in_executor(
                             self._mosaic_executor,
-                            partial(
-                                mosaic_jpeg,
-                                image,
-                                objects,
-                                blur_radius=blur_radius,
-                                pixel_size=pixel_size,
-                                max_bytes=self.settings.max_jpeg_bytes,
-                            ),
+                            compose,
                         )
                 else:
                     processed_data = bytes(request.data)

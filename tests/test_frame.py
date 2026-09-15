@@ -7,7 +7,14 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from service.frame import FrameLimits, decode_image, decode_jpeg, resize_long_edge
+from service.frame import (
+    FrameLimits,
+    decode_image,
+    decode_jpeg,
+    decode_raw_yuv420p,
+    raw_yuv420p_size,
+    resize_long_edge,
+)
 
 
 def _jpeg_header(width: int, height: int) -> bytes:
@@ -148,6 +155,36 @@ class FrameBoundaryTests(unittest.TestCase):
             FrameLimits(min_dimension=641, max_long_edge=640)
         with self.assertRaises(ValueError):
             FrameLimits(max_pixels=0)
+
+
+class RawFrameTests(unittest.TestCase):
+    def test_decodes_a_well_formed_yuv420p_frame(self):
+        width, height = 64, 48
+        data = bytes([0x10] * (width * height)) + bytes(
+            [0x80] * (2 * ((width + 1) // 2) * ((height + 1) // 2))
+        )
+        self.assertEqual(len(data), raw_yuv420p_size(width, height))
+        image = decode_raw_yuv420p(data, width, height)
+        self.assertEqual(image.shape, (height, width, 3))
+        self.assertEqual(image.dtype, np.uint8)
+
+    def test_rejects_wrong_byte_length(self):
+        width, height = 64, 48
+        with self.assertRaises(ValueError):
+            decode_raw_yuv420p(b"\x00" * (width * height), width, height)
+
+    def test_rejects_odd_dimensions(self):
+        width, height = 65, 48
+        with self.assertRaises(ValueError):
+            decode_raw_yuv420p(b"\x00" * raw_yuv420p_size(width, height), width, height)
+
+    def test_rejects_frames_over_the_byte_budget(self):
+        # 1920x1080 fits the 4MB gRPC budget; a larger frame within FrameLimits
+        # would overflow it, so it is rejected before the length check.
+        limits = FrameLimits(max_long_edge=1920, max_pixels=1920 * 1920)
+        width, height = 1920, 1920
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            decode_raw_yuv420p(b"\x00" * raw_yuv420p_size(width, height), width, height, limits)
 
 
 if __name__ == "__main__":

@@ -59,6 +59,28 @@ def mosaic_jpeg(
     return _encode_jpeg(output, max_bytes)
 
 
+def mosaic_yuv420p(
+    image: np.ndarray,
+    objects: list[dict[str, Any]],
+    *,
+    blur_radius: float = DEFAULT_BLUR_RADIUS,
+    pixel_size: int = DEFAULT_PIXEL_SIZE,
+) -> bytes:
+    """Compose the mosaic and return raw yuv420p bytes for the raw wire format."""
+
+    if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+        raise ValueError("mosaic input must be a uint8 BGR image")
+    height, width = image.shape[:2]
+    if width % 2 or height % 2:
+        raise ValueError("raw mosaic requires even dimensions")
+    blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
+
+    mask = _protected_mask(image.shape[:2], objects)
+    output = _mosaic_masked_region(image, _feathered_mask(mask), blur_radius, pixel_size)
+
+    return _encode_yuv420p(output)
+
+
 def _mosaic_masked_region(
     image: np.ndarray,
     blend_mask: np.ndarray,
@@ -95,6 +117,16 @@ def _mosaic_masked_region(
         region.astype(np.uint32) * inverse_alpha + blurred.astype(np.uint32) * alpha + 127
     ) // 255
     return output
+
+
+def _encode_yuv420p(image: np.ndarray) -> bytes:
+    """Convert the final BGR frame to planar yuv420p bytes for the raw wire format."""
+
+    try:
+        planar = cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420)
+    except cv2.error as error:
+        raise ValueError("mosaic yuv420p conversion failed") from error
+    return planar.tobytes()
 
 
 def _encode_jpeg(image: np.ndarray, max_bytes: int) -> bytes:
