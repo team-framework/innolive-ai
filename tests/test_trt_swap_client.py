@@ -825,3 +825,27 @@ def test_yunet_landmarks_use_columns_4_to_14() -> None:
         face.kps,
         np.asarray([[35, 45], [55, 45], [45, 65], [40, 85], [50, 85]], dtype=np.float32),
     )
+
+
+def test_objects_degenerate_mask_measures_zero_area_but_keeps_box_for_blur() -> None:
+    """A failed mask must never pass the swap gate via the box rectangle."""
+
+    class Masks:
+        def __init__(self) -> None:
+            self.xy = [np.empty((0, 2), dtype=np.float32)]
+
+    class Prediction:
+        def __init__(self) -> None:
+            self.masks = Masks()
+            self.boxes = [object()]
+
+    # Box alone would be 100x100 = 10_000, above any swap gate.
+    objects = _objects(
+        Prediction(),
+        np.asarray([[0, 0, 100, 100, 1, 0.9, 0, 0]], dtype=np.float32),
+        {0: "face", 1: "number_plate"},
+        200,
+        200,
+    )
+    assert objects[0]["mask_area_px"] == 0.0
+    assert len(objects[0]["mask_polygon"]) == 4

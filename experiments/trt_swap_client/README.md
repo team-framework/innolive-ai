@@ -108,6 +108,8 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 - `--target-aligner yunet_roi` 기본, 실패 시 InsightFace fallback
   (`insightface`는 legacy 비교 경로).
 - AdaFace whitelist 얼굴은 원본 유지, 작은 mask·hold·실패는 blur fallback.
+  면적은 YOLO mask 기준이며, mask가 깨지면 면적 0으로 blur한다
+  (box 사각형은 blur 영역으로만 쓴다).
 - WebRTC 우선, 불가 시 WebSocket fallback. TURN 환경변수 지원.
 
 ```bash

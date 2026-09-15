@@ -2051,7 +2051,12 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
             )
         except (TypeError, ValueError):
             polygon = np.empty((0, 2), dtype=np.float32)
-        if len(polygon) < 3 or not np.isfinite(polygon).all():
+        # Area is strictly mask-based: a degenerate mask measures 0 (blur
+        # fallback) instead of the box rectangle, so a small face with a loose
+        # box or a failed mask can never pass the swap gate.  The rectangle is
+        # kept only as the blur region to stay fail-closed.
+        mask_valid = len(polygon) >= 3 and bool(np.isfinite(polygon).all())
+        if not mask_valid:
             x1, y1, x2, y2 = row[:4]
             polygon = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)), dtype=np.float32)
         stride = max(1, int(np.ceil(len(polygon) / MAX_POLYGON_POINTS)))
@@ -2065,7 +2070,7 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
                 "confidence": float(row[5]),
                 "bbox": [float(value) for value in row[:4]],
                 "mask_polygon": polygon.tolist(),
-                "mask_area_px": _polygon_area(polygon),
+                "mask_area_px": _polygon_area(polygon) if mask_valid else 0.0,
             }
         )
     return objects
