@@ -32,6 +32,13 @@ def parse_args() -> argparse.Namespace:
         "a dynamic-batch engine with min=1/opt=max/max=max profile)",
     )
     parser.add_argument(
+        "--static-batch",
+        type=int,
+        default=0,
+        help="fixed batch rows without a profile (0 disables; best tactics but "
+        "only runs exactly this batch size)",
+    )
+    parser.add_argument(
         "--precision",
         choices=("fp32",),
         default="fp32",
@@ -82,7 +89,24 @@ def main() -> None:
     if args.builder_opt_level != 3:
         config.builder_optimization_level = args.builder_opt_level
     batch_range = {"min": 1, "opt": 1, "max": 1}
-    if args.max_batch > 1:
+    if args.static_batch > 1:
+        if args.max_batch > 1:
+            raise SystemExit("use only one of --max-batch and --static-batch")
+        batch_range = {
+            "min": args.static_batch,
+            "opt": args.static_batch,
+            "max": args.static_batch,
+        }
+        for index in range(network.num_inputs):
+            tensor = network.get_input(index)
+            shape = tuple(tensor.shape)
+            if len(shape) == 4:
+                tensor.shape = (args.static_batch, *shape[1:])
+            elif len(shape) == 2:
+                tensor.shape = (args.static_batch, shape[1])
+            else:
+                raise SystemExit(f"unexpected InSwapper input rank: {tensor.name} {shape}")
+    elif args.max_batch > 1:
         batch_range = {"min": 1, "opt": args.max_batch, "max": args.max_batch}
         _mark_dynamic_batch(network, trt)
         profile = builder.create_optimization_profile()

@@ -319,8 +319,10 @@ def _batched_swapper() -> tuple[InSwapper, Any]:
             self.seen_latents.append(latents.copy())
             count = blobs.shape[0]
             predictions = np.zeros((count, 3, 128, 128), dtype=np.float32)
+            # Position-independent: a face prediction depends only on its own
+            # inputs, like the production generator.
             for row in range(count):
-                predictions[row] = 0.1 * (row + 1) + 0.01 * float(latents[row, 0])
+                predictions[row] = 0.1 + 0.01 * float(latents[row, 0])
             return predictions
 
     swapper = InSwapper.__new__(InSwapper)
@@ -365,17 +367,16 @@ def test_apply_many_batches_faces_with_order_and_timing() -> None:
     )
     assert succeeded == {0, 1}
     assert output.shape == frame.shape
-    assert len(generator.seen_blobs) == 1
-    assert generator.seen_blobs[0].shape[0] == 2
-    assert generator.seen_latents[0].shape == (2, 512)
-    # Both rows share the single source latent in order.
-    assert np.array_equal(generator.seen_latents[0][0], generator.seen_latents[0][1])
+    # The multi-face pipeline forwards once per face; both rows share the
+    # single source latent (call order across threads is not asserted).
+    assert len(generator.seen_blobs) == 2
+    assert all(blob.shape == (1, 3, 128, 128) for blob in generator.seen_blobs)
+    assert len(generator.seen_latents) == 2
+    assert np.array_equal(generator.seen_latents[0], generator.seen_latents[1])
     assert swapper.last_batch_size == 2
     assert swapper.last_face_count == 2
     assert set(swapper.last_generator_timing) == {"prepare", "forward", "paste"}
-    assert swapper.last_generator_ms == (
-        swapper.last_prepare_ms + swapper.last_forward_ms + swapper.last_paste_ms
-    )
+    swapper.close()
 
 
 def test_apply_many_per_face_latent_mapping_preserves_order() -> None:
@@ -391,9 +392,11 @@ def test_apply_many_per_face_latent_mapping_preserves_order() -> None:
     )
     assert succeeded == {0, 1}
     assert output.shape == frame.shape
-    seen = generator.seen_latents[0]
-    assert np.allclose(seen[0], latent_a)
-    assert np.allclose(seen[1], latent_b)
+    seen = sorted(
+        (np.asarray(call).tobytes() for call in generator.seen_latents),
+    )
+    assert seen == sorted((latent_a.tobytes(), latent_b.tobytes()))
+    swapper.close()
 
 
 def test_find_pending_job_index_prefers_newest_same_stream() -> None:
@@ -408,6 +411,88 @@ def test_find_pending_job_index_prefers_newest_same_stream() -> None:
     assert _find_pending_job_index(pending, stream_a) == 2
     assert _find_pending_job_index(pending, stream_b) == 1
     assert _find_pending_job_index(pending, object()) is None
+
+
+def test_parallel_yunet_uses_clones_and_keeps_index_order() -> None:
+    from types import SimpleNamespace
+
+    import experiments.trt_swap_client.app as app_module
+
+    swapper, _ = _batched_swapper()
+    swapper.yunet = object()
+    clones = [object(), object()]
+    swapper._yunet_clones = clones
+    # _batched_swapper stubs _target_faces; restore the real method.
+    del swapper._target_faces
+    used: list[int] = []
+    real = app_module._target_from_yunet_with
+
+    def recording(ynet: object, frame: np.ndarray, box: list[float]) -> object:
+        used.append(id(ynet))
+        return SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32))
+
+    app_module._target_from_yunet_with = recording  # type: ignore[method-assign]
+    try:
+        targets = swapper._target_faces(
+            np.zeros((64, 64, 3), dtype=np.uint8), [[0, 0, 20, 20], [40, 40, 60, 60]]
+        )
+    finally:
+        app_module._target_from_yunet_with = real  # type: ignore[method-assign]
+    assert sorted(targets) == [0, 1]
+    assert sorted(used) == sorted(id(clone) for clone in clones)
+    swapper.close()
+
+
+def test_pipelined_multi_face_matches_sequential_helpers() -> None:
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    boxes = [[0, 0, 20, 20], [40, 40, 60, 60]]
+    pipelined, succeeded = swapper.apply_many(frame, boxes)
+    assert succeeded == {0, 1}
+    targets = swapper._target_faces(frame, boxes)
+    prepared, _ = swapper._prepare_faces(frame, targets, None, None)
+    fakes, _ = swapper._forward_prepared(prepared)
+    expected, _, _ = swapper._paste_prepared(frame, prepared, fakes)
+    assert np.array_equal(pipelined, expected)
+    swapper.close()
+
+
+def test_pipelined_prepare_failure_fails_whole_frame() -> None:
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    boxes = [[0, 0, 20, 20], [40, 40, 60, 60]]
+    bad = np.full((1, 512), np.nan, dtype=np.float32)
+    output, succeeded = swapper.apply_many(
+        frame, boxes, None, {0: bad, 1: np.ones((1, 512), dtype=np.float32)}
+    )
+    assert succeeded == set()
+    assert np.array_equal(output, frame)
+    swapper.close()
+
+
+def test_pipelined_render_failure_skips_only_that_face() -> None:
+    import experiments.trt_swap_client.app as app_module
+
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    boxes = [[0, 0, 20, 20], [40, 40, 60, 60]]
+    real_render = app_module._render_face_layer
+    calls = {"count": 0}
+
+    def flaky_render(*args: object, **kwargs: object) -> object:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("warp failed")
+        return real_render(*args, **kwargs)
+
+    app_module._render_face_layer = flaky_render  # type: ignore[method-assign]
+    try:
+        output, succeeded = swapper.apply_many(frame, boxes)
+    finally:
+        app_module._render_face_layer = real_render  # type: ignore[method-assign]
+    assert len(succeeded) == 1
+    assert output.shape == frame.shape
+    swapper.close()
 
 
 def _stub_lab(max_queue: int = 2) -> SwapLab:

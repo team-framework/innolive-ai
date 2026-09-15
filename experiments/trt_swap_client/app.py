@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -339,6 +340,9 @@ class TensorRtInSwapperGenerator:
         self._latent_tensor: Any | None = None
         self._output_tensor: Any | None = None
         self._host_output: Any | None = None
+        # The execution context and reusable buffers are shared; worker threads
+        # serialize here so pipelined faces never race on them.
+        self._forward_lock = threading.Lock()
 
     def _validate_static_bindings(self) -> None:
         """Fail early for a stale/wrong engine instead of producing plausible garbage."""
@@ -420,6 +424,10 @@ class TensorRtInSwapperGenerator:
     def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
         import torch
 
+        with self._forward_lock:
+            return self._forward_locked(image, latent, torch)
+
+    def _forward_locked(self, image: np.ndarray, latent: np.ndarray, torch: Any) -> np.ndarray:
         image = np.ascontiguousarray(image, dtype=np.float32)
         latent = np.ascontiguousarray(latent, dtype=np.float32)
         if image.shape != (1, 3, self.metadata.input_size[1], self.metadata.input_size[0]):
@@ -792,6 +800,41 @@ def _build_aligned_mask(
     return aligned_mask
 
 
+def _render_face_layer(
+    fake: np.ndarray,
+    aligned_shape: tuple[int, int],
+    seg_mask_aligned: np.ndarray | None,
+    roi_inverse: np.ndarray,
+    roi_size: tuple[int, int],
+    projected_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp one face to its ROI; thread-safe on per-face buffers only."""
+
+    aligned_mask = _build_aligned_mask(aligned_shape, projected_size, seg_mask_aligned)
+    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
+    return (
+        warped[:, :, :3],
+        warped[:, :, 3:4].astype(np.float32) / 255.0,
+    )
+
+
+def _merge_layer(
+    canvas: np.ndarray,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    fake_warped: np.ndarray,
+    mask: np.ndarray,
+) -> None:
+    """Blend one rendered layer into the canvas ROI (index order on caller)."""
+
+    canvas[top:bottom, left:right] = (
+        mask * fake_warped.astype(np.float32)
+        + (1 - mask) * canvas[top:bottom, left:right].astype(np.float32)
+    ).astype(np.uint8)
+
+
 def _paste_inswapper(
     target_img: np.ndarray,
     aligned: np.ndarray,
@@ -824,21 +867,15 @@ def _paste_inswapper(
     aligned_mask = _build_aligned_mask(
         (aligned.shape[0], aligned.shape[1]), projected_size, seg_mask_aligned
     )
-    warped = cv2.warpAffine(
-        np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0
-    )
+    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
     fake = warped[:, :, :3]
     mask = warped[:, :, 3:4].astype(np.float32) / 255.0
     if destination is None:
         result = target_img.copy()
-        result[top:bottom, left:right] = (
-            mask * fake + (1 - mask) * target_img[top:bottom, left:right].astype(np.float32)
-        ).astype(np.uint8)
+        _merge_layer(result, left, top, right, bottom, fake, mask)
     else:
         result = destination
-        result[top:bottom, left:right] = (
-            mask * fake + (1 - mask) * destination[top:bottom, left:right].astype(np.float32)
-        ).astype(np.uint8)
+        _merge_layer(result, left, top, right, bottom, fake, mask)
     if artifacts is not None:
         warped_full = np.zeros_like(target_img)
         warped_full[top:bottom, left:right] = fake
@@ -989,12 +1026,26 @@ class InSwapper:
             self.generator = self.model
         self.target_aligner = target_aligner
         self.yunet = None
+        self._yunet_clones: list[Any] = []
         if target_aligner == "yunet_roi":
             if not target_yunet.is_file():
                 raise FileNotFoundError(f"YuNet target aligner is missing: {target_yunet}")
             self.yunet = cv2.FaceDetectorYN.create(
                 str(target_yunet), "", (320, 320), score_threshold=0.6, nms_threshold=0.3, top_k=32
             )
+            # One clone per pipeline worker: setInputSize mutates shared state,
+            # so threads must not share a single detector (measured 54→23ms).
+            for _ in range(4):
+                self._yunet_clones.append(
+                    cv2.FaceDetectorYN.create(
+                        str(target_yunet),
+                        "",
+                        (320, 320),
+                        score_threshold=0.6,
+                        nms_threshold=0.3,
+                        top_k=32,
+                    )
+                )
         self.last_alignment_ms = 0.0
         self.last_generator_ms = 0.0
         self.last_generator_timing: dict[str, float] = {}
@@ -1004,6 +1055,7 @@ class InSwapper:
         self.last_batch_size = 0
         self.last_face_count = 0
         self._cached_source_latent: np.ndarray | None = None
+        self._face_pool: ThreadPoolExecutor | None = None
         faces = self.analysis.get(source)
         if not faces:
             raise ValueError("no source face found")
@@ -1025,6 +1077,13 @@ class InSwapper:
         finally:
             self.generator.debug_dumper = debug_dumper
         print(f"InSwapper TensorRT warm-up completed in {(time.perf_counter() - started) * 1_000:.1f}ms")
+
+    def close(self) -> None:
+        """Shut down the shared face-pipeline pool, if one was created."""
+
+        pool, self._face_pool = getattr(self, "_face_pool", None), None
+        if pool is not None:
+            pool.shutdown(wait=True)
 
     def provider_summary(self) -> dict[str, list[str]]:
         analysis: set[str] = set()
@@ -1064,6 +1123,58 @@ class InSwapper:
             hasattr(self.generator, name) for name in ("forward_batch", "forward", "_forward")
         )
 
+    def _prepare_one(
+        self,
+        frame: np.ndarray,
+        index: int,
+        target: Any,
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> PreparedFace:
+        """Prepare a single face; thread-safe across faces of one frame."""
+
+        metadata = self.model
+        aimg, matrix = self._align_target(frame, target.kps, metadata.input_size[0])
+        blob = cv2.dnn.blobFromImage(
+            aimg,
+            1.0 / metadata.input_std,
+            metadata.input_size,
+            (metadata.input_mean,) * 3,
+            swapRB=True,
+        )
+        if latents_by_index is not None and index in latents_by_index:
+            # Track/session mapped latent for a future per-face identity.
+            # Row order matches the prepared face order for batch inference.
+            latent = np.ascontiguousarray(
+                np.asarray(latents_by_index[index], dtype=np.float32).reshape((1, 512))
+            )
+            if not np.isfinite(latent).all():
+                raise ValueError(f"invalid mapped latent for face {index}")
+        else:
+            latent = self._base_latent()
+        seg_mask_aligned: np.ndarray | None = None
+        if mask_polygons_by_index is not None and index in mask_polygons_by_index:
+            try:
+                polygon_frame = np.asarray(mask_polygons_by_index[index], dtype=np.float32).reshape(
+                    (-1, 2)
+                )
+                seg_mask_aligned = _aligned_seg_mask(
+                    _transform_polygon_to_aligned(polygon_frame, matrix)
+                )
+            except (TypeError, ValueError):
+                # A degenerate polygon must not break the swap; the caller
+                # keeps the blur fallback when paste later fails.
+                seg_mask_aligned = None
+        return PreparedFace(
+            index=index,
+            target=target,
+            aimg=aimg,
+            matrix=matrix,
+            blob=np.ascontiguousarray(blob, dtype=np.float32),
+            latent=latent,
+            seg_mask_aligned=seg_mask_aligned,
+        )
+
     def _prepare_faces(
         self,
         frame: np.ndarray,
@@ -1075,54 +1186,26 @@ class InSwapper:
 
         started = time.perf_counter()
         prepared: list[PreparedFace] = []
-        metadata = self.model
         for index in sorted(targets):
             target = targets[index]
             if target is None:
                 continue
-            aimg, matrix = self._align_target(frame, target.kps, metadata.input_size[0])
-            blob = cv2.dnn.blobFromImage(
-                aimg,
-                1.0 / metadata.input_std,
-                metadata.input_size,
-                (metadata.input_mean,) * 3,
-                swapRB=True,
-            )
-            if latents_by_index is not None and index in latents_by_index:
-                # Track/session mapped latent for a future per-face identity.
-                # Row order matches the prepared face order for batch inference.
-                latent = np.ascontiguousarray(
-                    np.asarray(latents_by_index[index], dtype=np.float32).reshape((1, 512))
-                )
-                if not np.isfinite(latent).all():
-                    raise ValueError(f"invalid mapped latent for face {index}")
-            else:
-                latent = self._base_latent()
-            seg_mask_aligned: np.ndarray | None = None
-            if mask_polygons_by_index is not None and index in mask_polygons_by_index:
-                try:
-                    polygon_frame = np.asarray(
-                        mask_polygons_by_index[index], dtype=np.float32
-                    ).reshape((-1, 2))
-                    seg_mask_aligned = _aligned_seg_mask(
-                        _transform_polygon_to_aligned(polygon_frame, matrix)
-                    )
-                except (TypeError, ValueError):
-                    # A degenerate polygon must not break the swap; the caller
-                    # keeps the blur fallback when paste later fails.
-                    seg_mask_aligned = None
             prepared.append(
-                PreparedFace(
-                    index=index,
-                    target=target,
-                    aimg=aimg,
-                    matrix=matrix,
-                    blob=np.ascontiguousarray(blob, dtype=np.float32),
-                    latent=latent,
-                    seg_mask_aligned=seg_mask_aligned,
-                )
+                self._prepare_one(frame, index, target, mask_polygons_by_index, latents_by_index)
             )
         return prepared, (time.perf_counter() - started) * 1_000
+
+    def _forward_one(self, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+        """Run one face through whichever forward interface the generator has."""
+
+        generator = self.generator
+        if hasattr(generator, "forward_batch"):
+            return np.asarray(generator.forward_batch(blob, latent))
+        if hasattr(generator, "forward"):
+            return np.array(generator.forward(blob, latent), copy=True)
+        if hasattr(generator, "_forward"):
+            return np.array(generator._forward(blob, latent), copy=True)
+        raise RuntimeError("generator does not support separated forward")
 
     def _forward_prepared(self, prepared: list[PreparedFace]) -> tuple[list[np.ndarray], float]:
         """Run inference for prepared faces while preserving input/latent order."""
@@ -1225,6 +1308,8 @@ class InSwapper:
             return frame, set()
         if not self._supports_separated_forward():
             return self._apply_many_legacy(frame, targets)
+        if len(targets) > 1:
+            return self._apply_many_pipelined(frame, targets, polygons_by_index, latents_by_index)
         try:
             prepared, prepare_ms = self._prepare_faces(
                 frame, targets, polygons_by_index, latents_by_index
@@ -1274,6 +1359,140 @@ class InSwapper:
         }
         return output, succeeded
 
+    def _get_face_pool(self) -> ThreadPoolExecutor:
+        """Shared face-pipeline pool (reused across frames and sessions)."""
+
+        pool = getattr(self, "_face_pool", None)
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-face")
+            self._face_pool = pool
+        return pool
+
+    def _apply_many_pipelined(
+        self,
+        frame: np.ndarray,
+        targets: dict[int, Any],
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> tuple[np.ndarray, set[int]]:
+        """Run faces through prepare/forward/render concurrently, merge in order.
+
+        Each worker owns one face end to end.  Forwards serialize on the shared
+        TRT context while CPU stages overlap them, so the GPU never idles
+        waiting for another face's CPU work.  The main thread merges rendered
+        layers in index order with the exact sequential blend math, so
+        overlapping faces resolve identically to sequential pastes.
+        """
+
+        indices = sorted(targets)
+        self.last_batch_size = len([index for index in indices if targets[index] is not None])
+        pool = self._get_face_pool()
+        started = time.perf_counter()
+
+        def _run(
+            index: int,
+        ) -> tuple[str, Any]:
+            target = targets[index]
+            if target is None:
+                return ("skip", None)
+            try:
+                prepared_at = time.perf_counter()
+                item = self._prepare_one(
+                    frame, index, target, mask_polygons_by_index, latents_by_index
+                )
+                prepare_ms = (time.perf_counter() - prepared_at) * 1_000
+            except Exception:
+                return ("fatal", None)
+            try:
+                forwarded_at = time.perf_counter()
+                prediction = self._forward_one(item.blob, item.latent)
+                forward_ms = (time.perf_counter() - forwarded_at) * 1_000
+                bgr_fake = _prediction_to_bgr(prediction)
+            except Exception:
+                return ("fatal", None)
+            try:
+                rendered_at = time.perf_counter()
+                left, top, right, bottom, roi_inverse, roi_size, minimum, maximum = _paste_roi(
+                    (frame.shape[0], frame.shape[1]),
+                    (item.aimg.shape[0], item.aimg.shape[1]),
+                    item.matrix,
+                )
+                projected = max(1.0, float(np.sqrt(np.prod(maximum - minimum))))
+                fake_warped, mask = _render_face_layer(
+                    bgr_fake,
+                    (item.aimg.shape[0], item.aimg.shape[1]),
+                    item.seg_mask_aligned,
+                    roi_inverse,
+                    roi_size,
+                    projected,
+                )
+                render_ms = (time.perf_counter() - rendered_at) * 1_000
+            except Exception:
+                return ("skip", None)
+            return (
+                "ok",
+                (
+                    index,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    fake_warped,
+                    mask,
+                    prepare_ms,
+                    forward_ms,
+                    render_ms,
+                ),
+            )
+
+        try:
+            outcomes = list(pool.map(_run, indices))
+        except Exception:
+            self.last_prepare_ms = 0.0
+            self.last_forward_ms = 0.0
+            self.last_paste_ms = 0.0
+            self.last_generator_ms = 0.0
+            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
+            self.last_batch_size = 0
+            return frame, set()
+        if any(status == "fatal" for status, _ in outcomes):
+            self.last_prepare_ms = 0.0
+            self.last_forward_ms = 0.0
+            self.last_paste_ms = 0.0
+            self.last_generator_ms = 0.0
+            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
+            self.last_batch_size = 0
+            return frame, set()
+        prepare_ms = sum(outcome[1][7] for outcome in outcomes if outcome[0] == "ok")
+        forward_ms = sum(outcome[1][8] for outcome in outcomes if outcome[0] == "ok")
+        canvas = frame.copy()
+        succeeded: set[int] = set()
+        merge_started = time.perf_counter()
+        for _, payload in sorted(
+            (outcome for outcome in outcomes if outcome[0] == "ok"),
+            key=lambda entry: entry[1][0],
+        ):
+            index, left, top, right, bottom, fake_warped, mask, _, _, render_ms = payload
+            try:
+                _merge_layer(canvas, left, top, right, bottom, fake_warped, mask)
+            except Exception:
+                continue
+            succeeded.add(index)
+        paste_ms = (time.perf_counter() - merge_started) * 1_000 + sum(
+            outcome[1][9] for outcome in outcomes if outcome[0] == "ok"
+        )
+        wall_ms = (time.perf_counter() - started) * 1_000
+        self.last_prepare_ms = prepare_ms
+        self.last_forward_ms = forward_ms
+        self.last_paste_ms = paste_ms
+        self.last_generator_ms = wall_ms
+        self.last_generator_timing = {
+            "prepare": round(prepare_ms, 2),
+            "forward": round(forward_ms, 2),
+            "paste": round(paste_ms, 2),
+        }
+        return canvas, succeeded
+
     def _apply_many_legacy(
         self, frame: np.ndarray, targets: dict[int, Any]
     ) -> tuple[np.ndarray, set[int]]:
@@ -1316,10 +1535,13 @@ class InSwapper:
     def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
         targets: dict[int, Any] = {}
         if self.yunet is not None:
-            for index, box in enumerate(boxes):
-                target = self._target_from_yunet(frame, box)
-                if target is not None:
-                    targets[index] = target
+            if len(boxes) > 1 and len(getattr(self, "_yunet_clones", [])) >= len(boxes):
+                targets = self._targets_from_yunet_parallel(frame, boxes)
+            else:
+                for index, box in enumerate(boxes):
+                    target = self._target_from_yunet(frame, box)
+                    if target is not None:
+                        targets[index] = target
         missing = [index for index in range(len(boxes)) if index not in targets]
         if not missing:
             return targets
@@ -1338,46 +1560,73 @@ class InSwapper:
             targets[index] = target
         return targets
 
+    def _targets_from_yunet_parallel(
+        self, frame: np.ndarray, boxes: list[list[float]]
+    ) -> dict[int, Any]:
+        """Run YuNet landmark detection on clones (setInputSize is not thread-safe)."""
+
+        clones = getattr(self, "_yunet_clones", [])
+        pool = self._get_face_pool()
+        targets: dict[int, Any] = {}
+
+        def _detect(pair: tuple[int, Any]) -> tuple[int, Any | None]:
+            index, box = pair
+            try:
+                return index, _target_from_yunet_with(clones[index % len(clones)], frame, box)
+            except Exception:
+                return index, None
+
+        for index, target in pool.map(_detect, enumerate(boxes)):
+            if target is not None:
+                targets[index] = target
+        return targets
+
     def _target_from_yunet(self, frame: np.ndarray, box: list[float]) -> Any | None:
         if self.yunet is None:
             return None
-        x1, y1, x2, y2 = (float(value) for value in box)
-        padding_x = (x2 - x1) * 0.35
-        padding_y = (y2 - y1) * 0.35
-        left = max(0, int(np.floor(x1 - padding_x)))
-        top = max(0, int(np.floor(y1 - padding_y)))
-        right = min(frame.shape[1], int(np.ceil(x2 + padding_x)))
-        bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
-        if right - left < 32 or bottom - top < 32:
-            return None
-        roi = frame[top:bottom, left:right]
-        try:
-            self.yunet.setInputSize((roi.shape[1], roi.shape[0]))
-            _, detections = self.yunet.detect(roi)
-        except cv2.error:
-            return None
-        if detections is None or not len(detections):
-            return None
-        candidate = max(
-            detections,
-            key=lambda row: _iou(
-                [row[0] + left, row[1] + top, row[0] + row[2] + left, row[1] + row[3] + top], box
-            ),
-        )
-        candidate_box = [
-            float(candidate[0] + left),
-            float(candidate[1] + top),
-            float(candidate[0] + candidate[2] + left),
-            float(candidate[1] + candidate[3] + top),
-        ]
-        if _iou(candidate_box, box) < 0.2:
-            return None
-        from insightface.app.common import Face
+        return _target_from_yunet_with(self.yunet, frame, box)
 
-        landmarks = np.asarray(candidate[5:15], dtype=np.float32).reshape((5, 2))
-        landmarks[:, 0] += left
-        landmarks[:, 1] += top
-        return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
+
+def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> Any | None:
+    """YuNet five-point landmark path for one detector box (clone-safe)."""
+
+    x1, y1, x2, y2 = (float(value) for value in box)
+    padding_x = (x2 - x1) * 0.35
+    padding_y = (y2 - y1) * 0.35
+    left = max(0, int(np.floor(x1 - padding_x)))
+    top = max(0, int(np.floor(y1 - padding_y)))
+    right = min(frame.shape[1], int(np.ceil(x2 + padding_x)))
+    bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
+    if right - left < 32 or bottom - top < 32:
+        return None
+    roi = frame[top:bottom, left:right]
+    try:
+        ynet.setInputSize((roi.shape[1], roi.shape[0]))
+        _, detections = ynet.detect(roi)
+    except cv2.error:
+        return None
+    if detections is None or not len(detections):
+        return None
+    candidate = max(
+        detections,
+        key=lambda row: _iou(
+            [row[0] + left, row[1] + top, row[0] + row[2] + left, row[1] + row[3] + top], box
+        ),
+    )
+    candidate_box = [
+        float(candidate[0] + left),
+        float(candidate[1] + top),
+        float(candidate[0] + candidate[2] + left),
+        float(candidate[1] + candidate[3] + top),
+    ]
+    if _iou(candidate_box, box) < 0.2:
+        return None
+    from insightface.app.common import Face
+
+    landmarks = np.asarray(candidate[5:15], dtype=np.float32).reshape((5, 2))
+    landmarks[:, 0] += left
+    landmarks[:, 1] += top
+    return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
 
 
 def _find_pending_job_index(pending: list[Any], stream: Any) -> int | None:
@@ -1456,6 +1705,7 @@ class SwapLab:
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
         await asyncio.to_thread(self.adaface.close)
+        await asyncio.to_thread(self.swapper.close)
 
     def create_stream(self, session_id: str) -> StreamState:
         self.sessions.get_or_create(session_id)

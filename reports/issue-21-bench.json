@@ -526,5 +526,72 @@
         "gpu_util_mean": 18.3
       }
     }
+  },
+  "pipeline_mixed": {
+    "configs": {
+      "faces1xSessions1": {
+        "frames_completed": 40,
+        "frames_dropped": 0,
+        "wall_s": 1.252,
+        "fps": 31.94,
+        "face_swaps": 40,
+        "swaps_per_sec": 31.94,
+        "faces_per_frame_mean": 1.0,
+        "latency_p50_ms": 31.07511501002591,
+        "latency_p95_ms": 32.16695139853982,
+        "detector_batch_ms_mean": 3.24,
+        "swap_ms_mean": 26.87,
+        "swap_prepare_ms_mean": 0.86,
+        "swap_forward_ms_mean": 5.59,
+        "swap_paste_ms_mean": 10.24,
+        "swap_alignment_ms_mean": 10.14,
+        "swap_generator_ms_mean": 16.69,
+        "yolo_batch_mean": 1.0,
+        "swap_batch_size_mean": 1.0,
+        "gpu_util_mean": 19.4
+      },
+      "faces2xSessions1": {
+        "frames_completed": 40,
+        "frames_dropped": 0,
+        "wall_s": 1.715,
+        "fps": 23.32,
+        "face_swaps": 80,
+        "swaps_per_sec": 46.64,
+        "faces_per_frame_mean": 2.0,
+        "latency_p50_ms": 42.4706689955201,
+        "latency_p95_ms": 44.95820225274656,
+        "detector_batch_ms_mean": 3.38,
+        "swap_ms_mean": 37.91,
+        "swap_prepare_ms_mean": 1.68,
+        "swap_forward_ms_mean": 16.47,
+        "swap_paste_ms_mean": 16.89,
+        "swap_alignment_ms_mean": 10.32,
+        "swap_generator_ms_mean": 27.56,
+        "yolo_batch_mean": 1.0,
+        "swap_batch_size_mean": 2.0,
+        "gpu_util_mean": 28.1
+      },
+      "faces4xSessions1": {
+        "frames_completed": 40,
+        "frames_dropped": 0,
+        "wall_s": 2.12,
+        "fps": 18.86,
+        "face_swaps": 160,
+        "swaps_per_sec": 75.46,
+        "faces_per_frame_mean": 4.0,
+        "latency_p50_ms": 52.584906996344216,
+        "latency_p95_ms": 55.622062760812696,
+        "detector_batch_ms_mean": 3.37,
+        "swap_ms_mean": 47.54,
+        "swap_prepare_ms_mean": 4.43,
+        "swap_forward_ms_mean": 51.07,
+        "swap_paste_ms_mean": 23.34,
+        "swap_alignment_ms_mean": 5.46,
+        "swap_generator_ms_mean": 42.03,
+        "yolo_batch_mean": 1.0,
+        "swap_batch_size_mean": 4.0,
+        "gpu_util_mean": 34.6
+      }
+    }
   }
 }

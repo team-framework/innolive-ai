@@ -137,7 +137,29 @@ mixed 엔진 e2e (stock-opt 대비):
 베이스(`9aed52b`) 대비 1x1은 **23.43 → 30.84 (+31%)** 로 30fps선을 넘었다.
 남은 지배 병목은 yunet(CPU 10ms) + paste(CPU 11ms)다 (Phase 3).
 
-## 7. 결론
+## 7. 얼굴 파이프라인 (Phase 3a 결과)
+
+얼굴별 prepare/forward/render를 워커풀(4 스레드)로 겹치고,
+forward만 공유 TRT 컨텍스트 락으로 직렬화했다.
+CPU 단계가 GPU를 가리지 않아 GPU 유휴가 사라진다.
+머지는 인덱스 순서로 기존 blend 수식 그대로라서 순차 실행과 비트 동일함을
+e2e로 확인했다 (1/2얼굴 maxdiff 0). yunet도 스레드별 클론으로 병렬화했다
+(공유 객체의 setInputSize 레이스 회피, 실측 54→23ms).
+1얼굴 경로는 기존 순차 코드를 그대로 써서 건드리지 않았다.
+
+mixed 엔진 + 파이프라인 (순차-mixed 대비):
+
+| config | FPS | p50 (ms) |
+| --- | --- | --- |
+| 1face x 1sess | 30.84 → 31.94 (동등, 파이프 미사용) | 32.3 → 31.1 |
+| 2face x 1sess | 18.49 → **23.32 (+26%)** | 53.9 → 42.5 |
+| 4face x 1sess | 14.71 → **18.86 (+28%)** | 67.8 → 52.6 |
+
+베이스 대비 2얼굴 +67%, 4얼굴 +90%다.
+타이밍 합계(`swap_forward_ms` 등)는 락 대기를 포함하므로 wall보다 크게
+보일 수 있다. `swap_generator_ms`는 wall 기준이라 FPS와 일치한다.
+
+## 8. 결론
 
 - 이슈의 기능 범위(YOLO mask 합성, prepare/forward/paste 분리 batch 구조,
   bounded latest-frame, latent 매핑 준비, timing/FPS 분리)를 구현했다.
@@ -145,4 +167,7 @@ mixed 엔진 e2e (stock-opt 대비):
   화질·지연 회귀는 없다 (1얼굴 비트 동일, p95 안정).
 - 혼합 정밀도(mixed19) 적용 후 1x1 **30.84fps로 30fps선 돌파**,
   베이스 대비 +31%. 멀티세션 합계도 26→33/s로 상승했다.
-- 남은 지배 병목은 yunet(CPU 10ms) + paste(CPU 11ms)다 (Phase 3).
+- 얼굴 파이프라인 적용 후 2얼굴 23.3fps, 4얼굴 18.9fps
+  (베이스 대비 +67%/+90%). 순차 실행과 비트 동일함을 e2e로 확인했다.
+- 남은 과제: 세션 간 compose 병렬화 (합계 처리량), 적응형 레이트,
+  듀얼 GPU 분할 (계획 문서 §4).
