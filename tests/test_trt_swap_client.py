@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from experiments.trt_swap_client.app import (
     InSwapper,
     Settings,
+    _aligned_seg_mask,
     _blur_objects,
+    _find_pending_job_index,
     _iou,
     _mapped_latent,
     _objects,
@@ -18,6 +21,7 @@ from experiments.trt_swap_client.app import (
     _prediction_to_bgr,
     _require_current_swapper_engine,
     _swap_providers,
+    _transform_polygon_to_aligned,
 )
 from experiments.trt_swap_client.video_io import VideoSpec
 from service.mosaic import (
@@ -215,3 +219,150 @@ def test_ort_reference_does_not_apply_a_second_input_normalization() -> None:
     blob = np.full((1, 3, 128, 128), 0.5, dtype=np.float32)
     latent = np.ones((1, 512), dtype=np.float32)
     assert np.array_equal(_ort_raw_prediction(metadata, blob, latent), blob)
+
+
+def test_transform_polygon_to_aligned_uses_affine_matrix() -> None:
+    polygon = np.asarray([[10.0, 20.0], [30.0, 20.0], [30.0, 40.0]], dtype=np.float32)
+    identity = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    assert np.allclose(_transform_polygon_to_aligned(polygon, identity), polygon)
+    shifted = np.asarray([[1.0, 0.0, 5.0], [0.0, 1.0, -3.0]], dtype=np.float32)
+    converted = _transform_polygon_to_aligned(polygon, shifted)
+    assert np.allclose(converted, polygon + np.asarray([5.0, -3.0], dtype=np.float32))
+
+
+def test_aligned_seg_mask_keeps_interior_and_feathers_boundary() -> None:
+    polygon = np.asarray([[10.0, 10.0], [118.0, 10.0], [118.0, 118.0], [10.0, 118.0]])
+    mask = _aligned_seg_mask(polygon)
+    assert mask is not None
+    assert mask.shape == (128, 128)
+    assert mask.dtype == np.float32
+    assert float(mask[64, 64]) == 1.0
+    assert float(mask[0, 0]) == 0.0
+    edge = mask[10, 64]
+    assert 0.0 <= float(edge) <= 1.0
+    assert _aligned_seg_mask(np.asarray([[0.0, 0.0], [1.0, 1.0]])) is None
+
+
+def test_paste_inswapper_with_yolo_mask_preserves_background_outside() -> None:
+    target = np.full((64, 64, 3), 100, dtype=np.uint8)
+    aligned = np.full((16, 16, 3), 200, dtype=np.uint8)
+    fake = np.full((16, 16, 3), 250, dtype=np.uint8)
+    matrix = np.asarray(((1, 0, -24), (0, 1, -24)), dtype=np.float32)
+    plain = _paste_inswapper(target, aligned, fake, matrix)
+    assert plain[30, 30].mean() > 150
+    seg = np.zeros((16, 16), dtype=np.float32)
+    seg[:, :8] = 1.0
+    constrained = _paste_inswapper(target, aligned, fake, matrix, seg_mask_aligned=seg)
+    # Left half of the warped ROI follows the swap, right half stays original.
+    assert constrained[30, 27].mean() > 150
+    assert np.array_equal(constrained[30, 37], np.asarray([100, 100, 100], dtype=np.uint8))
+
+
+def _batched_swapper() -> tuple[InSwapper, Any]:
+    from types import SimpleNamespace
+
+    class Face:
+        def __init__(self, bbox: list[float]) -> None:
+            self.bbox = np.asarray(bbox, dtype=np.float32)
+            self.kps = np.asarray([[5, 5], [15, 5], [10, 10], [5, 15], [15, 15]], dtype=np.float32)
+
+    class BatchGenerator:
+        def __init__(self) -> None:
+            self.seen_blobs: list[np.ndarray] = []
+            self.seen_latents: list[np.ndarray] = []
+
+        def forward_batch(self, blobs: np.ndarray, latents: np.ndarray) -> np.ndarray:
+            assert blobs.shape[0] == latents.shape[0]
+            self.seen_blobs.append(blobs.copy())
+            self.seen_latents.append(latents.copy())
+            count = blobs.shape[0]
+            predictions = np.zeros((count, 3, 128, 128), dtype=np.float32)
+            for row in range(count):
+                predictions[row] = 0.1 * (row + 1) + 0.01 * float(latents[row, 0])
+            return predictions
+
+    swapper = InSwapper.__new__(InSwapper)
+    swapper.analysis = SimpleNamespace(get=lambda image: [])
+    swapper.model = SimpleNamespace(
+        emap=np.eye(512, dtype=np.float32),
+        input_size=(128, 128),
+        input_std=255.0,
+        input_mean=0.0,
+    )
+    generator = BatchGenerator()
+    swapper.generator = generator
+    swapper.source_face = SimpleNamespace(
+        normed_embedding=np.ones(512, dtype=np.float32) / np.sqrt(512.0)
+    )
+    swapper.yunet = None
+    swapper._cached_source_latent = None
+
+    def _fake_align(frame: np.ndarray, kps: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.full((128, 128, 3), 100, dtype=np.uint8),
+            np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        )
+
+    swapper._align_target = _fake_align  # type: ignore[method-assign]
+    faces = [Face([0, 0, 20, 20]), Face([40, 40, 60, 60])]
+
+    def _fake_targets(frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Face]:
+        return {index: faces[index] for index in range(len(boxes))}
+
+    swapper._target_faces = _fake_targets  # type: ignore[method-assign]
+    return swapper, generator
+
+
+def test_apply_many_batches_faces_with_order_and_timing() -> None:
+    swapper, generator = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    output, succeeded = swapper.apply_many(
+        frame,
+        [[0, 0, 20, 20], [40, 40, 60, 60]],
+        [[[0, 0], [63, 0], [63, 63], [0, 63]]] * 2,
+    )
+    assert succeeded == {0, 1}
+    assert output.shape == frame.shape
+    assert len(generator.seen_blobs) == 1
+    assert generator.seen_blobs[0].shape[0] == 2
+    assert generator.seen_latents[0].shape == (2, 512)
+    # Both rows share the single source latent in order.
+    assert np.array_equal(generator.seen_latents[0][0], generator.seen_latents[0][1])
+    assert swapper.last_batch_size == 2
+    assert swapper.last_face_count == 2
+    assert set(swapper.last_generator_timing) == {"prepare", "forward", "paste"}
+    assert swapper.last_generator_ms == (
+        swapper.last_prepare_ms + swapper.last_forward_ms + swapper.last_paste_ms
+    )
+
+
+def test_apply_many_per_face_latent_mapping_preserves_order() -> None:
+    swapper, generator = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    latent_a = np.full((1, 512), 0.25, dtype=np.float32)
+    latent_b = np.full((1, 512), 0.75, dtype=np.float32)
+    output, succeeded = swapper.apply_many(
+        frame,
+        [[0, 0, 20, 20], [40, 40, 60, 60]],
+        None,
+        {0: latent_a, 1: latent_b},
+    )
+    assert succeeded == {0, 1}
+    assert output.shape == frame.shape
+    seen = generator.seen_latents[0]
+    assert np.allclose(seen[0], latent_a)
+    assert np.allclose(seen[1], latent_b)
+
+
+def test_find_pending_job_index_prefers_newest_same_stream() -> None:
+    from types import SimpleNamespace
+
+    stream_a, stream_b = object(), object()
+    pending = [
+        SimpleNamespace(stream=stream_a),
+        SimpleNamespace(stream=stream_b),
+        SimpleNamespace(stream=stream_a),
+    ]
+    assert _find_pending_job_index(pending, stream_a) == 2
+    assert _find_pending_job_index(pending, stream_b) == 1
+    assert _find_pending_job_index(pending, object()) is None
