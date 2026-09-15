@@ -849,3 +849,85 @@ def test_objects_degenerate_mask_measures_zero_area_but_keeps_box_for_blur() -> 
     )
     assert objects[0]["mask_area_px"] == 0.0
     assert len(objects[0]["mask_polygon"]) == 4
+
+
+def test_paced_output_timestamp_never_sprints_or_drifts() -> None:
+    from experiments.trt_swap_client.app import WEBRTC_MAX_BEHIND_S, _paced_output_timestamp
+
+    step = 3000
+    # First frame anchors the clock.
+    start, timestamp, wait = _paced_output_timestamp(None, None, 1000.0)
+    assert (start, timestamp, wait) == (1000.0, 0, 0.0)
+    # Steady production sleeps the remainder of the period.
+    start, timestamp, wait = _paced_output_timestamp(1000.0, 0, 1000.0)
+    assert timestamp == step
+    assert 0.03 < wait < 0.034
+    # Slightly behind: no resync, emit immediately, pts still advances.
+    start, timestamp, wait = _paced_output_timestamp(1000.0, 0, 1000.0 + 0.05)
+    assert timestamp == step
+    assert wait == 0.0
+    assert start == 1000.0
+    # Far behind: resync anchor instead of sprinting timestamps ahead.
+    start, timestamp, wait = _paced_output_timestamp(1000.0, 0, 1000.0 + 5.0)
+    assert timestamp == step
+    assert wait == 0.0
+    assert abs(start - (1005.0 - step / 90000)) < 1e-6
+    assert WEBRTC_MAX_BEHIND_S == 0.10
+
+
+def test_webrtc_track_emits_only_fresh_frames_when_behind() -> None:
+    import asyncio
+    import time
+
+    import numpy as np
+    from av import VideoFrame
+
+    from experiments.trt_swap_client.app import SwapVideoTrack
+
+    class FakeSource:
+        kind = "video"
+        readyState = "live"
+
+        def __init__(self) -> None:
+            self.counter = 0
+
+        async def recv(self) -> VideoFrame:
+            await asyncio.sleep(0.033)
+            self.counter += 1
+            return VideoFrame.from_ndarray(
+                np.full((64, 64, 3), self.counter % 200 + 10, dtype=np.uint8),
+                format="bgr24",
+            )
+
+    class SlowLab:
+        async def submit(
+            self, image: np.ndarray, stream: object
+        ) -> tuple[np.ndarray, dict[str, object]]:
+            await asyncio.sleep(0.05)
+            return np.ascontiguousarray(image), {}
+
+    async def scenario() -> None:
+        track = SwapVideoTrack(FakeSource(), SlowLab(), object())
+        try:
+            markers: list[int] = []
+            pts_list: list[int] = []
+            gaps: list[float] = []
+            previous = time.perf_counter()
+            for _ in range(8):
+                out = await track.recv()
+                now = time.perf_counter()
+                gaps.append(now - previous)
+                previous = now
+                markers.append(int(out.to_ndarray(format="bgr24").mean()))
+                pts_list.append(out.pts)
+        finally:
+            track.stop()
+        # Every output is a distinct fresh completion: no stale dupes, pts steps.
+        assert len(set(markers)) == len(markers)
+        assert markers == sorted(markers)
+        assert pts_list == [3000 * index for index in range(8)]
+        # No spin: each output waited for a real 50ms swap, latency bounded.
+        assert min(gaps[1:]) > 0.025
+        assert sum(gaps) < 8 * (0.05 + 0.033) + 0.5
+
+    asyncio.run(scenario())

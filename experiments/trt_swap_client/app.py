@@ -27,6 +27,7 @@ from aiortc import (
     RTCSessionDescription,
     VideoStreamTrack,
 )
+from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_PTIME, VIDEO_TIME_BASE
 from av import VideoFrame
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -115,6 +116,36 @@ class StreamState:
     sequence: int = 0
 
 
+# Maximum sender-clock debt before the WebRTC pacer resyncs to wall time.
+# Without this, a service time above the 33ms camera period makes next_timestamp
+# wait negative forever: recv() spins emitting stale frames in bursts with
+# timestamps sprinting ahead of the wall clock (jitter growth, fps collapse).
+WEBRTC_MAX_BEHIND_S = 0.10
+
+
+def _paced_output_timestamp(
+    start: float | None, timestamp: int | None, now: float
+) -> tuple[float, int, float]:
+    """Steady RTP pacing that never emits stale bursts and never drifts.
+
+    Returns (start, timestamp, wait_s).  Each call advances one frame
+    (VIDEO_PTIME).  When production falls behind the wall clock by more than
+    ``WEBRTC_MAX_BEHIND_S``, the anchor shifts forward instead of sprinting
+    timestamps ahead: pts stays monotonic, latency stays bounded, and the
+    receiver sees a steady clock with latest-frame content.
+    """
+
+    step = int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
+    if start is None or timestamp is None:
+        return now, 0, 0.0
+    timestamp += step
+    due = start + timestamp / VIDEO_CLOCK_RATE
+    if due < now - WEBRTC_MAX_BEHIND_S:
+        start = now - timestamp / VIDEO_CLOCK_RATE
+        due = now
+    return start, timestamp, max(0.0, due - now)
+
+
 class SwapVideoTrack(VideoStreamTrack):
     """Latest-frame WebRTC transformer with independent input, work, and output clocks."""
 
@@ -137,7 +168,6 @@ class SwapVideoTrack(VideoStreamTrack):
         if self._reader is None:
             self._reader = asyncio.create_task(self._read_latest(), name="webrtc-video-reader")
             self._worker = asyncio.create_task(self._process_latest(), name="webrtc-video-worker")
-
     async def _read_latest(self) -> None:
         try:
             while self.readyState == "live":
@@ -178,17 +208,23 @@ class SwapVideoTrack(VideoStreamTrack):
 
     async def recv(self) -> VideoFrame:
         self._start_workers()
-        # The first output waits for a completed privacy-safe swap. Afterwards
-        # next_timestamp keeps RTP delivery paced even while a newer frame is
-        # being processed in parallel.
+        # Consume exactly one completed swap per output frame: without the
+        # clear, recv() would free-run on a stale frame once behind schedule.
         await self._output_ready.wait()
-        pts, time_base = await self.next_timestamp()
+        self._output_ready.clear()
+        self._pace_start, self._pace_timestamp, wait_s = _paced_output_timestamp(
+            getattr(self, "_pace_start", None),
+            getattr(self, "_pace_timestamp", None),
+            time.time(),
+        )
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
         output = self._latest_output
         if output is None:
             raise RuntimeError("WebRTC swap output was not initialized")
         result = VideoFrame.from_ndarray(output, format="bgr24")
-        result.pts = pts
-        result.time_base = time_base
+        result.pts = self._pace_timestamp
+        result.time_base = VIDEO_TIME_BASE
         return result
 
     def stop(self) -> None:
