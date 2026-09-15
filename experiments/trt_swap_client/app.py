@@ -272,7 +272,12 @@ def _require_current_swapper_engine(engine_path: Path, model_path: Path) -> None
         raise RuntimeError(f"invalid TensorRT swap engine manifest: {manifest_path}") from error
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
     if manifest.get("model_sha256") != model_hash:
-        raise RuntimeError("TensorRT swap engine was built from a different ONNX model; rebuild it")
+        # Mixed-precision engines are built from a surgically converted ONNX;
+        # accept them only with recorded provenance to the official model.
+        if manifest.get("base_model_sha256") != model_hash or "mixed_recipe" not in manifest:
+            raise RuntimeError(
+                "TensorRT swap engine was built from a different ONNX model; rebuild it"
+            )
     if manifest.get("preserve_onnx_fp32_io") is not True:
         raise RuntimeError(
             "legacy TensorRT swap engine converted ONNX I/O to FP16; rebuild it with the current exporter"

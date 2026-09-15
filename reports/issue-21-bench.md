@@ -98,12 +98,51 @@ alignment(yunet, CPU) 10.1 / prepare 0.8 / forward(TRT) 13.0 / paste 10.8
   render FPS와 합성 완료 FPS를 분리했다 (`render_frames`,
   `swap_completed_frames`, `swapped_faces_total`, p95 포함).
 
-## 6. 결론
+## 6. 혼합 정밀도 엔진 (Phase 2 결과)
+
+TRT 11.1에는 FP16 빌더 플래그와 레이어별 정밀도 API가 없어서
+(`BuilderFlag` 목록·`ILayer` 확인), ONNX 그래프 수술로 접근했다.
+forward의 83%를 차지하는 Conv 16개 포함 19개 Conv의 데이터·가중치에만
+FP16 Cast를 삽입하고 Resize/shape/AdaIN 통계 경로는 untouched다
+(`experiments/trt_swap_client/build_mixed_onnx.py`).
+19개 Conv FP16, 앞단·헤드 FP32 유지 같은 변형을 sweeep했고,
+실 얼굴 blob 기준 MAE가 가장 좋은 전체 변환을 채택했다.
+
+| 엔진 | forward/face | 실얼굴 MAE | 비고 |
+| --- | --- | --- | --- |
+| stock FP32 | 12.9ms | 7.9e-4 (ORT 대비) | 기준 |
+| mixed19 (19 Conv FP16) | **5.6ms (2.3배)** | 1.4e-3 | **채택** |
+| mixed17 (head FP32) | 7.6ms | 1.2e-3 | 오차 개선 미미, 기각 |
+| mixed12 (front+head FP32) | 8.9ms | 1.0e-3 | 비용 대비 효과 없음, 기각 |
+
+- 랜덤 노이즈 입력 기준 MAE(1.2e-2)는 실 얼굴(1.4e-3)보다 크게 나온다.
+  게이트는 실 데이터 + 육안으로 판정했다. 디코딩 PNG 육안 비교 통과,
+  mask on/off 패턴 동일(max 158/mean 6.4), 작은 얼굴 blur fallback 정상.
+- 엔진 provenance는 manifest에 기록한다
+  (`base_model_sha256` + `mixed_recipe`, `--mixed-base`).
+  런타임 게이트가 provenance 없는 엔진은 계속 거부한다.
+- 엔진 파일 자체는 Git에 넣지 않고 호스트에서 빌드한다
+  (`inswapper_128_trt11_mixed.engine`).
+
+mixed 엔진 e2e (stock-opt 대비):
+
+| config | FPS | p50 (ms) |
+| --- | --- | --- |
+| 1face x 1sess | 25.55 → **30.84 (+21%)** | 39.1 → 32.3 |
+| 2face x 1sess | 14.45 → **18.49 (+28%)** | 69.0 → 53.9 |
+| 4face x 1sess | 10.24 → **14.71 (+44%)** | 97.6 → 67.8 |
+| 1face x 4sess (합계) | 26.16 → **33.18** | 152.7 → 120.2 |
+| 1face x 10sess (합계) | 25.84 → **32.85** | 313.8 → 260.9 |
+
+베이스(`9aed52b`) 대비 1x1은 **23.43 → 30.84 (+31%)** 로 30fps선을 넘었다.
+남은 지배 병목은 yunet(CPU 10ms) + paste(CPU 11ms)다 (Phase 3).
+
+## 7. 결론
 
 - 이슈의 기능 범위(YOLO mask 합성, prepare/forward/paste 분리 batch 구조,
   bounded latest-frame, latent 매핑 준비, timing/FPS 분리)를 구현했다.
 - 동일 하네스에서 베이스 대비 단일 세션 +3~9%, 다중 세션 동률을 달성했고,
   화질·지연 회귀는 없다 (1얼굴 비트 동일, p95 안정).
-- forward(TRT, 얼굴당 13ms)와 yunet(CPU, 얼굴당 ~10ms)이 지배적 병목으로
-  남았다. 둘 다 이슈 범위를 벗어나는 변경(엔진 정밀도·랜드마크 경로)이
-  필요해서 건드리지 않았다.
+- 혼합 정밀도(mixed19) 적용 후 1x1 **30.84fps로 30fps선 돌파**,
+  베이스 대비 +31%. 멀티세션 합계도 26→33/s로 상승했다.
+- 남은 지배 병목은 yunet(CPU 10ms) + paste(CPU 11ms)다 (Phase 3).

@@ -48,9 +48,11 @@ ONNX FP32 대비 MAE ~1e-3, YOLO mask 내외 보존·fallback 육안 확인.
 - **Phase 1 — 무리스크 (1~2일)**: 엔진 rebuild 튜닝
   (optimization level 최대, channel-last 허용, timing cache,
   workspace 확대) + CUDA graphs 캡처. 기대 10~30%.
-- **Phase 2 — 혼합 정밀도 (3~5일)**: 레이어별 오차 측정 후 깨지는
-  상위 레이어만 FP32 고정, 나머지 FP16. 기대 forward 13→7ms.
-  전체 FP16 탈락 판정과 혼동하지 않는다 (리포트 4절).
+- **Phase 2 — 혼합 정밀도 (완료)**: TRT 11.1에 FP16 플래그·레이어 API가 없어
+  ONNX 그래프 수술로 접근했다 (`build_mixed_onnx.py`: 무거운 Conv 19개에만
+  FP16 Cast, Resize/shape/AdaIN 경로 untouched). forward 12.9→5.6ms,
+  실얼굴 MAE 1.4e-3·육안 동등으로 게이트 통과. 1x1 30.84fps로 30fps선 돌파.
+  상세는 `reports/issue-21-bench.md` §6.
 - **Phase 3 — 구조 (1주)**: YuNet TRT 엔진화 (10ms → 1~2ms, 동일 모델이라
   화질 논쟁 없음), CPU/GPU 소프트웨어 파이프라이닝 (context 2개로
   forward와 paste 겹치기). 기대 1얼굴 43→25ms.
@@ -100,3 +102,7 @@ Phase 1~3 전부 성공 가정 시 1얼굴 43→18ms(2.4배), 합계 ~60/s.
 | 09-15 | 적응형 batch wait | 1x1 +9.0% | 채택 (PR #24) |
 | 09-15 | paste 1-copy·1-warp | parity, 오버헤드 상쇄 | 채택 (PR #24) |
 | 09-15 | paste 스레딩 | 4얼굴만 -14%, warp 6배 악화 사례 | 기각 |
+| 09-15 | 레이어 프로파일 | Conv 16개가 forward의 83% | 혼합 정밀도로 |
+| 09-15 | 빌드 튜닝 (ws 8·opt 5) | 14.25→14.25ms 무이득 | 기각 |
+| 09-15 | TRT 11 정밀도 API 조사 | FP16 플래그·레이어 API 삭제 확인 | 그래프 수술로 전환 |
+| 09-15 | 혼합 정밀도 sweep | mixed19: 5.6ms·MAE 1.4e-3 채택 | 1x1 30.84fps 달성 |

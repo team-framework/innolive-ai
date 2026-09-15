@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 
 from experiments.trt_swap_client.app import (
     FrameJob,
@@ -205,6 +206,43 @@ def test_swapper_engine_manifest_rejects_legacy_or_wrong_model(tmp_path: Path) -
         )
     )
     _require_current_swapper_engine(engine, model)
+
+
+def test_swapper_engine_manifest_accepts_mixed_with_provenance(tmp_path: Path) -> None:
+    official, engine = tmp_path / "swapper.onnx", tmp_path / "swapper.engine"
+    official.write_bytes(b"model")
+    engine.write_bytes(b"engine")
+    engine.with_suffix(".engine.json").write_text(
+        json.dumps(
+            {
+                "model_sha256": "mixed-onnx-hash",
+                "base_model_sha256": hashlib.sha256(official.read_bytes()).hexdigest(),
+                "mixed_recipe": {"converted_convs": ["Conv_42"]},
+                "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
+                "preserve_onnx_fp32_io": True,
+                "precision": "fp32",
+            }
+        )
+    )
+    _require_current_swapper_engine(engine, official)
+
+
+def test_swapper_engine_manifest_rejects_mixed_without_provenance(tmp_path: Path) -> None:
+    official, engine = tmp_path / "swapper.onnx", tmp_path / "swapper.engine"
+    official.write_bytes(b"model")
+    engine.write_bytes(b"engine")
+    engine.with_suffix(".engine.json").write_text(
+        json.dumps(
+            {
+                "model_sha256": "other-hash",
+                "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
+                "preserve_onnx_fp32_io": True,
+                "precision": "fp32",
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="different ONNX model"):
+        _require_current_swapper_engine(engine, official)
 
 
 def test_ort_reference_does_not_apply_a_second_input_normalization() -> None:
@@ -407,8 +445,6 @@ def test_submit_coalesces_pending_same_stream_frame_when_full() -> None:
 
 
 def test_submit_evicts_oldest_when_full_without_same_stream() -> None:
-    import pytest
-
     async def scenario() -> None:
         lab = _stub_lab(max_queue=2)
         loop = asyncio.get_running_loop()

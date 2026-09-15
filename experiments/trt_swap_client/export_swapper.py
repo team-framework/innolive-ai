@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_ENGINE)
     parser.add_argument("--workspace", type=float, default=2.0, help="workspace GiB")
     parser.add_argument(
+        "--builder-opt-level",
+        type=int,
+        default=3,
+        help="TensorRT builder optimization level 0..5 (default 3 keeps stock tactics)",
+    )
+    parser.add_argument(
         "--max-batch",
         type=int,
         default=1,
@@ -27,11 +33,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--precision",
-        choices=("fp16", "fp32"),
+        choices=("fp32",),
         default="fp32",
-        help="FP32 is the supported InSwapper quality path; FP16 is diagnostic-only",
+        help="FP32 IO is the supported InSwapper quality path; mixed precision "
+        "comes from build_mixed_onnx.py graph surgery, not a builder flag "
+        "(TRT 11 removed the FP16 flag and per-layer precision API)",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--mixed-base",
+        type=Path,
+        default=None,
+        help="official FP32 ONNX when --onnx is a mixed-precision build from "
+        "build_mixed_onnx.py; records provenance so the runtime gate can accept it",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +77,10 @@ def main() -> None:
         raise SystemExit(f"could not parse {onnx_path}:\n{errors}")
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace * 1024**3))
+    if not 0 <= args.builder_opt_level <= 5:
+        raise SystemExit("--builder-opt-level must be in 0..5")
+    if args.builder_opt_level != 3:
+        config.builder_optimization_level = args.builder_opt_level
     batch_range = {"min": 1, "opt": 1, "max": 1}
     if args.max_batch > 1:
         batch_range = {"min": 1, "opt": args.max_batch, "max": args.max_batch}
@@ -81,18 +100,12 @@ def main() -> None:
             else:
                 raise SystemExit(f"unexpected InSwapper input rank: {tensor.name} {shape}")
         config.add_optimization_profile(profile)
-    if args.precision == "fp16":
-        if not getattr(builder, "platform_has_fast_fp16", False):
-            raise SystemExit("this GPU does not support fast TensorRT FP16")
-        if not hasattr(trt.BuilderFlag, "FP16"):
-            raise SystemExit("this TensorRT build does not expose native FP16 builder precision")
-        config.set_flag(trt.BuilderFlag.FP16)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise SystemExit("TensorRT InSwapper engine build failed; inspect TensorRT logs")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(bytes(serialized))
-    manifest = {
+    manifest: dict[str, object] = {
         "format": 1,
         "model_sha256": _sha256(onnx_path),
         "engine_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
@@ -101,6 +114,14 @@ def main() -> None:
         "preserve_onnx_fp32_io": True,
         "batch_range": batch_range,
     }
+    if args.mixed_base is not None:
+        base = args.mixed_base.expanduser().resolve()
+        if not base.is_file():
+            raise SystemExit(f"--mixed-base ONNX not found: {base}")
+        manifest["base_model_sha256"] = _sha256(base)
+        recipe_path = onnx_path.with_suffix(onnx_path.suffix + ".recipe.json")
+        if recipe_path.is_file():
+            manifest["mixed_recipe"] = json.loads(recipe_path.read_text())
     output.with_suffix(output.suffix + ".json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(
         f"created {output} with TensorRT {trt.__version__} "
