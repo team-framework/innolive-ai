@@ -18,6 +18,7 @@ from experiments.trt_swap_client.app import (
     _aligned_seg_mask,
     _blur_objects,
     _find_pending_job_index,
+    _group_job_indices,
     _iou,
     _mapped_latent,
     _objects,
@@ -25,6 +26,7 @@ from experiments.trt_swap_client.app import (
     _paste_inswapper,
     _prediction_to_bgr,
     _require_current_swapper_engine,
+    _resolve_swapper_engine,
     _swap_providers,
     _transform_polygon_to_aligned,
 )
@@ -411,6 +413,74 @@ def test_find_pending_job_index_prefers_newest_same_stream() -> None:
     assert _find_pending_job_index(pending, stream_a) == 2
     assert _find_pending_job_index(pending, stream_b) == 1
     assert _find_pending_job_index(pending, object()) is None
+
+
+def test_group_job_indices_keeps_per_stream_order() -> None:
+    from types import SimpleNamespace
+
+    stream_a, stream_b = object(), object()
+    jobs = [
+        SimpleNamespace(stream=stream_a),
+        SimpleNamespace(stream=stream_b),
+        SimpleNamespace(stream=stream_a),
+        SimpleNamespace(stream=stream_b),
+    ]
+    assert _group_job_indices(jobs) == [[0, 2], [1, 3]]
+    assert _group_job_indices(jobs[:1]) == [[0]]
+    assert _group_job_indices([]) == []
+
+
+def test_concurrent_apply_many_keeps_per_thread_results() -> None:
+    import threading
+
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    results: dict[int, tuple[np.ndarray, set[int]]] = {}
+    errors: list[BaseException] = []
+
+    def run(slot: int, boxes: list[list[float]]) -> None:
+        try:
+            results[slot] = swapper.apply_many(frame, boxes)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(0, [[0, 0, 20, 20]])),
+        threading.Thread(target=run, args=(1, [[0, 0, 20, 20], [40, 40, 60, 60]])),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert not errors
+    assert results[0][1] == {0}
+    assert results[1][1] == {0, 1}
+    assert results[0][0].shape == frame.shape
+    assert results[1][0].shape == frame.shape
+    swapper.close()
+
+
+def test_resolve_swapper_engine_prefers_mixed_when_built(tmp_path: Path) -> None:
+    import experiments.trt_swap_client.app as app_module
+
+    stock = tmp_path / "stock.engine"
+    stock.write_bytes(b"engine")
+    mixed = tmp_path / "mixed.engine"
+    mixed.write_bytes(b"engine")
+    other = tmp_path / "other.engine"
+    other.write_bytes(b"engine")
+    real_default, real_mixed = app_module.DEFAULT_SWAPPER_ENGINE, app_module.MIXED_SWAPPER_ENGINE
+    app_module.DEFAULT_SWAPPER_ENGINE = stock
+    try:
+        app_module.MIXED_SWAPPER_ENGINE = tmp_path / "missing.engine"
+        assert _resolve_swapper_engine(stock) == stock.resolve()
+        app_module.MIXED_SWAPPER_ENGINE = mixed
+        assert _resolve_swapper_engine(stock) == mixed.resolve()
+        assert _resolve_swapper_engine(other) == other.resolve()
+    finally:
+        app_module.DEFAULT_SWAPPER_ENGINE = real_default
+        app_module.MIXED_SWAPPER_ENGINE = real_mixed
 
 
 def test_parallel_yunet_uses_clones_and_keeps_index_order() -> None:

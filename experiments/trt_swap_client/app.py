@@ -51,6 +51,9 @@ DEFAULT_DETECTOR_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
+#: Faster mixed-precision build (see build_mixed_onnx.py); used automatically
+#: when present unless --swapper-engine is given explicitly.
+MIXED_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_mixed.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 
@@ -272,13 +275,11 @@ def _require_current_swapper_engine(engine_path: Path, model_path: Path) -> None
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"invalid TensorRT swap engine manifest: {manifest_path}") from error
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
-    if manifest.get("model_sha256") != model_hash:
-        # Mixed-precision engines are built from a surgically converted ONNX;
-        # accept them only with recorded provenance to the official model.
-        if manifest.get("base_model_sha256") != model_hash or "mixed_recipe" not in manifest:
-            raise RuntimeError(
-                "TensorRT swap engine was built from a different ONNX model; rebuild it"
-            )
+    # Mixed-precision engines are built from a surgically converted ONNX;
+    # accept them only with recorded provenance to the official model.
+    provenanced = manifest.get("base_model_sha256") == model_hash and "mixed_recipe" in manifest
+    if manifest.get("model_sha256") != model_hash and not provenanced:
+        raise RuntimeError("TensorRT swap engine was built from a different ONNX model; rebuild it")
     if manifest.get("preserve_onnx_fp32_io") is not True:
         raise RuntimeError(
             "legacy TensorRT swap engine converted ONNX I/O to FP16; rebuild it with the current exporter"
@@ -1113,6 +1114,59 @@ class InSwapper:
             )
         return self._cached_source_latent
 
+    def _record_timing(
+        self,
+        *,
+        prepare_ms: float,
+        forward_ms: float,
+        paste_ms: float,
+        generator_ms: float,
+        batch_size: int,
+    ) -> None:
+        """Record stage timings globally and for the calling thread.
+
+        ``last_*`` attributes are last-writer-wins (fine for /health).
+        ``last_call_timing()`` is exact per thread, which the concurrent
+        compose path needs to attribute timings to the right job.
+        """
+
+        timing = {
+            "prepare": round(prepare_ms, 2),
+            "forward": round(forward_ms, 2),
+            "paste": round(paste_ms, 2),
+        }
+        self.last_prepare_ms = prepare_ms
+        self.last_forward_ms = forward_ms
+        self.last_paste_ms = paste_ms
+        self.last_generator_ms = generator_ms
+        self.last_generator_timing = timing
+        self.last_batch_size = batch_size
+        tls = self.__dict__.setdefault("_tls", threading.local())
+        tls.timing = {
+            "prepare_ms": round(prepare_ms, 2),
+            "forward_ms": round(forward_ms, 2),
+            "paste_ms": round(paste_ms, 2),
+            "generator_ms": round(generator_ms, 2),
+            "batch_size": batch_size,
+        }
+
+    def last_call_timing(self) -> dict[str, float]:
+        """Stage timings of this thread's most recent apply_many call."""
+
+        tls = self.__dict__.get("_tls")
+        timing = getattr(tls, "timing", None)
+        if not isinstance(timing, dict):
+            timing = {
+                "prepare_ms": 0.0,
+                "forward_ms": 0.0,
+                "paste_ms": 0.0,
+                "generator_ms": 0.0,
+                "batch_size": 0,
+            }
+        merged = dict(timing)
+        merged["alignment_ms"] = float(getattr(tls, "alignment_ms", 0.0) or 0.0)
+        return merged
+
     def _align_target(self, frame: np.ndarray, kps: np.ndarray, input_size: int) -> tuple[Any, Any]:
         from insightface.utils import face_align
 
@@ -1292,6 +1346,7 @@ class InSwapper:
         targets = self._target_faces(frame, boxes)
         self.last_alignment_ms = (time.perf_counter() - alignment_started) * 1_000
         self.last_face_count = len(targets)
+        self.__dict__.setdefault("_tls", threading.local()).alignment_ms = self.last_alignment_ms
         polygons_by_index: dict[int, Any] | None = None
         if mask_polygons is not None:
             if isinstance(mask_polygons, dict):
@@ -1299,12 +1354,9 @@ class InSwapper:
             else:
                 polygons_by_index = {index: polygon for index, polygon in enumerate(mask_polygons)}
         if not targets:
-            self.last_prepare_ms = 0.0
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = 0.0
-            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
-            self.last_batch_size = 0
+            self._record_timing(
+                prepare_ms=0.0, forward_ms=0.0, paste_ms=0.0, generator_ms=0.0, batch_size=0
+            )
             return frame, set()
         if not self._supports_separated_forward():
             return self._apply_many_legacy(frame, targets)
@@ -1315,48 +1367,39 @@ class InSwapper:
                 frame, targets, polygons_by_index, latents_by_index
             )
         except Exception:
-            self.last_prepare_ms = 0.0
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = 0.0
-            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
-            self.last_batch_size = 0
+            self._record_timing(
+                prepare_ms=0.0, forward_ms=0.0, paste_ms=0.0, generator_ms=0.0, batch_size=0
+            )
             return frame, set()
         self.last_batch_size = len(prepared)
         if not prepared:
-            self.last_prepare_ms = prepare_ms
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = prepare_ms
-            self.last_generator_timing = {
-                "prepare": round(prepare_ms, 2),
-                "forward": 0.0,
-                "paste": 0.0,
-            }
+            self._record_timing(
+                prepare_ms=prepare_ms,
+                forward_ms=0.0,
+                paste_ms=0.0,
+                generator_ms=prepare_ms,
+                batch_size=0,
+            )
             return frame, set()
         try:
             fakes, forward_ms = self._forward_prepared(prepared)
         except Exception:
-            self.last_prepare_ms = prepare_ms
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = prepare_ms
-            self.last_generator_timing = {
-                "prepare": round(prepare_ms, 2),
-                "forward": 0.0,
-                "paste": 0.0,
-            }
+            self._record_timing(
+                prepare_ms=prepare_ms,
+                forward_ms=0.0,
+                paste_ms=0.0,
+                generator_ms=prepare_ms,
+                batch_size=0,
+            )
             return frame, set()
         output, succeeded, paste_ms = self._paste_prepared(frame, prepared, fakes)
-        self.last_prepare_ms = prepare_ms
-        self.last_forward_ms = forward_ms
-        self.last_paste_ms = paste_ms
-        self.last_generator_ms = prepare_ms + forward_ms + paste_ms
-        self.last_generator_timing = {
-            "prepare": round(prepare_ms, 2),
-            "forward": round(forward_ms, 2),
-            "paste": round(paste_ms, 2),
-        }
+        self._record_timing(
+            prepare_ms=prepare_ms,
+            forward_ms=forward_ms,
+            paste_ms=paste_ms,
+            generator_ms=prepare_ms + forward_ms + paste_ms,
+            batch_size=len(prepared),
+        )
         return output, succeeded
 
     def _get_face_pool(self) -> ThreadPoolExecutor:
@@ -1364,8 +1407,11 @@ class InSwapper:
 
         pool = getattr(self, "_face_pool", None)
         if pool is None:
-            pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-face")
-            self._face_pool = pool
+            with _POOL_CREATE_LOCK:
+                pool = getattr(self, "_face_pool", None)
+                if pool is None:
+                    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-face")
+                    self._face_pool = pool
         return pool
 
     def _apply_many_pipelined(
@@ -1448,20 +1494,14 @@ class InSwapper:
         try:
             outcomes = list(pool.map(_run, indices))
         except Exception:
-            self.last_prepare_ms = 0.0
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = 0.0
-            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
-            self.last_batch_size = 0
+            self._record_timing(
+                prepare_ms=0.0, forward_ms=0.0, paste_ms=0.0, generator_ms=0.0, batch_size=0
+            )
             return frame, set()
         if any(status == "fatal" for status, _ in outcomes):
-            self.last_prepare_ms = 0.0
-            self.last_forward_ms = 0.0
-            self.last_paste_ms = 0.0
-            self.last_generator_ms = 0.0
-            self.last_generator_timing = {"prepare": 0.0, "forward": 0.0, "paste": 0.0}
-            self.last_batch_size = 0
+            self._record_timing(
+                prepare_ms=0.0, forward_ms=0.0, paste_ms=0.0, generator_ms=0.0, batch_size=0
+            )
             return frame, set()
         prepare_ms = sum(outcome[1][7] for outcome in outcomes if outcome[0] == "ok")
         forward_ms = sum(outcome[1][8] for outcome in outcomes if outcome[0] == "ok")
@@ -1472,7 +1512,7 @@ class InSwapper:
             (outcome for outcome in outcomes if outcome[0] == "ok"),
             key=lambda entry: entry[1][0],
         ):
-            index, left, top, right, bottom, fake_warped, mask, _, _, render_ms = payload
+            index, left, top, right, bottom, fake_warped, mask, _ = payload[:8]
             try:
                 _merge_layer(canvas, left, top, right, bottom, fake_warped, mask)
             except Exception:
@@ -1482,15 +1522,13 @@ class InSwapper:
             outcome[1][9] for outcome in outcomes if outcome[0] == "ok"
         )
         wall_ms = (time.perf_counter() - started) * 1_000
-        self.last_prepare_ms = prepare_ms
-        self.last_forward_ms = forward_ms
-        self.last_paste_ms = paste_ms
-        self.last_generator_ms = wall_ms
-        self.last_generator_timing = {
-            "prepare": round(prepare_ms, 2),
-            "forward": round(forward_ms, 2),
-            "paste": round(paste_ms, 2),
-        }
+        self._record_timing(
+            prepare_ms=prepare_ms,
+            forward_ms=forward_ms,
+            paste_ms=paste_ms,
+            generator_ms=wall_ms,
+            batch_size=self.last_batch_size,
+        )
         return canvas, succeeded
 
     def _apply_many_legacy(
@@ -1517,19 +1555,17 @@ class InSwapper:
             except Exception:
                 continue
             succeeded.add(index)
-        self.last_batch_size = len(targets)
-        self.last_prepare_ms = prepare_ms
-        self.last_forward_ms = forward_ms
-        self.last_paste_ms = paste_ms
-        self.last_generator_ms = prepare_ms + forward_ms + paste_ms
-        if self.last_generator_ms <= 0:
+        generator_ms = prepare_ms + forward_ms + paste_ms
+        if generator_ms <= 0:
             # Legacy mocks without timing still report the loop total.
-            self.last_generator_ms = sum((prepare_ms, forward_ms, paste_ms))
-        self.last_generator_timing = {
-            "prepare": round(prepare_ms, 2),
-            "forward": round(forward_ms, 2),
-            "paste": round(paste_ms, 2),
-        }
+            generator_ms = sum((prepare_ms, forward_ms, paste_ms))
+        self._record_timing(
+            prepare_ms=prepare_ms,
+            forward_ms=forward_ms,
+            paste_ms=paste_ms,
+            generator_ms=generator_ms,
+            batch_size=len(targets),
+        )
         return output, succeeded
 
     def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
@@ -1629,6 +1665,10 @@ def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> A
     return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
 
 
+# Serializes lazy pool creation so concurrent first frames never leak pools.
+_POOL_CREATE_LOCK = threading.Lock()
+
+
 def _find_pending_job_index(pending: list[Any], stream: Any) -> int | None:
     """Find the newest queued job from the same stream for latest-frame coalescing."""
 
@@ -1636,6 +1676,20 @@ def _find_pending_job_index(pending: list[Any], stream: Any) -> int | None:
         if pending[position].stream is stream:
             return position
     return None
+
+
+def _group_job_indices(jobs: list[Any]) -> list[list[int]]:
+    """Group batch positions by stream, preserving first-appearance order."""
+
+    order: list[int] = []
+    groups: dict[int, list[int]] = {}
+    for position, job in enumerate(jobs):
+        key = id(job.stream)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(position)
+    return [groups[key] for key in order]
 
 
 class SwapLab:
@@ -1672,6 +1726,8 @@ class SwapLab:
         self.worker: asyncio.Task[None] | None = None
         self.frames = 0
         self.latencies: deque[float] = deque(maxlen=300)
+        self._stats_lock = threading.Lock()
+        self._compose_pool_attr: ThreadPoolExecutor | None = None
         # Render FPS counts every composed frame; swap-completed FPS counts only
         # frames with at least one successful face synthesis.
         self.swap_completed_frames = 0
@@ -1706,6 +1762,10 @@ class SwapLab:
             await asyncio.gather(self.worker, return_exceptions=True)
         await asyncio.to_thread(self.adaface.close)
         await asyncio.to_thread(self.swapper.close)
+        pool = getattr(self, "_compose_pool_attr", None)
+        if pool is not None:
+            self._compose_pool_attr = None
+            await asyncio.to_thread(pool.shutdown, True)
 
     def create_stream(self, session_id: str) -> StreamState:
         self.sessions.get_or_create(session_id)
@@ -1792,10 +1852,16 @@ class SwapLab:
                 inference_started = time.perf_counter()
                 results = await asyncio.to_thread(self._predict, [job.frame for job in jobs])
                 detector_batch_ms = (time.perf_counter() - inference_started) * 1_000
-                for job, prediction in zip(jobs, results, strict=True):
-                    output, meta = await self._compose(job.frame, prediction, job.stream, len(jobs))
-                    meta["detector_batch_ms"] = round(detector_batch_ms, 2)
-                    job.future.set_result((output, meta))
+                groups = _group_job_indices(jobs)
+                if len(groups) < 2:
+                    for position, job in enumerate(jobs):
+                        output, meta = await self._compose(
+                            job.frame, results[position], job.stream, len(jobs)
+                        )
+                        meta["detector_batch_ms"] = round(detector_batch_ms, 2)
+                        job.future.set_result((output, meta))
+                else:
+                    await self._compose_groups(jobs, results, detector_batch_ms)
             except Exception as error:
                 for job in jobs:
                     if not job.future.done():
@@ -1803,6 +1869,61 @@ class SwapLab:
             finally:
                 for _ in jobs:
                     self.queue.task_done()
+
+    def _compose_pool(self) -> ThreadPoolExecutor:
+        """Shared compose pool across detector batches (never nested in face pool)."""
+
+        pool = getattr(self, "_compose_pool_attr", None)
+        if pool is None:
+            with _POOL_CREATE_LOCK:
+                pool = getattr(self, "_compose_pool_attr", None)
+                if pool is None:
+                    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-compose")
+                    self._compose_pool_attr = pool
+        return pool
+
+    async def _compose_groups(
+        self,
+        jobs: list[FrameJob],
+        results: list[Any],
+        detector_batch_ms: float,
+    ) -> None:
+        """Compose multi-stream batches with per-stream order preserved.
+
+        Jobs from one stream stay sequential in their group; groups run
+        concurrently.  A group failure only fails its own jobs.
+        """
+
+        loop = asyncio.get_running_loop()
+        groups = _group_job_indices(jobs)
+
+        def _compose_group(idxs: list[int]) -> list[tuple[int, bool, Any]]:
+            outcomes: list[tuple[int, bool, Any]] = []
+            for position in idxs:
+                job = jobs[position]
+                try:
+                    output, meta = self._compose_sync(
+                        job.frame, results[position], job.stream, len(jobs)
+                    )
+                except Exception as error:
+                    outcomes.append((position, False, error))
+                else:
+                    meta["detector_batch_ms"] = round(detector_batch_ms, 2)
+                    outcomes.append((position, True, (output, meta)))
+            return outcomes
+
+        grouped = await asyncio.gather(
+            *(loop.run_in_executor(self._compose_pool(), _compose_group, idxs) for idxs in groups)
+        )
+        for outcomes in grouped:
+            for position, ok, payload in outcomes:
+                job = jobs[position]
+                if job.future.done():
+                    continue
+                if ok:
+                    job.future.set_result(payload)
+                else:
+                    job.future.set_exception(payload)
 
     def _predict(self, frames: list[np.ndarray]) -> list[Any]:
         return list(
@@ -1822,6 +1943,11 @@ class SwapLab:
         )
 
     async def _compose(
+        self, frame: np.ndarray, prediction: Any, stream: StreamState, batch_size: int
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        return self._compose_sync(frame, prediction, stream, batch_size)
+
+    def _compose_sync(
         self, frame: np.ndarray, prediction: Any, stream: StreamState, batch_size: int
     ) -> tuple[np.ndarray, dict[str, Any]]:
         started = time.perf_counter()
@@ -1875,27 +2001,31 @@ class SwapLab:
         if fallback_objects:
             output = _blur_objects(output, fallback_objects)
         elapsed = (time.perf_counter() - started) * 1_000
-        self.frames += 1
-        self.latencies.append(elapsed)
-        if swapped > 0:
-            self.swap_completed_frames += 1
-            self.swapped_faces_total += swapped
-            self.swap_latencies.append(swap_ms)
+        call_timing = self.swapper.last_call_timing()
+        with self._stats_lock:
+            self.frames += 1
+            self.latencies.append(elapsed)
+            if swapped > 0:
+                self.swap_completed_frames += 1
+                self.swapped_faces_total += swapped
+                self.swap_latencies.append(swap_ms)
         return output, {
             "detections": len(objects),
             "swap_faces": swapped,
             "fallback_blurs": fallback,
             "small_face_fallbacks": small_face_fallbacks,
             "swap_ms": round(swap_ms, 2),
-            "swap_alignment_ms": round(self.swapper.last_alignment_ms, 2),
-            "swap_generator_ms": round(self.swapper.last_generator_ms, 2),
+            "swap_alignment_ms": round(call_timing.get("alignment_ms", self.swapper.last_alignment_ms), 2),
+            "swap_generator_ms": round(call_timing.get("generator_ms", 0.0), 2),
             "swap_generator_timing_ms": {
-                name: round(value, 2) for name, value in self.swapper.last_generator_timing.items()
+                "prepare": round(call_timing.get("prepare_ms", 0.0), 2),
+                "forward": round(call_timing.get("forward_ms", 0.0), 2),
+                "paste": round(call_timing.get("paste_ms", 0.0), 2),
             },
-            "swap_prepare_ms": round(getattr(self.swapper, "last_prepare_ms", 0.0), 2),
-            "swap_forward_ms": round(getattr(self.swapper, "last_forward_ms", 0.0), 2),
-            "swap_paste_ms": round(getattr(self.swapper, "last_paste_ms", 0.0), 2),
-            "swap_batch_size": int(getattr(self.swapper, "last_batch_size", 0)),
+            "swap_prepare_ms": round(call_timing.get("prepare_ms", 0.0), 2),
+            "swap_forward_ms": round(call_timing.get("forward_ms", 0.0), 2),
+            "swap_paste_ms": round(call_timing.get("paste_ms", 0.0), 2),
+            "swap_batch_size": int(call_timing.get("batch_size", 0)),
             "swap_faces_total": self.swapped_faces_total,
             "render_frames": self.frames,
             "swap_completed_frames": self.swap_completed_frames,
@@ -2256,6 +2386,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_swapper_engine(cli_path: Path) -> Path:
+    """Pick the swapper engine: explicit flag wins, else mixed if built, else stock."""
+
+    explicit = cli_path.expanduser().resolve()
+    default = DEFAULT_SWAPPER_ENGINE.expanduser().resolve()
+    if explicit != default:
+        return explicit
+    if MIXED_SWAPPER_ENGINE.is_file():
+        print(f"using mixed-precision swap engine: {MIXED_SWAPPER_ENGINE.name}")
+        return MIXED_SWAPPER_ENGINE.resolve()
+    return default.resolve()
+
+
 def main() -> None:
     args = parse_args()
     if (
@@ -2278,10 +2421,11 @@ def main() -> None:
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
         raise SystemExit(f"input video not found: {input_video}")
+    swapper_engine = _resolve_swapper_engine(args.swapper_engine)
     settings = Settings(
         args.detector.expanduser().resolve(),
         args.swapper.expanduser().resolve(),
-        args.swapper_engine.expanduser().resolve(),
+        swapper_engine,
         args.source.expanduser().resolve(),
         args.device,
         args.max_batch,
