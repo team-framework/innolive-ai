@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -8,8 +9,11 @@ from typing import Any
 import numpy as np
 
 from experiments.trt_swap_client.app import (
+    FrameJob,
     InSwapper,
+    PreparedFace,
     Settings,
+    SwapLab,
     _aligned_seg_mask,
     _blur_objects,
     _find_pending_job_index,
@@ -366,3 +370,215 @@ def test_find_pending_job_index_prefers_newest_same_stream() -> None:
     assert _find_pending_job_index(pending, stream_a) == 2
     assert _find_pending_job_index(pending, stream_b) == 1
     assert _find_pending_job_index(pending, object()) is None
+
+
+def _stub_lab(max_queue: int = 2) -> SwapLab:
+    from types import SimpleNamespace
+
+    lab = SwapLab.__new__(SwapLab)
+    lab.settings = SimpleNamespace(max_batch=4, batch_wait_ms=3.0, max_queue=max_queue)
+    lab.queue = asyncio.Queue(maxsize=max_queue)
+    lab.dropped_frames = 0
+    return lab
+
+
+def test_submit_coalesces_pending_same_stream_frame_when_full() -> None:
+    async def scenario() -> None:
+        lab = _stub_lab(max_queue=2)
+        loop = asyncio.get_running_loop()
+        stream_a, stream_b = object(), object()
+        first_a: asyncio.Future = loop.create_future()
+        first_b: asyncio.Future = loop.create_future()
+        old_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        lab.queue.put_nowait(FrameJob(old_frame, stream_a, first_a))
+        lab.queue.put_nowait(FrameJob(old_frame, stream_b, first_b))
+        new_frame = np.full((4, 4, 3), 7, dtype=np.uint8)
+        pending = asyncio.ensure_future(lab.submit(new_frame, stream_a))
+        await asyncio.sleep(0)
+        # The queued job now carries the newest frame and both callers share it.
+        assert lab.queue.qsize() == 2
+        assert next(iter(list(lab.queue._queue))).frame is new_frame  # type: ignore[attr-defined]
+        first_a.set_result((new_frame, {"ok": True}))
+        output, _ = await pending
+        assert np.array_equal(output, new_frame)
+        assert lab.dropped_frames == 0
+
+    asyncio.run(scenario())
+
+
+def test_submit_evicts_oldest_when_full_without_same_stream() -> None:
+    import pytest
+
+    async def scenario() -> None:
+        lab = _stub_lab(max_queue=2)
+        loop = asyncio.get_running_loop()
+        stream_a, stream_b, stream_c = object(), object(), object()
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        future_b: asyncio.Future = loop.create_future()
+        future_c: asyncio.Future = loop.create_future()
+        lab.queue.put_nowait(FrameJob(frame, stream_b, future_b))
+        lab.queue.put_nowait(FrameJob(frame, stream_c, future_c))
+        pending = asyncio.ensure_future(lab.submit(frame, stream_a))
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="superseded"):
+            await future_b
+        assert lab.dropped_frames == 1
+        assert lab.queue.qsize() == 2
+        for job in list(lab.queue._queue):  # type: ignore[attr-defined]
+            if job.stream is stream_a:
+                job.future.set_result((frame, {"ok": True}))
+        output, _ = await pending
+        assert np.array_equal(output, frame)
+
+    asyncio.run(scenario())
+
+
+def test_forward_batch_keeps_distinct_rows_with_reused_buffer() -> None:
+    """Per-row forwards may reuse one buffer; stacked rows must not alias it."""
+
+    from types import SimpleNamespace
+
+    class AliasingGenerator:
+        def __init__(self) -> None:
+            self.buffer = np.zeros((1, 3, 128, 128), dtype=np.float32)
+
+        def forward(self, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+            self.buffer[0] = float(latent[0, 0])
+            return self.buffer
+
+    swapper, _ = _batched_swapper()
+    swapper.generator = AliasingGenerator()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    latent_a = np.full((1, 512), 0.25, dtype=np.float32)
+    latent_b = np.full((1, 512), 0.75, dtype=np.float32)
+    prepared, _ = swapper._prepare_faces(
+        frame,
+        {0: SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32))},
+        None,
+        None,
+    )
+    assert len(prepared) == 1
+    template = prepared[0]
+    # Sanity: raw per-row views into one buffer really do alias.
+    swapper.generator.buffer[0] = 0.0
+    first = np.array(swapper.generator.forward(template.blob, latent_a), copy=False)
+    second = np.array(swapper.generator.forward(template.blob, latent_b), copy=False)
+    assert np.all(first == second)
+    fakes, _ = swapper._forward_prepared(
+        [
+            PreparedFace(
+                index=0,
+                target=template.target,
+                aimg=template.aimg,
+                matrix=template.matrix,
+                blob=template.blob,
+                latent=latent_a,
+            ),
+            PreparedFace(
+                index=1,
+                target=template.target,
+                aimg=template.aimg,
+                matrix=template.matrix,
+                blob=template.blob,
+                latent=latent_b,
+            ),
+        ]
+    )
+    assert not np.array_equal(fakes[0], fakes[1])
+
+
+def test_paste_prepared_blends_all_faces_into_one_canvas() -> None:
+    from types import SimpleNamespace
+
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    prepared, _ = swapper._prepare_faces(
+        frame,
+        {
+            0: SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32)),
+            1: SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32)),
+        },
+        None,
+        None,
+    )
+    fakes = [np.full((128, 128, 3), 200, dtype=np.uint8)] * 2
+    output, succeeded, _ = swapper._paste_prepared(frame, prepared, fakes)
+    assert succeeded == {0, 1}
+    assert output.shape == frame.shape
+    # The caller's frame is never mutated in place.
+    assert np.array_equal(frame, np.zeros((64, 64, 3), dtype=np.uint8))
+
+
+def test_paste_prepared_matches_sequential_for_disjoint_rois() -> None:
+    from types import SimpleNamespace
+
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 512, 3), dtype=np.uint8)
+    left = np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    right = np.asarray([[1, 0, -384], [0, 1, 0]], dtype=np.float32)
+    aimg = np.full((128, 128, 3), 100, dtype=np.uint8)
+    prepared = [
+        PreparedFace(
+            index=0,
+            target=SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32)),
+            aimg=aimg,
+            matrix=left,
+            blob=np.zeros((1, 3, 128, 128), dtype=np.float32),
+            latent=np.zeros((1, 512), dtype=np.float32),
+        ),
+        PreparedFace(
+            index=1,
+            target=SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32)),
+            aimg=aimg,
+            matrix=right,
+            blob=np.zeros((1, 3, 128, 128), dtype=np.float32),
+            latent=np.zeros((1, 512), dtype=np.float32),
+        ),
+    ]
+    fakes = [
+        np.full((128, 128, 3), 200, dtype=np.uint8),
+        np.full((128, 128, 3), 50, dtype=np.uint8),
+    ]
+    batched, succeeded_batched, _ = swapper._paste_prepared(frame, prepared, fakes)
+    assert succeeded_batched == {0, 1}
+    expected = frame.copy()
+    for item, fake in zip(prepared, fakes, strict=True):
+        expected = _paste_inswapper(
+            expected, item.aimg, fake, item.matrix, seg_mask_aligned=item.seg_mask_aligned
+        )
+    assert np.array_equal(batched, expected)
+    # Each half actually received its own face.
+    assert batched[32, 64].mean() > 100
+    assert batched[32, 448].mean() < 100
+
+
+def test_paste_prepared_matches_sequential_for_overlapping_rois() -> None:
+    from types import SimpleNamespace
+
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    matrix = np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    aimg = np.full((128, 128, 3), 100, dtype=np.uint8)
+    prepared = [
+        PreparedFace(
+            index=index,
+            target=SimpleNamespace(kps=np.zeros((5, 2), dtype=np.float32)),
+            aimg=aimg,
+            matrix=matrix,
+            blob=np.zeros((1, 3, 128, 128), dtype=np.float32),
+            latent=np.zeros((1, 512), dtype=np.float32),
+        )
+        for index in range(2)
+    ]
+    fakes = [
+        np.full((128, 128, 3), 200, dtype=np.uint8),
+        np.full((128, 128, 3), 50, dtype=np.uint8),
+    ]
+    batched, succeeded_batched, _ = swapper._paste_prepared(frame, prepared, fakes)
+    assert succeeded_batched == {0, 1}
+    expected = frame.copy()
+    for item, fake in zip(prepared, fakes, strict=True):
+        expected = _paste_inswapper(
+            expected, item.aimg, fake, item.matrix, seg_mask_aligned=item.seg_mask_aligned
+        )
+    assert np.array_equal(batched, expected)

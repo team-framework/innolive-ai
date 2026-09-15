@@ -341,13 +341,16 @@ class TensorRtInSwapperGenerator:
         image_shape = tuple(self.engine.get_tensor_shape(self.image_input))
         latent_shape = tuple(self.engine.get_tensor_shape(self.latent_input))
         output_shape = tuple(self.engine.get_tensor_shape(self.output))
-        expected_image = (1, 3, self.metadata.input_size[1], self.metadata.input_size[0])
-        if all(dimension >= 0 for dimension in image_shape) and image_shape != expected_image:
-            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected {expected_image}")
-        if all(dimension >= 0 for dimension in latent_shape) and latent_shape != (1, 512):
-            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (1, 512)")
-        if all(dimension >= 0 for dimension in output_shape) and output_shape != expected_image:
-            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected {expected_image}")
+        expected_tail = (3, self.metadata.input_size[1], self.metadata.input_size[0])
+        if len(image_shape) != 4 or tuple(image_shape[1:]) != expected_tail:
+            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected (N, {expected_tail})")
+        if len(latent_shape) != 2 or tuple(latent_shape[1:]) != (512,):
+            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (N, 512)")
+        if len(output_shape) != 4 or tuple(output_shape[1:]) != expected_tail:
+            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected (N, {expected_tail})")
+        for shape in (image_shape, latent_shape, output_shape):
+            if shape[0] == 0 or any(dimension < -1 for dimension in shape):
+                raise RuntimeError(f"unexpected TensorRT dims: {shape}")
 
     def provider_summary(self) -> list[str]:
         info = self.batch_info()
@@ -366,17 +369,26 @@ class TensorRtInSwapperGenerator:
     def batch_info(self) -> dict[str, Any]:
         """Expose engine batch/profile support with input order guarantees.
 
-        The current exporter builds a static batch-1 engine, so multi-face
-        batches run as order-preserving sequential forwards.  A future dynamic
-        engine plugs into :meth:`forward_batch` without changing callers: input
-        rows and identity latent rows share the same face order.
+        A static batch-1 engine runs multi-face batches as order-preserving
+        sequential forwards.  A dynamic-batch engine (``--max-batch N``) runs
+        each profile-sized chunk in one ``execute_async_v3`` call.  Either way
+        input rows and identity latent rows share the same face order.
         """
 
         image_shape = tuple(self.engine.get_tensor_shape(self.image_input))
         latent_shape = tuple(self.engine.get_tensor_shape(self.latent_input))
         output_shape = tuple(self.engine.get_tensor_shape(self.output))
         static = all(dimension >= 0 for dimension in (*image_shape, *latent_shape, *output_shape))
-        max_batch = int(image_shape[0]) if static and len(image_shape) == 4 else 1
+        if static and len(image_shape) == 4:
+            max_batch = max(int(image_shape[0]), 1)
+        else:
+            max_batch = 1
+            for profile in range(self.engine.num_optimization_profiles):
+                try:
+                    _, _opt, max_shape = self.engine.get_profile_shape(profile, self.image_input)
+                    max_batch = max(max_batch, int(max_shape[0]))
+                except Exception:
+                    continue
         return {
             "image_shape": image_shape,
             "latent_shape": latent_shape,
@@ -443,7 +455,9 @@ class TensorRtInSwapperGenerator:
         output = self._host_output.numpy()
         if not np.isfinite(output).all():
             raise RuntimeError("TensorRT InSwapper output contains NaN or infinity")
-        return output
+        # The host buffer is reused across calls; return a copy so batched
+        # callers stacking per-row views never alias the same memory.
+        return np.array(output, copy=True)
 
     def forward(self, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
         """Single-face forward used by the separated prepare/forward/paste path."""
@@ -453,10 +467,10 @@ class TensorRtInSwapperGenerator:
     def forward_batch(self, blobs: np.ndarray, latents: np.ndarray) -> np.ndarray:
         """Run stacked faces with order-preserving latent correspondence.
 
-        Row ``i`` of ``blobs`` always uses row ``i`` of ``latents``.  The
-        current static batch-1 engine executes rows sequentially; a future
-        dynamic engine executes them in one ``execute_async_v3`` call without
-        changing callers.
+        Row ``i`` of ``blobs`` always uses row ``i`` of ``latents``.  Rows are
+        split into engine-sized chunks; a dynamic-batch engine executes each
+        chunk in one ``execute_async_v3`` call, while a static batch-1 engine
+        falls back to sequential forwards without changing callers.
         """
 
         images = np.ascontiguousarray(blobs, dtype=np.float32)
@@ -474,7 +488,7 @@ class TensorRtInSwapperGenerator:
         if images.shape[0] == 1:
             return self._forward(images, mapped)
         info = self.batch_info()
-        if not info["static"] or info["max_batch"] < images.shape[0]:
+        if info["static"] and info["max_batch"] < 2:
             # Static batch-1 engine: preserve order with sequential forwards.
             return np.ascontiguousarray(
                 np.concatenate(
@@ -485,6 +499,18 @@ class TensorRtInSwapperGenerator:
                     axis=0,
                 )
             )
+        chunk = max(int(info["max_batch"]), 1)
+        outputs = []
+        for start in range(0, images.shape[0], chunk):
+            piece = self._forward_chunk(
+                images[start : start + chunk], mapped[start : start + chunk]
+            )
+            outputs.append(piece)
+        return np.ascontiguousarray(np.concatenate(outputs, axis=0))
+
+    def _forward_chunk(self, images: np.ndarray, mapped: np.ndarray) -> np.ndarray:
+        """Execute one engine-sized chunk, falling back to sequential on reject."""
+
         import torch
 
         image_dtype = self._torch_dtype(self.image_dtype, torch)
@@ -492,8 +518,12 @@ class TensorRtInSwapperGenerator:
         output_dtype = self._torch_dtype(self.output_dtype, torch)
         device = torch.device(f"cuda:{self.device}")
         try:
-            image_tensor = torch.from_numpy(images).to(device=device, dtype=image_dtype)
-            latent_tensor = torch.from_numpy(mapped).to(device=device, dtype=latent_dtype)
+            image_tensor = torch.from_numpy(np.ascontiguousarray(images)).to(
+                device=device, dtype=image_dtype
+            )
+            latent_tensor = torch.from_numpy(np.ascontiguousarray(mapped)).to(
+                device=device, dtype=latent_dtype
+            )
             self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
             self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
             output_shape = tuple(self.context.get_tensor_shape(self.output))
@@ -695,26 +725,14 @@ def _ort_raw_prediction(metadata: Any, blob: np.ndarray, latent: np.ndarray) -> 
     )[0]
 
 
-def _paste_inswapper(
-    target_img: np.ndarray,
-    aligned: np.ndarray,
-    fake: np.ndarray,
-    matrix: np.ndarray,
-    *,
-    seg_mask_aligned: np.ndarray | None = None,
-    artifacts: dict[str, np.ndarray] | None = None,
-) -> np.ndarray:
-    """Paste only the face ROI; full-frame warps made 1080p swaps unnecessarily slow.
-
-    When ``seg_mask_aligned`` (float32 0..1 in the aligned crop domain) is given,
-    it is warped with the same inverse matrix and intersected with the InSwapper
-    feather mask.  The generated face interior is kept while pixels outside the
-    YOLO segmentation stay as the original background.
-    """
+def _paste_roi(
+    target_shape: tuple[int, int], aligned_shape: tuple[int, int], matrix: np.ndarray
+) -> tuple[int, int, int, int, np.ndarray, tuple[int, int], np.ndarray, np.ndarray]:
+    """Compute the padded paste ROI shared by sequential and parallel pastes."""
 
     inverse = cv2.invertAffineTransform(matrix)
     corners = cv2.transform(
-        np.asarray([[[0, 0], [aligned.shape[1], 0], [aligned.shape[1], aligned.shape[0]], [0, aligned.shape[0]]]], dtype=np.float32),
+        np.asarray([[[0, 0], [aligned_shape[1], 0], [aligned_shape[1], aligned_shape[0]], [0, aligned_shape[0]]]], dtype=np.float32),
         inverse,
     )[0]
     minimum = np.floor(corners.min(axis=0)).astype(np.int32)
@@ -724,55 +742,104 @@ def _paste_inswapper(
     padding = max(16, int(np.ceil(max(maximum - minimum) * 0.2)))
     left = max(0, int(minimum[0]) - padding)
     top = max(0, int(minimum[1]) - padding)
-    right = min(target_img.shape[1], int(maximum[0]) + padding)
-    bottom = min(target_img.shape[0], int(maximum[1]) + padding)
+    right = min(target_shape[1], int(maximum[0]) + padding)
+    bottom = min(target_shape[0], int(maximum[1]) + padding)
     if right <= left or bottom <= top:
         raise RuntimeError("empty InSwapper paste ROI")
     roi_inverse = inverse.copy()
     roi_inverse[:, 2] -= (left, top)
-    roi_size = (right - left, bottom - top)
-    # Build the feather in the 128px aligned domain, then warp BGR+alpha in a
-    # single operation.  The old implementation did erosion, blur, and two
-    # warps over a large 1080p ROI for every face.
-    projected_size = max(1.0, float(np.sqrt(np.prod(maximum - minimum))))
-    aligned_scale = projected_size / max(aligned.shape[:2])
+    return left, top, right, bottom, roi_inverse, (right - left, bottom - top), minimum, maximum
+
+
+def _build_aligned_mask(
+    aligned_shape: tuple[int, int],
+    projected_size: float,
+    seg_mask_aligned: np.ndarray | None,
+) -> np.ndarray:
+    """Build the uint8 feather mask in the 128px aligned domain."""
+
+    aligned_scale = projected_size / max(aligned_shape[:2])
     erode_size = max(1, round(max(projected_size // 10, 10) / aligned_scale))
     aligned_mask = cv2.erode(
-        np.full(aligned.shape[:2], 255, dtype=np.uint8),
+        np.full(aligned_shape, 255, dtype=np.uint8),
         np.ones((erode_size, erode_size), dtype=np.uint8),
         iterations=1,
     )
     blur_radius = max(1, round(max(projected_size // 20, 5) / aligned_scale))
     aligned_mask = cv2.GaussianBlur(aligned_mask, (2 * blur_radius + 1,) * 2, 0)
-    rgba = np.dstack((fake, aligned_mask))
-    warped_rgba = cv2.warpAffine(rgba, roi_inverse, roi_size, borderValue=0.0)
-    fake = warped_rgba[:, :, :3]
-    mask = warped_rgba[:, :, 3:4].astype(np.float32) / 255.0
-    if seg_mask_aligned is not None:
-        seg = np.asarray(seg_mask_aligned, dtype=np.float32)
-        if seg.shape != tuple(aligned.shape[:2]):
-            raise ValueError(
-                f"YOLO seg mask shape {seg.shape} does not match aligned {aligned.shape[:2]}"
-            )
-        if not np.isfinite(seg).all():
-            raise ValueError("YOLO seg mask contains NaN or infinity")
-        seg_warped = cv2.warpAffine(
-            np.clip(seg, 0.0, 1.0), roi_inverse, roi_size, flags=cv2.INTER_LINEAR, borderValue=0.0
-        ).astype(np.float32)[..., None]
-        if float(seg_warped.max(initial=0.0)) <= 0:
-            raise RuntimeError("empty YOLO-constrained swap mask")
-        mask = mask * seg_warped
-    result = target_img.copy()
-    target_roi = target_img[top:bottom, left:right]
-    result[top:bottom, left:right] = (
-        mask * fake + (1 - mask) * target_roi.astype(np.float32)
+    if seg_mask_aligned is None:
+        return aligned_mask
+    seg = np.asarray(seg_mask_aligned, dtype=np.float32)
+    if seg.shape != tuple(aligned_shape):
+        raise ValueError(f"YOLO seg mask shape {seg.shape} does not match aligned {aligned_shape}")
+    if not np.isfinite(seg).all():
+        raise ValueError("YOLO seg mask contains NaN or infinity")
+    if float(seg.max(initial=0.0)) <= 0:
+        raise RuntimeError("empty YOLO-constrained swap mask")
+    seg_u8 = np.rint(np.clip(seg, 0.0, 1.0) * 255.0).astype(np.uint8)
+    # Intersect in the 128px domain so BGR+alpha still share one ROI warp.
+    # A 5-channel warp (or a second ROI warp) was measurably slower here.
+    aligned_mask = np.rint(
+        aligned_mask.astype(np.float32) * seg_u8.astype(np.float32) / 255.0
     ).astype(np.uint8)
+    if int(aligned_mask.max(initial=0)) <= 0:
+        raise RuntimeError("empty YOLO-constrained swap mask")
+    return aligned_mask
+
+
+def _paste_inswapper(
+    target_img: np.ndarray,
+    aligned: np.ndarray,
+    fake: np.ndarray,
+    matrix: np.ndarray,
+    *,
+    seg_mask_aligned: np.ndarray | None = None,
+    artifacts: dict[str, np.ndarray] | None = None,
+    destination: np.ndarray | None = None,
+) -> np.ndarray:
+    """Paste only the face ROI; full-frame warps made 1080p swaps unnecessarily slow.
+
+    When ``seg_mask_aligned`` (float32 0..1 in the aligned crop domain) is given,
+    it is warped with the same inverse matrix and intersected with the InSwapper
+    feather mask.  The generated face interior is kept while pixels outside the
+    YOLO segmentation stay as the original background.  When ``destination`` is
+    given, the ROI is blended into it in place (used to copy a multi-face frame
+    once instead of once per face); otherwise a blended copy is returned.
+    """
+
+    left, top, right, bottom, roi_inverse, roi_size, minimum, maximum = _paste_roi(
+        (target_img.shape[0], target_img.shape[1]),
+        (aligned.shape[0], aligned.shape[1]),
+        matrix,
+    )
+    # Build the feather in the 128px aligned domain, then warp BGR+alpha in a
+    # single operation.  The old implementation did erosion, blur, and two
+    # warps over a large 1080p ROI for every face.
+    projected_size = max(1.0, float(np.sqrt(np.prod(maximum - minimum))))
+    aligned_mask = _build_aligned_mask(
+        (aligned.shape[0], aligned.shape[1]), projected_size, seg_mask_aligned
+    )
+    warped = cv2.warpAffine(
+        np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0
+    )
+    fake = warped[:, :, :3]
+    mask = warped[:, :, 3:4].astype(np.float32) / 255.0
+    if destination is None:
+        result = target_img.copy()
+        result[top:bottom, left:right] = (
+            mask * fake + (1 - mask) * target_img[top:bottom, left:right].astype(np.float32)
+        ).astype(np.uint8)
+    else:
+        result = destination
+        result[top:bottom, left:right] = (
+            mask * fake + (1 - mask) * destination[top:bottom, left:right].astype(np.float32)
+        ).astype(np.uint8)
     if artifacts is not None:
-        warped = np.zeros_like(target_img)
-        warped[top:bottom, left:right] = fake
+        warped_full = np.zeros_like(target_img)
+        warped_full[top:bottom, left:right] = fake
         debug_mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
         debug_mask[top:bottom, left:right] = np.rint(mask[:, :, 0] * 255).astype(np.uint8)
-        artifacts["inverse_warp_swap"] = warped
+        artifacts["inverse_warp_swap"] = warped_full
         artifacts["swap_mask"] = debug_mask
         artifacts["paste_before_blend"] = target_img
     return result
@@ -1064,16 +1131,23 @@ class InSwapper:
         if hasattr(generator, "forward_batch"):
             predictions = np.asarray(generator.forward_batch(blobs, latents))
         elif hasattr(generator, "forward"):
+            # Copy each row: some forwards return views into a reused buffer.
             predictions = np.ascontiguousarray(
                 np.concatenate(
-                    [np.asarray(generator.forward(item.blob, item.latent)) for item in prepared],
+                    [
+                        np.array(generator.forward(item.blob, item.latent), copy=True)
+                        for item in prepared
+                    ],
                     axis=0,
                 )
             )
         elif hasattr(generator, "_forward"):
             predictions = np.ascontiguousarray(
                 np.concatenate(
-                    [np.asarray(generator._forward(item.blob, item.latent)) for item in prepared],
+                    [
+                        np.array(generator._forward(item.blob, item.latent), copy=True)
+                        for item in prepared
+                    ],
                     axis=0,
                 )
             )
@@ -1089,19 +1163,25 @@ class InSwapper:
     ) -> tuple[np.ndarray, set[int], float]:
         started = time.perf_counter()
         succeeded: set[int] = set()
+        # One full-frame copy for all faces; each ROI blends into the evolving
+        # canvas in index order, exactly like sequential per-face pastes.
+        # (Worker-thread warps were measured slower: warpAffine on this build
+        # does not scale across threads, so pastes stay sequential.)
+        canvas = output.copy()
         for item, bgr_fake in zip(prepared, fakes, strict=True):
             try:
-                output = _paste_inswapper(
-                    output,
+                _paste_inswapper(
+                    canvas,
                     item.aimg,
                     bgr_fake,
                     item.matrix,
                     seg_mask_aligned=item.seg_mask_aligned,
+                    destination=canvas,
                 )
             except Exception:
                 continue
             succeeded.add(item.index)
-        return output, succeeded, (time.perf_counter() - started) * 1_000
+        return canvas, succeeded, (time.perf_counter() - started) * 1_000
 
     def apply_many(
         self,
@@ -1440,15 +1520,19 @@ class SwapLab:
         while True:
             first = await self.queue.get()
             jobs = [first]
-            deadline = asyncio.get_running_loop().time() + self.settings.batch_wait_ms / 1000
-            while len(jobs) < self.settings.max_batch:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    jobs.append(await asyncio.wait_for(self.queue.get(), remaining))
-                except TimeoutError:
-                    break
+            # Only spend the batch-wait budget when a backlog already exists.
+            # An idle single session used to pay the full wait on every frame;
+            # under load the queue is non-empty and batching works as before.
+            if self.settings.max_batch > 1 and not self.queue.empty():
+                deadline = asyncio.get_running_loop().time() + self.settings.batch_wait_ms / 1000
+                while len(jobs) < self.settings.max_batch:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        jobs.append(await asyncio.wait_for(self.queue.get(), remaining))
+                    except TimeoutError:
+                        break
             try:
                 inference_started = time.perf_counter()
                 results = await asyncio.to_thread(self._predict, [job.frame for job in jobs])
