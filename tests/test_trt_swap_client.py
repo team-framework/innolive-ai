@@ -215,3 +215,57 @@ def test_ort_reference_does_not_apply_a_second_input_normalization() -> None:
     blob = np.full((1, 3, 128, 128), 0.5, dtype=np.float32)
     latent = np.ones((1, 512), dtype=np.float32)
     assert np.array_equal(_ort_raw_prediction(metadata, blob, latent), blob)
+
+
+def test_yunet_landmarks_use_columns_4_to_14() -> None:
+    """YuNet rows are [box(4), landmarks(10), score]; [5:15] shifts into the score."""
+
+    import sys
+    import types
+
+    class FakeYuNet:
+        def __init__(self) -> None:
+            self.sizes: list[tuple[int, int]] = None  # type: ignore[assignment]
+
+        def setInputSize(self, size: tuple[int, int]) -> None:
+            self.sizes = size
+
+        def detect(self, roi: np.ndarray) -> tuple[None, np.ndarray]:
+            row = np.asarray(
+                [[10, 10, 100, 100, 20, 30, 40, 30, 30, 50, 25, 70, 35, 70, 0.9]],
+                dtype=np.float32,
+            )
+            return None, row
+
+    class FakeFace:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    package = types.ModuleType("insightface")
+    app_module = types.ModuleType("insightface.app")
+    common_module = types.ModuleType("insightface.app.common")
+    common_module.Face = FakeFace  # type: ignore[attr-defined]
+    saved = {
+        name: sys.modules[name] for name in list(sys.modules) if name.startswith("insightface")
+    }
+    sys.modules["insightface"] = package
+    sys.modules["insightface.app"] = app_module
+    sys.modules["insightface.app.common"] = common_module
+    try:
+        swapper = InSwapper.__new__(InSwapper)
+        swapper.yunet = FakeYuNet()
+        face = swapper._target_from_yunet(
+            np.zeros((200, 200, 3), dtype=np.uint8), [50, 50, 150, 150]
+        )
+    finally:
+        for name in [n for n in sys.modules if n.startswith("insightface")]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+    assert face is not None
+    assert swapper.yunet.sizes == (170, 170)
+    assert np.array_equal(
+        face.kps,
+        np.asarray(
+            [[35, 45], [55, 45], [45, 65], [40, 85], [50, 85]], dtype=np.float32
+        ),
+    )

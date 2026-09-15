@@ -823,7 +823,7 @@ class InSwapper:
             return None
         from insightface.app.common import Face
 
-        landmarks = np.asarray(candidate[5:15], dtype=np.float32).reshape((5, 2))
+        landmarks = np.asarray(candidate[4:14], dtype=np.float32).reshape((5, 2))
         landmarks[:, 0] += left
         landmarks[:, 1] += top
         return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
