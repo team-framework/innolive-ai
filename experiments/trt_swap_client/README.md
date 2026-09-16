@@ -1,8 +1,8 @@
-# TensorRT Face Swap Lab
+# TensorRT Face Swap Lab (프로덕션 연동 가이드)
 
-독립 테스트 클라이언트입니다. 기존 gRPC server와 production code는 변경하지 않습니다.
-
-3090 Linux host에서 먼저 현재 checkpoint로 **이 클라이언트 전용** dynamic FP16 engine을 만듭니다. 기존 `best_b1.engine`을 대체하지 않습니다.
+독립 테스트 클라이언트이자 프로덕션 face-swap 파이프라인의 기준 구현이다.
+YOLO26n-seg 검출 → 얼굴 합성 → blur fallback까지 한 프로세스에서 돌고,
+WebRTC/WebSocket/file(HLS) 출력으로 서빙한다.
 
 ```bash
 python -m pip install -r requirements-trt-swap-client.txt
@@ -13,34 +13,106 @@ python -m experiments.trt_swap_client.export_detector \
   --checkpoint models/best.pt --output models/best_swap_b4.engine \
   --max-batch 4 --workspace 8 --device 0
 
-python -m experiments.trt_swap_client.export_swapper \
+python -m experiments.trt_swap_client.build_mixed_onnx \
   --onnx models/face_swap/inswapper_128.onnx \
-  --output models/face_swap/inswapper_128_trt11_fp32.engine \
-  --workspace 2 --precision fp32 --force
+  --output models/face_swap/inswapper_128_mixed19.onnx --force
+
+python -m experiments.trt_swap_client.export_swapper \
+  --onnx models/face_swap/inswapper_128_mixed19.onnx \
+  --output models/face_swap/inswapper_128_trt11_mixed.engine \
+  --mixed-base models/face_swap/inswapper_128.onnx --force
 ```
 
 ```bash
 python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
-  --detector models/best_swap_b4.engine \
-  --swapper models/face_swap/inswapper_128.onnx \
-  --swapper-engine models/face_swap/inswapper_128_trt11_fp32.engine \
   --source ~/Documents/input.png
 ```
 
-동일한 기본 설정은 저장소 루트에서 실행할 수 있다. 첫 번째 인자 또는 `PORT` 환경 변수로 포트를 바꾼다.
+`--swapper-engine`을 생략하면 빌드된 mixed 엔진을 자동 선택하고,
+없으면 stock FP32 엔진으로 떨어진다. 명시한 경로는 그대로 쓴다.
+`./run.sh [포트]` / `PORT=... ./run.sh`도 같다.
+브라우저는 `http://SERVER_IP:8088` (사설망에서만 실행).
 
-```bash
-./run.sh             # 8088
-./run.sh 9090        # 9090
-PORT=9090 ./run.sh   # 9090
+## 파이프라인과 동시성 (프로덕션 연동 시 그대로 쓰는 계약)
+
+```
+ camera/file ─▶ detector batch ─▶ compose ─▶ WebRTC/WebSocket/HLS
+   (YOLO TRT,      (스트림별 격리, 스레드풀 병렬)
+    짧은 batch wait)
 ```
 
-브라우저에서 `http://SERVER_IP:8088`로 접근합니다. 신뢰할 수 있는 사설망에서만 실행하세요.
+- **진입점**: `Settings` + `SwapLab` (`experiments/trt_swap_client/app.py`).
+  `create_stream(session_id)` → `submit(frame, stream)` → `(output, meta)`.
+- **얼굴 1개**: 기존 순차 경로 그대로 (prepare → forward → paste).
+  다얼굴만 워커풀 파이프라인을 탄다.
+- **얼굴 N개**: prepare/forward/render를 워커풀(4 스레드)로 겹친다.
+  forward는 공유 TRT 컨텍스트 락으로 직렬화하고, 머지는 인덱스 순서로
+  기존 blend 수식 그대로라서 순차 실행과 비트 동일하다.
+- **세션 N개**: detector 배치는 유지하고, compose는 스트림별로 그룹핑해서
+  그룹 간만 병렬로 돌린다. **같은 스트림은 항상 순차**라서 프레임 순서와
+  tracker/recognition 상태가 깨지지 않는다. 단일 그룹이면 풀을 안 탄다.
+- **스레드 안전**: TRT context·재사용 버퍼는 forward 락,
+  YuNet은 스레드별 클론 4개, 통계 카운터는 락, 레지스트리는 기존 락.
+  timing은 스레드별 TLS로 귀속돼서 남의 job 수치를 읽지 않는다.
+- **최신 프레임 우선**: 큐가 차면 같은 세션의 대기 프레임을 교체하고,
+  없으면 가장 오래된 것을 evict한다. p95 꼬리를 만들지 않는다.
+- **종료**: `await lab.close()`가 worker·AdaFace·swapper 풀을 순서대로 닫는다.
+- **메타**: `swap_ms`, `swap_prepare/forward/paste_ms`, `swap_batch_size`,
+  `swap_faces`, `fallback_blurs`, `render_frames`/`swap_completed_frames`
+  (렌더 FPS와 합성 완료 FPS 분리), `yolo_batch`, `detector_batch_ms`.
+  `/health`에 p50/p95·드롭·마지막 단계 시간이 있다.
 
-기본 browser 경로는 WebRTC 영상 트랙이다. 카메라 JPEG를 WebSocket으로 왕복하지 않으므로,
-FHD에서 HTTP/WebSocket proxy 왕복 지연이 추론 FPS를 제한하지 않는다. WebRTC가 지원되지
-않거나 ICE 연결에 실패하면 기존 WebSocket JPEG 경로로 자동 fallback한다. 원격/NAT 환경은
-서버의 UDP candidate port를 허용해야 한다. 직접 UDP가 불가능한 배포는 TURN을 설정한다.
+## 엔진 (재현 절차 포함)
+
+- detector: `best_swap_b4.engine` (dynamic B1–B4 FP16). `best.pt` 변경 시 rebuild.
+- swapper stock: `inswapper_128_trt11_fp32.engine` (static B1 FP32 direct).
+- swapper mixed: `inswapper_128_trt11_mixed.engine` (무거운 Conv 19개만 FP16,
+  forward 12.9→5.6ms, 실얼굴 MAE 1.4e-3·육안 동등).
+- 시작 시 manifest 게이트가 binding 이름·shape·dtype·모델 해시를 검증한다.
+  provenance 없는 엔진(구 FP16 포함)은 그대로 거부한다. mixed는
+  `base_model_sha256` + `mixed_recipe`가 있어야 통과한다.
+- 엔진은 Git에 넣지 않고 호스트에서 빌드한다. **다른 GPU(5070Ti 등)로
+  옮기면 전량 rebuild + 아래 품질 게이트를 다시 돌린다.**
+  Blackwell(sm_120)은 TRT/CUDA 버전 요구가 다르다.
+
+## 성능 (3090 실측, 720p 합성 프레임)
+
+| config | 베이스 | 최종 | 비고 |
+| --- | --- | --- | --- |
+| 1얼굴 x 1세션 | 23.4fps | **52.3fps** | YuNet TRT 후 |
+| 2얼굴 x 1세션 | 14.0fps | **32.5fps** | 30fps선 돌파 |
+| 4얼굴 x 1세션 | 9.9fps | **24.0fps** | 동률 (원인 조사 중) |
+| 1얼굴 x 10세션 합계 | 25.8/s | **69.4/s** | compose 병렬 +169% |
+| 4얼굴 x 4세션 | 41sw/s | **123sw/s** | +200% |
+
+- 단계 비용(1얼굴): detector 3 / yunet 3.4 (TRT) / forward 5.6 / paste 5.
+- 1얼굴 프레임은 베이스와 비트 동일 출력이다.
+- YuNet landmark 인덱스 수정(#25 병합) 후 paste ROI가 정상화되면서
+  뭉개짐이 사라지고 paste가 절반으로 줄었다.
+- YuNet TRT(`face_detection_yunet_trt.engine`, 동적 shape)는 CPU 구현과
+  box p50 0.38px·kps p50 0.16px로 일치한다. 엔진 없으면 CPU로 자동 fallback.
+- 측정 하네스: `python -m experiments.trt_swap_client.bench_lab --help`
+  (base/opt 공용, `--faces/--sessions/--swapper-engine` 지정).
+- 시도 후 기각: 동적 배치(정확하나 속도 선형), paste 스레드 warp(역효과),
+  전체 FP16(오차), 빌드 레벨 튜닝(무이득).
+
+## 품질 게이트 (엔진·코드 변경 시 매번)
+
+1. 1얼굴 프레임 베이스 대비 비트 동등 (paste 수식 변경 시).
+2. YOLO mask 내외 원본 보존·경계 artifact 육안 + 작은 얼굴 blur fallback.
+3. 엔진 교체 시 실 얼굴 blob 기준 ORT/FP32 대비 + 디코딩 PNG 비교.
+4. `pytest tests/test_trt_swap_client.py` 전체 통과.
+
+## 동작 계약 (변경 금지 없이 유지)
+
+- YOLO26n-seg class `0=face`, `1=number_plate`가 아니면 시작 거부.
+- InSwapper CUDA arena 세션당 2GiB 상한, age/gender 세션 미생성.
+- `--target-aligner yunet_roi` 기본, 실패 시 InsightFace fallback
+  (`insightface`는 legacy 비교 경로).
+- AdaFace whitelist 얼굴은 원본 유지, 작은 mask·hold·실패는 blur fallback.
+  면적은 YOLO mask 기준이며, mask가 깨지면 면적 0으로 blur한다
+  (box 사각형은 blur 영역으로만 쓴다).
+- WebRTC 우선, 불가 시 WebSocket fallback. TURN 환경변수 지원.
 
 ```bash
 export WEBRTC_TURN_URL='turn:turn.example.com:3478?transport=udp'
@@ -48,26 +120,7 @@ export WEBRTC_TURN_USERNAME='...'
 export WEBRTC_TURN_CREDENTIAL='...'
 ```
 
-- YOLO26n-seg는 dynamic TensorRT engine을 사용하며 class `0=face`, `1=number_plate`만 유지한다. 이 클래스 계약이 아니면 시작을 거부한다.
-- 기본 baseline은 dynamic B4 engine과 최대 4개 frame batch다. model quality는 그대로이며, B8/B16은 B4의 실측 GPU 여유가 확인된 경우에만 별도 engine으로 export한다.
-- InSwapper ONNX Runtime CUDA arena는 session당 2GiB 상한(`--swap-ort-mem-gib`)과 exact-request growth를 사용한다. swap에 필요하지 않은 age/gender/106-landmark InsightFace session은 만들지 않는다.
-- 기본 `--swapper-backend tensorrt`는 128 swap generator만 ONNX Runtime TensorRT EP FP16·engine/timing cache·CUDA graph로 실행한다. face analysis는 CUDA EP로 유지한다. 초기 실행은 cache build 때문에 느릴 수 있으며, 이후 재기동부터 cache를 재사용한다.
-- 기본 `--target-aligner yunet_roi`는 YOLO face box 주변에서 YuNet 5-point landmark만 다시 구한다. landmark를 못 찾거나 YOLO box와 맞지 않으면 기존 InsightFace 640 analysis로 fallback한다. 시각 품질 비교용 legacy 경로는 `--target-aligner insightface`다.
-- queue가 가득 차면 오래된 처리를 쌓지 않고 해당 browser frame을 drop한다.
-- AdaFace whitelist가 확인된 face는 원본을 유지한다. class 0의 비화이트리스트 face만 InSwapper에 전달한다.
-- class 0 mask가 `5,625px²`(기본값, 약 75×75)보다 작거나 tracking hold 상태면 generator를 실행하지 않고 local Gaussian blur fallback을 적용한다. `--swap-min-mask-area-px`로 조정할 수 있다.
-- number plate와 swap 실패 face는 즉시 local Gaussian blur fallback을 적용한다.
-- 한 frame의 여러 swap 후보는 InsightFace face analysis를 한 번만 실행한 뒤 YOLO box와 일대일 매칭한다.
-- AdaFace는 실제 whitelist enrollment가 시작될 때만 GPU model을 load한다. whitelist가 없는 익명 swap stream은 AdaFace VRAM을 예약하지 않는다.
-- Browser WebSocket은 request/response backpressure를 적용해 처리하지 못할 frame을 계속 전송하지 않는다.
-
-응답 metadata에는 `detector_batch_ms`, `swap_ms`, `swap_alignment_ms`, `swap_generator_ms`, `small_face_fallbacks`가 포함된다. 1-session FPS가 낮을 때는 이 값을 먼저 확인한다. `swap_generator_ms`가 크면 generator model이 병목이고, `swap_alignment_ms`가 크면 target landmark 경로가 병목이다.
-
-`/health`의 `swapper_providers.generator` 첫 값이 `TensorRTDirect`인지 확인한다. InSwapper는 ONNX Runtime TensorRT EP가 아니라 current TensorRT에서 만든 direct **FP32** engine으로 실행한다. 이 모델은 FP16 TensorRT raw output이 ONNXRuntime과 크게 달라져 화질이 무너지는 것이 확인됐으므로, runtime은 FP16 engine을 거부한다. 비교용 ONNX Runtime CUDA 경로만 `--swapper-backend cuda`를 명시한다.
-
-## 얼굴 품질 진단
-
-먼저 JPEG/브라우저 표시가 아닌 raw 128×128 결과를 비교한다. `--swap-debug-dir`를 지정하면 TensorRT 실행 결과는 그대로 유지하면서, 같은 blob과 mapped latent를 CPU ONNX Runtime reference에 한 번 더 넣어 진단 묶음을 저장한다. 기본값은 **첫 swap 1회만** 저장한다. 매 프레임 ONNX reference와 PNG dump를 실행하면 성능 측정이 무효해지므로 일반 실행에는 이 옵션을 넣지 않는다.
+## 얼굴 품질 진단·파일 테스트
 
 ```bash
 python -m experiments.trt_swap_client.app \
@@ -76,25 +129,14 @@ python -m experiments.trt_swap_client.app \
   --stream-jpeg-quality 100
 ```
 
-`/tmp/inswapper-debug/05_onnx_raw_swap.png`와 `06_trt_raw_swap.png`가 처음 비교할 파일이며, `debug.json`에는 input/latent 통계와 ORT-vs-TRT MAE·RMSE·MAX error가 기록된다. 이어서 `07_swap_mask.png`, `08_inverse_warp_swap.png`, `10_after_blend.png`을 보면 paste-back에서 문제가 시작되는지 확인할 수 있다. 덤프가 실패해도 live swap은 blur fallback으로 바뀌지 않는다.
-
-이 저장소의 공식 `inswapper_128.onnx`는 InsightFace metadata상 `input_mean=0`, `input_std=255`를 사용한다. 따라서 target tensor 범위는 **`[0,1]`** 이며, 다른 InSwapper 변형의 `[-1,1]` normalization을 적용하면 안 된다. 시작 시 engine binding의 이름·shape·dtype도 검증하므로, 잘못된/stale 또는 FP16 engine은 화질이 깨진 상태로 실행하지 않고 오류로 중단한다.
-
-## NVDEC/NVENC file test
-
-FFmpeg가 `h264_nvenc`를 제공하는 3090 host에서는 같은 batcher에 file stream을 추가할 수 있습니다.
+`05_onnx_raw_swap.png` vs `06_trt_raw_swap.png` 먼저 비교, `debug.json`에
+MAE·RMSE·MAX 기록. 덤프 실패는 live swap에 영향 없다.
+공식 ONNX는 `input_mean=0`, `input_std=255`라 target 범위는 `[0,1]`이다.
 
 ```bash
 python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
   --input-video /data/input.mp4 --hls-dir /tmp/face-swap-hls
 ```
 
-입력은 NVDEC로 decode하고 output은 NVENC H.264 low-latency HLS (`/hls/live.m3u8`)로 encode합니다. tracker, AdaFace, InSwapper가 OpenCV BGR array를 요구하므로 decode 후 device→host, encode 전 host→device 복사가 한 번씩 있습니다. 따라서 이 경로는 hardware codec I/O이며 **zero-copy claim은 하지 않습니다**.
-
-## Deployment checks
-
-- dynamic engine은 export한 동일한 NVIDIA driver/CUDA/TensorRT 계열의 3090 host에서만 사용합니다. `best.pt` 변경 시 다시 export합니다.
-- `models/face_swap/inswapper_128.onnx`는 완전한 유효 ONNX 파일이어야 합니다. 이 repository의 무시된 model artifact는 자동으로 내려받거나 교체하지 않습니다.
-- 이 client는 quality를 낮추는 resize, frame-skip을 추가하지 않습니다. 작은 mask fallback은 privacy-first 처리이며, 큰 face의 generator model과 input size는 유지합니다. 실제 10 clients × 30fps는 3090 host에서 browser 및 NVDEC file workload를 나누어 실측해야 합니다.
-
-`models/best_swap_b4.engine`과 `models/face_swap/inswapper_128_trt11.engine`은 동일한 3090 Linux TensorRT 11 environment에서 만들어야 하며 Git에 넣지 않습니다.
+NVDEC decode → NVENC HLS(`/hls/live.m3u8`). BGR 변환에 device↔host 복사가
+한 번씩 있어 zero-copy가 아니다.

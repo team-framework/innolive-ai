@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -26,6 +27,7 @@ from aiortc import (
     RTCSessionDescription,
     VideoStreamTrack,
 )
+from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_PTIME, VIDEO_TIME_BASE
 from av import VideoFrame
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -50,24 +52,46 @@ DEFAULT_DETECTOR_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
+#: Faster mixed-precision build (see build_mixed_onnx.py); used automatically
+#: when present unless --swapper-engine is given explicitly.
+MIXED_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_mixed.engine"
+#: GPU YuNet landmark engine (see export_yunet.py); used automatically when
+#: present unless --yunet-engine selects another file.  Falls back to CPU.
+DEFAULT_YUNET_ENGINE = ROOT / "models" / "face_detection_yunet_trt.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
+
+# YOLO segmentation mask handling in the 128px aligned InSwapper domain.
+# The polygon is transformed with the same affine matrix as the face crop,
+# then slightly expanded and feathered so the generated face interior is kept
+# while the surrounding background stays untouched.
+SEG_MASK_ALIGNED_SIZE = 128
+SEG_MASK_DILATE_PX = 4
+SEG_MASK_FEATHER_RADIUS = 4
 
 
 def _webrtc_ice_servers() -> list[RTCIceServer]:
     """Use public STUN by default; deployments behind NAT can provide TURN."""
 
+    return _webrtc_turn_config()[0]
+
+
+def _webrtc_turn_config() -> tuple[list[RTCIceServer], str, str, str]:
+    """Shared STUN/TURN setup for the server peer and the browser client."""
+
     servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
-    turn_url = os.getenv("WEBRTC_TURN_URL")
+    turn_url = os.getenv("WEBRTC_TURN_URL", "")
+    username = os.getenv("WEBRTC_TURN_USERNAME", "")
+    credential = os.getenv("WEBRTC_TURN_CREDENTIAL", "")
     if turn_url:
         servers.append(
             RTCIceServer(
                 urls=turn_url,
-                username=os.getenv("WEBRTC_TURN_USERNAME"),
-                credential=os.getenv("WEBRTC_TURN_CREDENTIAL"),
+                username=username or None,
+                credential=credential or None,
             )
         )
-    return servers
+    return servers, turn_url, username, credential
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +117,7 @@ class Settings:
     swap_debug_frames: int = 1
     stream_jpeg_quality: int = 90
     capture_max_width: int = 1920
+    yunet_engine: Path | None = None
 
 
 @dataclass(slots=True)
@@ -101,6 +126,36 @@ class StreamState:
     tracker: StreamTracker
     recognition: StreamRecognition
     sequence: int = 0
+
+
+# Maximum sender-clock debt before the WebRTC pacer resyncs to wall time.
+# Without this, a service time above the 33ms camera period makes next_timestamp
+# wait negative forever: recv() spins emitting stale frames in bursts with
+# timestamps sprinting ahead of the wall clock (jitter growth, fps collapse).
+WEBRTC_MAX_BEHIND_S = 0.10
+
+
+def _paced_output_timestamp(
+    start: float | None, timestamp: int | None, now: float
+) -> tuple[float, int, float]:
+    """Steady RTP pacing that never emits stale bursts and never drifts.
+
+    Returns (start, timestamp, wait_s).  Each call advances one frame
+    (VIDEO_PTIME).  When production falls behind the wall clock by more than
+    ``WEBRTC_MAX_BEHIND_S``, the anchor shifts forward instead of sprinting
+    timestamps ahead: pts stays monotonic, latency stays bounded, and the
+    receiver sees a steady clock with latest-frame content.
+    """
+
+    step = int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
+    if start is None or timestamp is None:
+        return now, 0, 0.0
+    timestamp += step
+    due = start + timestamp / VIDEO_CLOCK_RATE
+    if due < now - WEBRTC_MAX_BEHIND_S:
+        start = now - timestamp / VIDEO_CLOCK_RATE
+        due = now
+    return start, timestamp, max(0.0, due - now)
 
 
 class SwapVideoTrack(VideoStreamTrack):
@@ -125,7 +180,6 @@ class SwapVideoTrack(VideoStreamTrack):
         if self._reader is None:
             self._reader = asyncio.create_task(self._read_latest(), name="webrtc-video-reader")
             self._worker = asyncio.create_task(self._process_latest(), name="webrtc-video-worker")
-
     async def _read_latest(self) -> None:
         try:
             while self.readyState == "live":
@@ -166,17 +220,23 @@ class SwapVideoTrack(VideoStreamTrack):
 
     async def recv(self) -> VideoFrame:
         self._start_workers()
-        # The first output waits for a completed privacy-safe swap. Afterwards
-        # next_timestamp keeps RTP delivery paced even while a newer frame is
-        # being processed in parallel.
+        # Consume exactly one completed swap per output frame: without the
+        # clear, recv() would free-run on a stale frame once behind schedule.
         await self._output_ready.wait()
-        pts, time_base = await self.next_timestamp()
+        self._output_ready.clear()
+        self._pace_start, self._pace_timestamp, wait_s = _paced_output_timestamp(
+            getattr(self, "_pace_start", None),
+            getattr(self, "_pace_timestamp", None),
+            time.time(),
+        )
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
         output = self._latest_output
         if output is None:
             raise RuntimeError("WebRTC swap output was not initialized")
         result = VideoFrame.from_ndarray(output, format="bgr24")
-        result.pts = pts
-        result.time_base = time_base
+        result.pts = self._pace_timestamp
+        result.time_base = VIDEO_TIME_BASE
         return result
 
     def stop(self) -> None:
@@ -263,7 +323,10 @@ def _require_current_swapper_engine(engine_path: Path, model_path: Path) -> None
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"invalid TensorRT swap engine manifest: {manifest_path}") from error
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
-    if manifest.get("model_sha256") != model_hash:
+    # Mixed-precision engines are built from a surgically converted ONNX;
+    # accept them only with recorded provenance to the official model.
+    provenanced = manifest.get("base_model_sha256") == model_hash and "mixed_recipe" in manifest
+    if manifest.get("model_sha256") != model_hash and not provenanced:
         raise RuntimeError("TensorRT swap engine was built from a different ONNX model; rebuild it")
     if manifest.get("preserve_onnx_fp32_io") is not True:
         raise RuntimeError(
@@ -326,6 +389,11 @@ class TensorRtInSwapperGenerator:
         self._latent_tensor: Any | None = None
         self._output_tensor: Any | None = None
         self._host_output: Any | None = None
+        # The execution context is shared; worker threads and concurrent
+        # frames serialize here so set_input_shape/execute never interleave.
+        # RLock: _forward_chunk holds the lock and its sequential fallback
+        # re-enters _forward on the same thread.
+        self._forward_lock = threading.RLock()
 
     def _validate_static_bindings(self) -> None:
         """Fail early for a stale/wrong engine instead of producing plausible garbage."""
@@ -333,15 +401,19 @@ class TensorRtInSwapperGenerator:
         image_shape = tuple(self.engine.get_tensor_shape(self.image_input))
         latent_shape = tuple(self.engine.get_tensor_shape(self.latent_input))
         output_shape = tuple(self.engine.get_tensor_shape(self.output))
-        expected_image = (1, 3, self.metadata.input_size[1], self.metadata.input_size[0])
-        if all(dimension >= 0 for dimension in image_shape) and image_shape != expected_image:
-            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected {expected_image}")
-        if all(dimension >= 0 for dimension in latent_shape) and latent_shape != (1, 512):
-            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (1, 512)")
-        if all(dimension >= 0 for dimension in output_shape) and output_shape != expected_image:
-            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected {expected_image}")
+        expected_tail = (3, self.metadata.input_size[1], self.metadata.input_size[0])
+        if len(image_shape) != 4 or tuple(image_shape[1:]) != expected_tail:
+            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected (N, {expected_tail})")
+        if len(latent_shape) != 2 or tuple(latent_shape[1:]) != (512,):
+            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (N, 512)")
+        if len(output_shape) != 4 or tuple(output_shape[1:]) != expected_tail:
+            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected (N, {expected_tail})")
+        for shape in (image_shape, latent_shape, output_shape):
+            if shape[0] == 0 or any(dimension < -1 for dimension in shape):
+                raise RuntimeError(f"unexpected TensorRT dims: {shape}")
 
     def provider_summary(self) -> list[str]:
+        info = self.batch_info()
         return [
             "TensorRTDirect",
             f"input={self.image_dtype}",
@@ -350,7 +422,42 @@ class TensorRtInSwapperGenerator:
             f"image_name={self.image_input}",
             f"latent_name={self.latent_input}",
             f"output_name={self.output}",
+            f"batch={info['max_batch']}",
+            f"binding={info['binding']}",
         ]
+
+    def batch_info(self) -> dict[str, Any]:
+        """Expose engine batch/profile support with input order guarantees.
+
+        A static batch-1 engine runs multi-face batches as order-preserving
+        sequential forwards.  A dynamic-batch engine (``--max-batch N``) runs
+        each profile-sized chunk in one ``execute_async_v3`` call.  Either way
+        input rows and identity latent rows share the same face order.
+        """
+
+        image_shape = tuple(self.engine.get_tensor_shape(self.image_input))
+        latent_shape = tuple(self.engine.get_tensor_shape(self.latent_input))
+        output_shape = tuple(self.engine.get_tensor_shape(self.output))
+        static = all(dimension >= 0 for dimension in (*image_shape, *latent_shape, *output_shape))
+        if static and len(image_shape) == 4:
+            max_batch = max(int(image_shape[0]), 1)
+        else:
+            max_batch = 1
+            for profile in range(self.engine.num_optimization_profiles):
+                try:
+                    _, _opt, max_shape = self.engine.get_profile_shape(profile, self.image_input)
+                    max_batch = max(max_batch, int(max_shape[0]))
+                except Exception:
+                    continue
+        return {
+            "image_shape": image_shape,
+            "latent_shape": latent_shape,
+            "output_shape": output_shape,
+            "static": static,
+            "max_batch": max_batch if max_batch >= 1 else 1,
+            "binding": f"{self.image_input},{self.latent_input}->{self.output}",
+            "order": "input face row i uses identity latent row i",
+        }
 
     @staticmethod
     def _torch_dtype(trt_dtype: Any, torch: Any) -> Any:
@@ -368,6 +475,10 @@ class TensorRtInSwapperGenerator:
     def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
         import torch
 
+        with self._forward_lock:
+            return self._forward_locked(image, latent, torch)
+
+    def _forward_locked(self, image: np.ndarray, latent: np.ndarray, torch: Any) -> np.ndarray:
         image = np.ascontiguousarray(image, dtype=np.float32)
         latent = np.ascontiguousarray(latent, dtype=np.float32)
         if image.shape != (1, 3, self.metadata.input_size[1], self.metadata.input_size[0]):
@@ -408,9 +519,134 @@ class TensorRtInSwapperGenerator:
         output = self._host_output.numpy()
         if not np.isfinite(output).all():
             raise RuntimeError("TensorRT InSwapper output contains NaN or infinity")
-        return output
+        # The host buffer is reused across calls; return a copy so batched
+        # callers stacking per-row views never alias the same memory.
+        return np.array(output, copy=True)
 
-    def get(self, img: np.ndarray, target_face: Any, source_face: Any, *, paste_back: bool) -> np.ndarray:
+    def forward(self, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+        """Single-face forward used by the separated prepare/forward/paste path."""
+
+        return self._forward(blob, latent)
+
+    def forward_batch(self, blobs: np.ndarray, latents: np.ndarray) -> np.ndarray:
+        """Run stacked faces with order-preserving latent correspondence.
+
+        Row ``i`` of ``blobs`` always uses row ``i`` of ``latents``. Rows are
+        split into engine-sized chunks; a dynamic-batch engine (``--max-batch``)
+        executes each chunk in one ``execute_async_v3`` call, while a static
+        batch-1 engine falls back to sequential forwards. Either way the live
+        multi-face path calls this once per frame, so one TRT batch covers all
+        faces (``swap_batch_size`` == TRT rows).
+        """
+
+        images = np.ascontiguousarray(blobs, dtype=np.float32)
+        mapped = np.ascontiguousarray(latents, dtype=np.float32)
+        if images.ndim != 4 or images.shape[1:] != (
+            3,
+            self.metadata.input_size[1],
+            self.metadata.input_size[0],
+        ):
+            raise ValueError(f"unexpected InSwapper batch image shape: {images.shape}")
+        if mapped.ndim != 2 or mapped.shape[0] != images.shape[0] or mapped.shape[1] != 512:
+            raise ValueError(f"unexpected InSwapper batch latent shape: {mapped.shape}")
+        if not np.isfinite(images).all() or not np.isfinite(mapped).all():
+            raise ValueError("InSwapper batch input contains NaN or infinity")
+        if images.shape[0] == 1:
+            return self._forward(images, mapped)
+        info = self.batch_info()
+        if info["static"] and info["max_batch"] < 2:
+            # Static batch-1 engine: preserve order with sequential forwards.
+            return np.ascontiguousarray(
+                np.concatenate(
+                    [
+                        self._forward(images[i : i + 1], mapped[i : i + 1])
+                        for i in range(images.shape[0])
+                    ],
+                    axis=0,
+                )
+            )
+        chunk = max(int(info["max_batch"]), 1)
+        outputs = []
+        for start in range(0, images.shape[0], chunk):
+            piece = self._forward_chunk(
+                images[start : start + chunk], mapped[start : start + chunk]
+            )
+            outputs.append(piece)
+        return np.ascontiguousarray(np.concatenate(outputs, axis=0))
+
+    def _forward_chunk(self, images: np.ndarray, mapped: np.ndarray) -> np.ndarray:
+        """Execute one engine-sized chunk under the shared-context lock.
+
+        Falls back to order-preserving sequential forwards when the engine
+        rejects the batch shape (e.g. a static batch-1 engine).
+        """
+
+        import torch
+
+        with self._forward_lock:
+            return self._forward_chunk_locked(images, mapped, torch)
+
+    def _forward_chunk_locked(self, images: np.ndarray, mapped: np.ndarray, torch: Any) -> np.ndarray:
+        image_dtype = self._torch_dtype(self.image_dtype, torch)
+        latent_dtype = self._torch_dtype(self.latent_dtype, torch)
+        output_dtype = self._torch_dtype(self.output_dtype, torch)
+        device = torch.device(f"cuda:{self.device}")
+        try:
+            image_tensor = torch.from_numpy(np.ascontiguousarray(images)).to(
+                device=device, dtype=image_dtype
+            )
+            latent_tensor = torch.from_numpy(np.ascontiguousarray(mapped)).to(
+                device=device, dtype=latent_dtype
+            )
+            self.context.set_input_shape(self.image_input, tuple(image_tensor.shape))
+            self.context.set_input_shape(self.latent_input, tuple(latent_tensor.shape))
+            output_shape = tuple(self.context.get_tensor_shape(self.output))
+            expected = (
+                images.shape[0],
+                3,
+                self.metadata.input_size[1],
+                self.metadata.input_size[0],
+            )
+            if output_shape != expected:
+                raise RuntimeError(f"unexpected TensorRT batch output shape: {output_shape}")
+            output_tensor = torch.empty(output_shape, device=device, dtype=output_dtype)
+            self.context.set_tensor_address(self.image_input, image_tensor.data_ptr())
+            self.context.set_tensor_address(self.latent_input, latent_tensor.data_ptr())
+            self.context.set_tensor_address(self.output, output_tensor.data_ptr())
+            stream = torch.cuda.current_stream(self.device)
+            if not self.context.execute_async_v3(stream.cuda_stream):
+                raise RuntimeError("TensorRT InSwapper batch execution failed")
+            host = torch.empty(output_shape, dtype=torch.float32, pin_memory=True)
+            host.copy_(output_tensor, non_blocking=True)
+            stream.synchronize()
+            output = host.numpy()
+        except Exception:
+            # A static engine rejects batch shapes here; fall back to the
+            # order-preserving sequential path instead of failing the frame.
+            # RLock makes this re-entrant: we already hold _forward_lock.
+            return np.ascontiguousarray(
+                np.concatenate(
+                    [
+                        self._forward(images[i : i + 1], mapped[i : i + 1])
+                        for i in range(images.shape[0])
+                    ],
+                    axis=0,
+                )
+            )
+        if not np.isfinite(output).all():
+            raise RuntimeError("TensorRT InSwapper batch output contains NaN or infinity")
+        return np.ascontiguousarray(output)
+
+    def get(
+        self,
+        img: np.ndarray,
+        target_face: Any,
+        source_face: Any,
+        *,
+        paste_back: bool,
+        seg_mask_aligned: np.ndarray | None = None,
+        latent_override: np.ndarray | None = None,
+    ) -> np.ndarray:
         from insightface.utils import face_align
 
         started = time.perf_counter()
@@ -422,7 +658,14 @@ class TensorRtInSwapperGenerator:
             (self.metadata.input_mean,) * 3,
             swapRB=True,
         )
-        latent = _mapped_latent(source_face, self.metadata.emap)
+        if latent_override is not None:
+            latent = np.ascontiguousarray(
+                np.asarray(latent_override, dtype=np.float32).reshape((1, 512))
+            )
+            if not np.isfinite(latent).all():
+                raise ValueError("override identity latent contains NaN or infinity")
+        else:
+            latent = _mapped_latent(source_face, self.metadata.emap)
         prepared_at = time.perf_counter()
         prediction = self._forward(blob, latent)
         forwarded_at = time.perf_counter()
@@ -436,7 +679,9 @@ class TensorRtInSwapperGenerator:
             return bgr_fake
         debugger = self.debug_dumper if self.debug_dumper and self.debug_dumper.consume() else None
         artifacts: dict[str, np.ndarray] | None = {} if debugger is not None else None
-        result = _paste_inswapper(img, aimg, bgr_fake, matrix, artifacts=artifacts)
+        result = _paste_inswapper(
+            img, aimg, bgr_fake, matrix, seg_mask_aligned=seg_mask_aligned, artifacts=artifacts
+        )
         pasted_at = time.perf_counter()
         self.last_timing_ms = {
             "prepare": (prepared_at - started) * 1_000,
@@ -489,6 +734,60 @@ def _prediction_to_bgr(prediction: np.ndarray) -> np.ndarray:
     return np.clip(255.0 * output.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
 
 
+def _transform_polygon_to_aligned(polygon: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Map a frame-space YOLO polygon into the 128px aligned crop domain."""
+
+    points = np.asarray(polygon, dtype=np.float32).reshape((-1, 2))
+    if len(points) < 3 or not np.isfinite(points).all():
+        raise ValueError("YOLO polygon has no area for aligned mask conversion")
+    affine = np.asarray(matrix, dtype=np.float32).reshape((2, 3))
+    if not np.isfinite(affine).all():
+        raise ValueError("invalid face alignment matrix for polygon conversion")
+    homogeneous = np.concatenate([points, np.ones((len(points), 1), dtype=np.float32)], axis=1)
+    return np.ascontiguousarray(homogeneous @ affine.T, dtype=np.float32)
+
+
+def _aligned_seg_mask(
+    polygon_aligned: np.ndarray, aligned_size: int = SEG_MASK_ALIGNED_SIZE
+) -> np.ndarray | None:
+    """Rasterize an aligned polygon with boundary expansion and feathering.
+
+    Returns a float32 0..1 mask that keeps the generated face interior at full
+    opacity while tapering only the outer boundary.  Returns None for an empty
+    or degenerate polygon so the caller keeps the blur fallback path.
+    """
+
+    points = np.asarray(polygon_aligned, dtype=np.float32).reshape((-1, 2))
+    if len(points) < 3 or not np.isfinite(points).all():
+        return None
+    clipped = np.clip(points, 0, aligned_size - 1)
+    rounded = np.rint(clipped).astype(np.int32)
+    if float(cv2.contourArea(rounded)) <= 0:
+        return None
+    mask = np.zeros((aligned_size, aligned_size), dtype=np.uint8)
+    cv2.fillPoly(mask, [rounded], 255)
+    if not np.any(mask):
+        return None
+    if SEG_MASK_DILATE_PX > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (SEG_MASK_DILATE_PX * 2 + 1, SEG_MASK_DILATE_PX * 2 + 1),
+        )
+        expanded = cv2.dilate(mask, kernel)
+    else:
+        expanded = mask
+    if SEG_MASK_FEATHER_RADIUS > 0:
+        distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        alpha = np.minimum(distance / SEG_MASK_FEATHER_RADIUS, 1.0)
+        feathered = alpha.astype(np.float32)
+        feathered[mask != 0] = 1.0
+    else:
+        feathered = (expanded != 0).astype(np.float32)
+    if float(feathered.max(initial=0.0)) <= 0:
+        return None
+    return np.ascontiguousarray(feathered, dtype=np.float32)
+
+
 def _ort_raw_prediction(metadata: Any, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
     """Match InsightFace INSwapper.get() without applying forward() normalization again."""
 
@@ -501,19 +800,14 @@ def _ort_raw_prediction(metadata: Any, blob: np.ndarray, latent: np.ndarray) -> 
     )[0]
 
 
-def _paste_inswapper(
-    target_img: np.ndarray,
-    aligned: np.ndarray,
-    fake: np.ndarray,
-    matrix: np.ndarray,
-    *,
-    artifacts: dict[str, np.ndarray] | None = None,
-) -> np.ndarray:
-    """Paste only the face ROI; full-frame warps made 1080p swaps unnecessarily slow."""
+def _paste_roi(
+    target_shape: tuple[int, int], aligned_shape: tuple[int, int], matrix: np.ndarray
+) -> tuple[int, int, int, int, np.ndarray, tuple[int, int], np.ndarray, np.ndarray]:
+    """Compute the padded paste ROI shared by sequential and parallel pastes."""
 
     inverse = cv2.invertAffineTransform(matrix)
     corners = cv2.transform(
-        np.asarray([[[0, 0], [aligned.shape[1], 0], [aligned.shape[1], aligned.shape[0]], [0, aligned.shape[0]]]], dtype=np.float32),
+        np.asarray([[[0, 0], [aligned_shape[1], 0], [aligned_shape[1], aligned_shape[0]], [0, aligned_shape[0]]]], dtype=np.float32),
         inverse,
     )[0]
     minimum = np.floor(corners.min(axis=0)).astype(np.int32)
@@ -523,43 +817,164 @@ def _paste_inswapper(
     padding = max(16, int(np.ceil(max(maximum - minimum) * 0.2)))
     left = max(0, int(minimum[0]) - padding)
     top = max(0, int(minimum[1]) - padding)
-    right = min(target_img.shape[1], int(maximum[0]) + padding)
-    bottom = min(target_img.shape[0], int(maximum[1]) + padding)
+    right = min(target_shape[1], int(maximum[0]) + padding)
+    bottom = min(target_shape[0], int(maximum[1]) + padding)
     if right <= left or bottom <= top:
         raise RuntimeError("empty InSwapper paste ROI")
     roi_inverse = inverse.copy()
     roi_inverse[:, 2] -= (left, top)
-    roi_size = (right - left, bottom - top)
+    return left, top, right, bottom, roi_inverse, (right - left, bottom - top), minimum, maximum
+
+
+def _build_aligned_mask(
+    aligned_shape: tuple[int, int],
+    projected_size: float,
+    seg_mask_aligned: np.ndarray | None,
+) -> np.ndarray:
+    """Build the uint8 feather mask in the 128px aligned domain.
+
+    The YOLO polygon is intersected here (pre-warp, uint8) so BGR+alpha share
+    a single ROI warp. Tradeoff vs the old two-warp float path: ``warp(a*b)``
+    differs from ``warp(a)*warp(b)`` under linear interpolation, plus 1/255
+    quant. Kept deliberately: a second full ROI warp (or 5-channel warp) was
+    measurably slower, and boundary error stays within one feather pixel.
+    Empty results raise so callers take the fail-closed blur path.
+    """
+
+    aligned_scale = projected_size / max(max(aligned_shape[:2]), 1)
+    # Frame-space erosion divided by scale explodes for tiny faces
+    # (20px face -> ~64px erosion wipes the 128px mask). Clamp to keep an
+    # interior; typical large faces use ~10-15px and are unaffected.
+    erode_size = max(1, round(max(projected_size // 10, 10) / max(aligned_scale, 1e-6)))
+    erode_size = min(erode_size, 32)
+    aligned_mask = cv2.erode(
+        np.full(aligned_shape, 255, dtype=np.uint8),
+        np.ones((erode_size, erode_size), dtype=np.uint8),
+        iterations=1,
+    )
+    blur_radius = max(1, round(max(projected_size // 20, 5) / max(aligned_scale, 1e-6)))
+    blur_radius = min(blur_radius, 16)
+    aligned_mask = cv2.GaussianBlur(aligned_mask, (2 * blur_radius + 1,) * 2, 0)
+    if int(aligned_mask.max(initial=0)) <= 0:
+        raise RuntimeError("empty feather mask after erosion; face too small")
+    if seg_mask_aligned is None:
+        return aligned_mask
+    seg = np.asarray(seg_mask_aligned, dtype=np.float32)
+    if seg.shape != tuple(aligned_shape):
+        raise ValueError(f"YOLO seg mask shape {seg.shape} does not match aligned {aligned_shape}")
+    if not np.isfinite(seg).all():
+        raise ValueError("YOLO seg mask contains NaN or infinity")
+    if float(seg.max(initial=0.0)) <= 0:
+        raise RuntimeError("empty YOLO-constrained swap mask")
+    seg_u8 = np.rint(np.clip(seg, 0.0, 1.0) * 255.0).astype(np.uint8)
+    aligned_mask = np.rint(
+        aligned_mask.astype(np.float32) * seg_u8.astype(np.float32) / 255.0
+    ).astype(np.uint8)
+    if int(aligned_mask.max(initial=0)) <= 0:
+        raise RuntimeError("empty YOLO-constrained swap mask")
+    return aligned_mask
+
+
+def _render_face_layer(
+    fake: np.ndarray,
+    aligned_shape: tuple[int, int],
+    seg_mask_aligned: np.ndarray | None,
+    roi_inverse: np.ndarray,
+    roi_size: tuple[int, int],
+    projected_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp one face to its ROI; thread-safe on per-face buffers only.
+
+    Raises on an empty post-warp mask so the caller skips the face
+    (fail-closed to blur) instead of counting a no-op blend as success.
+    Kept for parallel-render experiments; the live path keeps warps
+    sequential (warpAffine did not scale across threads on this build).
+    """
+
+    aligned_mask = _build_aligned_mask(aligned_shape, projected_size, seg_mask_aligned)
+    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
+    mask = warped[:, :, 3:4].astype(np.float32) / 255.0
+    if float(mask.max(initial=0.0)) <= 0:
+        raise RuntimeError("empty warped swap mask")
+    return (
+        warped[:, :, :3],
+        mask,
+    )
+
+
+def _merge_layer(
+    canvas: np.ndarray,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    fake_warped: np.ndarray,
+    mask: np.ndarray,
+) -> None:
+    """Blend one rendered layer into the canvas ROI (index order on caller)."""
+
+    canvas[top:bottom, left:right] = (
+        mask * fake_warped.astype(np.float32)
+        + (1 - mask) * canvas[top:bottom, left:right].astype(np.float32)
+    ).astype(np.uint8)
+
+
+def _paste_inswapper(
+    target_img: np.ndarray,
+    aligned: np.ndarray,
+    fake: np.ndarray,
+    matrix: np.ndarray,
+    *,
+    seg_mask_aligned: np.ndarray | None = None,
+    artifacts: dict[str, np.ndarray] | None = None,
+    destination: np.ndarray | None = None,
+) -> np.ndarray:
+    """Paste only the face ROI; full-frame warps made 1080p swaps unnecessarily slow.
+
+    When ``seg_mask_aligned`` (float32 0..1 in the aligned crop domain) is given,
+    it is intersected pre-warp (see _build_aligned_mask) so BGR+alpha share one
+    ROI warp. When ``destination`` is given, the ROI is blended into it in place
+    (multi-face path copies the frame once); otherwise a blended copy is returned.
+    Empty masks raise so callers take the blur fallback.
+    """
+
+    left, top, right, bottom, roi_inverse, roi_size, minimum, maximum = _paste_roi(
+        (target_img.shape[0], target_img.shape[1]),
+        (aligned.shape[0], aligned.shape[1]),
+        matrix,
+    )
+    # Snapshot before blending: with destination=canvas, target_img aliases the
+    # mutating canvas, so storing the reference would show the final frame.
+    before_blend: np.ndarray | None = None
+    if artifacts is not None:
+        before_blend = target_img.copy()
     # Build the feather in the 128px aligned domain, then warp BGR+alpha in a
     # single operation.  The old implementation did erosion, blur, and two
     # warps over a large 1080p ROI for every face.
     projected_size = max(1.0, float(np.sqrt(np.prod(maximum - minimum))))
-    aligned_scale = projected_size / max(aligned.shape[:2])
-    erode_size = max(1, round(max(projected_size // 10, 10) / aligned_scale))
-    aligned_mask = cv2.erode(
-        np.full(aligned.shape[:2], 255, dtype=np.uint8),
-        np.ones((erode_size, erode_size), dtype=np.uint8),
-        iterations=1,
+    aligned_mask = _build_aligned_mask(
+        (aligned.shape[0], aligned.shape[1]), projected_size, seg_mask_aligned
     )
-    blur_radius = max(1, round(max(projected_size // 20, 5) / aligned_scale))
-    aligned_mask = cv2.GaussianBlur(aligned_mask, (2 * blur_radius + 1,) * 2, 0)
-    rgba = np.dstack((fake, aligned_mask))
-    warped_rgba = cv2.warpAffine(rgba, roi_inverse, roi_size, borderValue=0.0)
-    fake = warped_rgba[:, :, :3]
-    mask = warped_rgba[:, :, 3:4].astype(np.float32) / 255.0
-    result = target_img.copy()
-    target_roi = target_img[top:bottom, left:right]
-    result[top:bottom, left:right] = (
-        mask * fake + (1 - mask) * target_roi.astype(np.float32)
-    ).astype(np.uint8)
+    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
+    fake = warped[:, :, :3]
+    mask = warped[:, :, 3:4].astype(np.float32) / 255.0
+    if float(mask.max(initial=0.0)) <= 0:
+        raise RuntimeError("empty warped swap mask")
+    if destination is None:
+        result = target_img.copy()
+        _merge_layer(result, left, top, right, bottom, fake, mask)
+    else:
+        result = destination
+        _merge_layer(result, left, top, right, bottom, fake, mask)
     if artifacts is not None:
-        warped = np.zeros_like(target_img)
-        warped[top:bottom, left:right] = fake
+        warped_full = np.zeros_like(target_img)
+        warped_full[top:bottom, left:right] = fake
         debug_mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
         debug_mask[top:bottom, left:right] = np.rint(mask[:, :, 0] * 255).astype(np.uint8)
-        artifacts["inverse_warp_swap"] = warped
+        artifacts["inverse_warp_swap"] = warped_full
         artifacts["swap_mask"] = debug_mask
-        artifacts["paste_before_blend"] = target_img
+        assert before_blend is not None
+        artifacts["paste_before_blend"] = before_blend
     return result
 
 
@@ -642,6 +1057,59 @@ class SwapDebugDumper:
         (self.directory / "debug.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
+@dataclass(slots=True)
+class PreparedFace:
+    """One face after prepare, ready for batched inference with order preserved."""
+
+    index: int
+    target: Any
+    aimg: np.ndarray
+    matrix: np.ndarray
+    blob: np.ndarray
+    latent: np.ndarray
+    seg_mask_aligned: np.ndarray | None = None
+
+
+@dataclass(slots=True)
+class StageTiming:
+    """Wall-clock stage breakdown for one apply_many call.
+
+    All fields are wall times (not worker sums), so
+    ``generator_ms ~= prepare + forward + paste`` holds for both single-face
+    and multi-face frames. ``batch_size`` is TRT rows attempted.
+    """
+
+    prepare_ms: float = 0.0
+    forward_ms: float = 0.0
+    paste_ms: float = 0.0
+    generator_ms: float = 0.0
+    batch_size: int = 0
+
+
+def _load_yunet_trt(yunet_engine: Path | None) -> Any | None:
+    """Load the GPU YuNet runner when a valid engine exists, else None (CPU)."""
+
+    from experiments.trt_swap_client.yunet_trt import YuNetTRT
+
+    explicit = yunet_engine.expanduser().resolve() if yunet_engine is not None else None
+    if explicit is not None:
+        if not explicit.is_file():
+            raise FileNotFoundError(f"YuNet TensorRT engine is missing: {explicit}")
+        runner = YuNetTRT(explicit)
+        print(f"using TensorRT YuNet engine: {explicit.name}")
+        return runner
+    default = DEFAULT_YUNET_ENGINE.expanduser().resolve()
+    if default.is_file():
+        try:
+            runner = YuNetTRT(default)
+        except Exception as error:
+            print(f"YuNet TensorRT engine unusable ({error}); using CPU YuNet")
+            return None
+        print(f"using TensorRT YuNet engine: {default.name}")
+        return runner
+    return None
+
+
 class InSwapper:
     """Keep the established generator/face-analysis behavior, isolated from server code."""
 
@@ -658,6 +1126,7 @@ class InSwapper:
         target_yunet: Path,
         debug_dir: Path | None,
         debug_frames: int,
+        yunet_engine: Path | None = None,
     ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
@@ -689,15 +1158,39 @@ class InSwapper:
             self.generator = self.model
         self.target_aligner = target_aligner
         self.yunet = None
+        self._yunet_clones: list[Any] = []
         if target_aligner == "yunet_roi":
             if not target_yunet.is_file():
                 raise FileNotFoundError(f"YuNet target aligner is missing: {target_yunet}")
             self.yunet = cv2.FaceDetectorYN.create(
                 str(target_yunet), "", (320, 320), score_threshold=0.6, nms_threshold=0.3, top_k=32
             )
+            # One clone per pipeline worker: setInputSize mutates shared state,
+            # so threads must not share a single detector (measured 54→23ms).
+            for _ in range(4):
+                self._yunet_clones.append(
+                    cv2.FaceDetectorYN.create(
+                        str(target_yunet),
+                        "",
+                        (320, 320),
+                        score_threshold=0.6,
+                        nms_threshold=0.3,
+                        top_k=32,
+                    )
+                )
+            self.yunet_trt = _load_yunet_trt(yunet_engine)
+        else:
+            self.yunet_trt = None
         self.last_alignment_ms = 0.0
         self.last_generator_ms = 0.0
         self.last_generator_timing: dict[str, float] = {}
+        self.last_prepare_ms = 0.0
+        self.last_forward_ms = 0.0
+        self.last_paste_ms = 0.0
+        self.last_batch_size = 0
+        self.last_face_count = 0
+        self._cached_source_latent: np.ndarray | None = None
+        self._face_pool: ThreadPoolExecutor | None = None
         faces = self.analysis.get(source)
         if not faces:
             raise ValueError("no source face found")
@@ -720,6 +1213,13 @@ class InSwapper:
             self.generator.debug_dumper = debug_dumper
         print(f"InSwapper TensorRT warm-up completed in {(time.perf_counter() - started) * 1_000:.1f}ms")
 
+    def close(self) -> None:
+        """Shut down the shared face-pipeline pool, if one was created."""
+
+        pool, self._face_pool = getattr(self, "_face_pool", None), None
+        if pool is not None:
+            pool.shutdown(wait=True)
+
     def provider_summary(self) -> dict[str, list[str]]:
         analysis: set[str] = set()
         for model in self.analysis.models.values():
@@ -739,36 +1239,457 @@ class InSwapper:
             raise RuntimeError("swapper could not align detected face")
         return output
 
+    def _base_latent(self) -> np.ndarray:
+        """Cache the single-source identity latent shared by all target faces."""
+
+        if self._cached_source_latent is None:
+            self._cached_source_latent = np.ascontiguousarray(
+                _mapped_latent(self.source_face, self.model.emap), dtype=np.float32
+            )
+        return self._cached_source_latent
+
+    def _record_timing(
+        self,
+        *,
+        prepare_ms: float,
+        forward_ms: float,
+        paste_ms: float,
+        generator_ms: float,
+        batch_size: int,
+    ) -> None:
+        """Record wall-clock stage timings globally and for the calling thread.
+
+        All stage values are walls for the calling frame (parallel workers are
+        already joined), so ``generator_ms ~= prepare+forward+paste``. This
+        keeps /health and bench stage breakdowns comparable across 1-face and
+        N-face frames. ``last_*`` attributes are last-writer-wins (fine for
+        /health); ``last_call_timing()`` is exact per thread for the concurrent
+        compose path.
+        """
+
+        timing = {
+            "prepare": round(prepare_ms, 2),
+            "forward": round(forward_ms, 2),
+            "paste": round(paste_ms, 2),
+        }
+        self.last_prepare_ms = prepare_ms
+        self.last_forward_ms = forward_ms
+        self.last_paste_ms = paste_ms
+        self.last_generator_ms = generator_ms
+        self.last_generator_timing = timing
+        self.last_batch_size = batch_size
+        tls = self.__dict__.setdefault("_tls", threading.local())
+        tls.timing = {
+            "prepare_ms": round(prepare_ms, 2),
+            "forward_ms": round(forward_ms, 2),
+            "paste_ms": round(paste_ms, 2),
+            "generator_ms": round(generator_ms, 2),
+            "batch_size": batch_size,
+        }
+
+    def last_call_timing(self) -> dict[str, float]:
+        """Stage timings of this thread's most recent apply_many call."""
+
+        tls = self.__dict__.get("_tls")
+        timing = getattr(tls, "timing", None)
+        if not isinstance(timing, dict):
+            timing = {
+                "prepare_ms": 0.0,
+                "forward_ms": 0.0,
+                "paste_ms": 0.0,
+                "generator_ms": 0.0,
+                "batch_size": 0,
+            }
+        merged = dict(timing)
+        merged["alignment_ms"] = float(getattr(tls, "alignment_ms", 0.0) or 0.0)
+        return merged
+
+    def _align_target(self, frame: np.ndarray, kps: np.ndarray, input_size: int) -> tuple[Any, Any]:
+        from insightface.utils import face_align
+
+        return face_align.norm_crop2(frame, kps, input_size)
+
+    def _supports_separated_forward(self) -> bool:
+        return any(
+            hasattr(self.generator, name) for name in ("forward_batch", "forward", "_forward")
+        )
+
+    def _prepare_one(
+        self,
+        frame: np.ndarray,
+        index: int,
+        target: Any,
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> PreparedFace:
+        """Prepare a single face; thread-safe across faces of one frame."""
+
+        metadata = self.model
+        aimg, matrix = self._align_target(frame, target.kps, metadata.input_size[0])
+        blob = cv2.dnn.blobFromImage(
+            aimg,
+            1.0 / metadata.input_std,
+            metadata.input_size,
+            (metadata.input_mean,) * 3,
+            swapRB=True,
+        )
+        if latents_by_index is not None and index in latents_by_index:
+            # Track/session mapped latent for a future per-face identity.
+            # Row order matches the prepared face order for batch inference.
+            latent = np.ascontiguousarray(
+                np.asarray(latents_by_index[index], dtype=np.float32).reshape((1, 512))
+            )
+            if not np.isfinite(latent).all():
+                raise ValueError(f"invalid mapped latent for face {index}")
+        else:
+            latent = self._base_latent()
+        seg_mask_aligned: np.ndarray | None = None
+        if mask_polygons_by_index is not None and index in mask_polygons_by_index:
+            try:
+                polygon_frame = np.asarray(mask_polygons_by_index[index], dtype=np.float32).reshape(
+                    (-1, 2)
+                )
+                seg_mask_aligned = _aligned_seg_mask(
+                    _transform_polygon_to_aligned(polygon_frame, matrix)
+                )
+            except (TypeError, ValueError):
+                # A degenerate polygon must not break the swap; the caller
+                # keeps the blur fallback when paste later fails.
+                seg_mask_aligned = None
+        return PreparedFace(
+            index=index,
+            target=target,
+            aimg=aimg,
+            matrix=matrix,
+            blob=np.ascontiguousarray(blob, dtype=np.float32),
+            latent=latent,
+            seg_mask_aligned=seg_mask_aligned,
+        )
+
+    def _prepare_faces(
+        self,
+        frame: np.ndarray,
+        targets: dict[int, Any],
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> tuple[list[PreparedFace], float]:
+        """Align faces sequentially; per-face failures are skipped, not raised."""
+
+        started = time.perf_counter()
+        prepared: list[PreparedFace] = []
+        for index in sorted(targets):
+            target = targets[index]
+            if target is None:
+                continue
+            try:
+                prepared.append(
+                    self._prepare_one(frame, index, target, mask_polygons_by_index, latents_by_index)
+                )
+            except Exception:
+                continue
+        return prepared, (time.perf_counter() - started) * 1_000
+
+    def _prepare_faces_parallel(
+        self,
+        frame: np.ndarray,
+        targets: dict[int, Any],
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> tuple[list[PreparedFace], float]:
+        """Align faces on the shared pool; one bad kps never vetoes good faces."""
+
+        indices = [index for index in sorted(targets) if targets[index] is not None]
+        if len(indices) < 2:
+            return self._prepare_faces(frame, targets, mask_polygons_by_index, latents_by_index)
+        pool = self._get_face_pool()
+        started = time.perf_counter()
+
+        def _run(index: int) -> PreparedFace | None:
+            try:
+                return self._prepare_one(
+                    frame, index, targets[index], mask_polygons_by_index, latents_by_index
+                )
+            except Exception:
+                return None
+
+        prepared = [item for item in pool.map(_run, indices) if item is not None]
+        prepared.sort(key=lambda item: item.index)
+        return prepared, (time.perf_counter() - started) * 1_000
+
+    def _forward_one(self, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+        """Run one face through whichever forward interface the generator has."""
+
+        generator = self.generator
+        if hasattr(generator, "forward_batch"):
+            return np.asarray(generator.forward_batch(blob, latent))
+        if hasattr(generator, "forward"):
+            return np.array(generator.forward(blob, latent), copy=True)
+        if hasattr(generator, "_forward"):
+            return np.array(generator._forward(blob, latent), copy=True)
+        raise RuntimeError("generator does not support separated forward")
+
+    def _forward_prepared(self, prepared: list[PreparedFace]) -> tuple[list[np.ndarray], float]:
+        """Run one TRT batch for all faces, preserving input/latent order."""
+
+        started = time.perf_counter()
+        if not prepared:
+            return [], 0.0
+        blobs = np.ascontiguousarray(np.concatenate([item.blob for item in prepared], axis=0))
+        latents = np.ascontiguousarray(np.concatenate([item.latent for item in prepared], axis=0))
+        generator = self.generator
+        if hasattr(generator, "forward_batch"):
+            predictions = np.asarray(generator.forward_batch(blobs, latents))
+        elif hasattr(generator, "forward"):
+            # Copy each row: some forwards return views into a reused buffer.
+            predictions = np.ascontiguousarray(
+                np.concatenate(
+                    [
+                        np.array(generator.forward(item.blob, item.latent), copy=True)
+                        for item in prepared
+                    ],
+                    axis=0,
+                )
+            )
+        elif hasattr(generator, "_forward"):
+            predictions = np.ascontiguousarray(
+                np.concatenate(
+                    [
+                        np.array(generator._forward(item.blob, item.latent), copy=True)
+                        for item in prepared
+                    ],
+                    axis=0,
+                )
+            )
+        else:
+            raise RuntimeError("generator does not support separated forward")
+        if predictions.shape[0] != len(prepared):
+            raise RuntimeError("generator batch output lost face order")
+        fakes = [_prediction_to_bgr(predictions[i : i + 1]) for i in range(len(prepared))]
+        return fakes, (time.perf_counter() - started) * 1_000
+
+    def _forward_prepared_tolerant(
+        self, prepared: list[PreparedFace]
+    ) -> tuple[list[PreparedFace], list[np.ndarray], float]:
+        """Batched forward with per-face fallback so one bad row never kills the frame.
+
+        Tries a single ``forward_batch`` first (one TRT launch for N faces).
+        On failure (e.g. one NaN latent poisons validation), retries each face
+        individually and keeps only the successes.
+        """
+
+        started = time.perf_counter()
+        if not prepared:
+            return [], [], 0.0
+        try:
+            fakes, _ = self._forward_prepared(prepared)
+            return prepared, fakes, (time.perf_counter() - started) * 1_000
+        except Exception:
+            pass
+        kept: list[PreparedFace] = []
+        fakes: list[np.ndarray] = []
+        for item in prepared:
+            try:
+                prediction = self._forward_one(item.blob, item.latent)
+                fakes.append(_prediction_to_bgr(prediction))
+                kept.append(item)
+            except Exception:
+                continue
+        return kept, fakes, (time.perf_counter() - started) * 1_000
+
+    def _paste_prepared(
+        self, output: np.ndarray, prepared: list[PreparedFace], fakes: list[np.ndarray]
+    ) -> tuple[np.ndarray, set[int], float]:
+        started = time.perf_counter()
+        succeeded: set[int] = set()
+        # One full-frame copy for all faces; each ROI blends into the evolving
+        # canvas in index order, exactly like sequential per-face pastes.
+        # (Worker-thread warps were measured slower: warpAffine on this build
+        # does not scale across threads, so pastes stay sequential.)
+        canvas = output.copy()
+        for item, bgr_fake in zip(prepared, fakes, strict=True):
+            try:
+                _paste_inswapper(
+                    canvas,
+                    item.aimg,
+                    bgr_fake,
+                    item.matrix,
+                    seg_mask_aligned=item.seg_mask_aligned,
+                    destination=canvas,
+                )
+            except Exception:
+                continue
+            succeeded.add(item.index)
+        return canvas, succeeded, (time.perf_counter() - started) * 1_000
+
     def apply_many(
-        self, frame: np.ndarray, boxes: list[list[float]]
+        self,
+        frame: np.ndarray,
+        boxes: list[list[float]],
+        mask_polygons: list[Any] | dict[int, Any] | None = None,
+        latents_by_index: dict[int, np.ndarray] | None = None,
     ) -> tuple[np.ndarray, set[int]]:
-        """Run FaceAnalysis once per frame, then map only YOLO class-0 boxes to it."""
+        """Run FaceAnalysis once per frame, then swap every YOLO face in one TRT batch.
+
+        ``mask_polygons`` optionally carries YOLO segmentation polygons aligned
+        with ``boxes`` (list) or keyed by box index (dict). Each polygon is
+        converted to the aligned crop domain and intersected pre-warp so the
+        background outside the segmentation is preserved. ``latents_by_index``
+        optionally maps a box index to its own identity latent row; without it
+        every face shares the single source latent.
+
+        Pipeline per frame (all walls, so generator ~= prepare+forward+paste):
+        parallel prepare -> single ``forward_batch`` (one TRT launch for N
+        faces) -> sequential paste in index order. Each stage skips bad faces
+        individually; only zero successes returns the untouched frame.
+        """
 
         alignment_started = time.perf_counter()
         targets = self._target_faces(frame, boxes)
         self.last_alignment_ms = (time.perf_counter() - alignment_started) * 1_000
+        self.last_face_count = len(targets)
+        self.__dict__.setdefault("_tls", threading.local()).alignment_ms = self.last_alignment_ms
+        polygons_by_index: dict[int, Any] | None = None
+        if mask_polygons is not None:
+            if isinstance(mask_polygons, dict):
+                polygons_by_index = dict(mask_polygons)
+            else:
+                polygons_by_index = {index: polygon for index, polygon in enumerate(mask_polygons)}
+        if not targets:
+            self._record_timing(
+                prepare_ms=0.0, forward_ms=0.0, paste_ms=0.0, generator_ms=0.0, batch_size=0
+            )
+            return frame, set()
+        if not self._supports_separated_forward():
+            return self._apply_many_legacy(frame, targets)
+        return self._apply_many_batched(frame, targets, polygons_by_index, latents_by_index)
+
+    def _get_face_pool(self) -> ThreadPoolExecutor:
+        """Shared face-pipeline pool (reused across frames and sessions)."""
+
+        pool = getattr(self, "_face_pool", None)
+        if pool is None:
+            with _POOL_CREATE_LOCK:
+                pool = getattr(self, "_face_pool", None)
+                if pool is None:
+                    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-face")
+                    self._face_pool = pool
+        return pool
+
+    def _apply_many_batched(
+        self,
+        frame: np.ndarray,
+        targets: dict[int, Any],
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> tuple[np.ndarray, set[int]]:
+        """Prepare in parallel, infer in one TRT batch, paste sequentially in order."""
+
+        started = time.perf_counter()
+        prepared, prepare_ms = self._prepare_faces_parallel(
+            frame, targets, mask_polygons_by_index, latents_by_index
+        )
+        attempted = len(prepared)
+        self.last_batch_size = attempted
+        if not prepared:
+            self._record_timing(
+                prepare_ms=prepare_ms,
+                forward_ms=0.0,
+                paste_ms=0.0,
+                generator_ms=(time.perf_counter() - started) * 1_000,
+                batch_size=0,
+            )
+            return frame, set()
+        kept, fakes, forward_ms = self._forward_prepared_tolerant(prepared)
+        if not kept:
+            self._record_timing(
+                prepare_ms=prepare_ms,
+                forward_ms=forward_ms,
+                paste_ms=0.0,
+                generator_ms=(time.perf_counter() - started) * 1_000,
+                batch_size=attempted,
+            )
+            return frame, set()
+        output, succeeded, paste_ms = self._paste_prepared(frame, kept, fakes)
+        generator_ms = (time.perf_counter() - started) * 1_000
+        self._record_timing(
+            prepare_ms=prepare_ms,
+            forward_ms=forward_ms,
+            paste_ms=paste_ms,
+            generator_ms=generator_ms,
+            batch_size=attempted,
+        )
+        return output, succeeded
+
+    def _apply_many_pipelined(
+        self,
+        frame: np.ndarray,
+        targets: dict[int, Any],
+        mask_polygons_by_index: dict[int, Any] | None,
+        latents_by_index: dict[int, np.ndarray] | None,
+    ) -> tuple[np.ndarray, set[int]]:
+        """Backward-compatible alias for the batched pipeline."""
+
+        return self._apply_many_batched(frame, targets, mask_polygons_by_index, latents_by_index)
+
+    def _apply_many_legacy(
+        self, frame: np.ndarray, targets: dict[int, Any]
+    ) -> tuple[np.ndarray, set[int]]:
+        """Preserve the exact sequential behavior for generators without forward()."""
+
         output = frame
         succeeded: set[int] = set()
-        generator_started = time.perf_counter()
-        for index, target in targets.items():
+        prepare_ms = forward_ms = paste_ms = 0.0
+        for index, target in sorted(targets.items()):
             if target is None:
                 continue
             try:
+                started = time.perf_counter()
                 output = self.generator.get(output, target, self.source_face, paste_back=True)
+                elapsed = (time.perf_counter() - started) * 1_000
+                timing = dict(getattr(self.generator, "last_timing_ms", {}))
+                prepare_ms += float(timing.get("prepare", 0.0)) or 0.0
+                forward_ms += float(timing.get("forward", 0.0)) or 0.0
+                paste_ms += float(timing.get("paste", 0.0)) or 0.0
+                if not timing:
+                    forward_ms += elapsed
             except Exception:
                 continue
             succeeded.add(index)
-        self.last_generator_ms = (time.perf_counter() - generator_started) * 1_000
-        self.last_generator_timing = dict(getattr(self.generator, "last_timing_ms", {}))
+        generator_ms = prepare_ms + forward_ms + paste_ms
+        if generator_ms <= 0:
+            # Legacy mocks without timing still report the loop total.
+            generator_ms = sum((prepare_ms, forward_ms, paste_ms))
+        self._record_timing(
+            prepare_ms=prepare_ms,
+            forward_ms=forward_ms,
+            paste_ms=paste_ms,
+            generator_ms=generator_ms,
+            batch_size=len(targets),
+        )
         return output, succeeded
 
     def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
         targets: dict[int, Any] = {}
         if self.yunet is not None:
-            for index, box in enumerate(boxes):
-                target = self._target_from_yunet(frame, box)
-                if target is not None:
-                    targets[index] = target
+            runner = getattr(self, "yunet_trt", None)
+            rois = [(index, _yunet_roi(frame, box)) for index, box in enumerate(boxes)]
+            if (
+                runner is not None
+                and rois
+                and all(
+                    roi is not None
+                    and max(roi[2] - roi[0], roi[3] - roi[1]) <= runner.max_side
+                    for _, roi in rois
+                )
+            ):
+                targets = self._targets_from_yunet_trt(runner, frame, boxes, rois)
+            elif len(boxes) > 1 and len(getattr(self, "_yunet_clones", [])) >= len(boxes):
+                targets = self._targets_from_yunet_parallel(frame, boxes)
+            else:
+                for index, box in enumerate(boxes):
+                    target = self._target_from_yunet(frame, box)
+                    if target is not None:
+                        targets[index] = target
         missing = [index for index in range(len(boxes)) if index not in targets]
         if not missing:
             return targets
@@ -787,46 +1708,188 @@ class InSwapper:
             targets[index] = target
         return targets
 
-    def _target_from_yunet(self, frame: np.ndarray, box: list[float]) -> Any | None:
-        if self.yunet is None:
+    def _targets_from_yunet_parallel(
+        self, frame: np.ndarray, boxes: list[list[float]]
+    ) -> dict[int, Any]:
+        """Run YuNet landmark detection on clones (setInputSize is not thread-safe)."""
+
+        clones = getattr(self, "_yunet_clones", [])
+        pool = self._get_face_pool()
+        targets: dict[int, Any] = {}
+
+        def _detect(pair: tuple[int, Any]) -> tuple[int, Any | None]:
+            index, box = pair
+            try:
+                return index, _target_from_yunet_with(clones[index % len(clones)], frame, box)
+            except Exception:
+                return index, None
+
+        for index, target in pool.map(_detect, enumerate(boxes)):
+            if target is not None:
+                targets[index] = target
+        return targets
+
+    def _targets_from_yunet_trt(
+        self,
+        runner: Any,
+        frame: np.ndarray,
+        boxes: list[list[float]],
+        rois: list[tuple[int, tuple[int, int, int, int] | None]],
+    ) -> dict[int, Any]:
+        """Run YuNet landmark detection on the GPU runner (validated = CPU)."""
+
+        targets: dict[int, Any] = {}
+        if len(boxes) < 2:
+            for index, roi in rois:
+                target = self._target_from_yunet_trt_one(runner, frame, boxes[index], roi)
+                if target is not None:
+                    targets[index] = target
+            return targets
+        pool = self._get_face_pool()
+
+        def _detect(pair: tuple[int, tuple[int, int, int, int] | None]) -> tuple[int, Any | None]:
+            index, roi = pair
+            try:
+                return index, self._target_from_yunet_trt_one(runner, frame, boxes[index], roi)
+            except Exception:
+                return index, None
+
+        for index, target in pool.map(_detect, rois):
+            if target is not None:
+                targets[index] = target
+        return targets
+
+    def _target_from_yunet_trt_one(
+        self,
+        runner: Any,
+        frame: np.ndarray,
+        box: list[float],
+        roi: tuple[int, int, int, int] | None,
+    ) -> Any | None:
+        """One GPU YuNet lookup with CPU fallback on any failure."""
+
+        from experiments.trt_swap_client.yunet_trt import extend_window
+
+        if roi is None:
             return None
-        x1, y1, x2, y2 = (float(value) for value in box)
-        padding_x = (x2 - x1) * 0.35
-        padding_y = (y2 - y1) * 0.35
-        left = max(0, int(np.floor(x1 - padding_x)))
-        top = max(0, int(np.floor(y1 - padding_y)))
-        right = min(frame.shape[1], int(np.ceil(x2 + padding_x)))
-        bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
-        if right - left < 32 or bottom - top < 32:
-            return None
-        roi = frame[top:bottom, left:right]
-        try:
-            self.yunet.setInputSize((roi.shape[1], roi.shape[0]))
-            _, detections = self.yunet.detect(roi)
-        except cv2.error:
-            return None
+        left, top, right, bottom = roi
+        window, (origin_x, origin_y) = extend_window(frame, left, top, right, bottom)
+        detections = runner.detect(window)
         if detections is None or not len(detections):
             return None
         candidate = max(
-            detections,
+            (row for row in detections),
             key=lambda row: _iou(
-                [row[0] + left, row[1] + top, row[0] + row[2] + left, row[1] + row[3] + top], box
+                [
+                    row[0] + origin_x,
+                    row[1] + origin_y,
+                    row[0] + row[2] + origin_x,
+                    row[1] + row[3] + origin_y,
+                ],
+                box,
             ),
+            default=None,
         )
+        if candidate is None:
+            return None
         candidate_box = [
-            float(candidate[0] + left),
-            float(candidate[1] + top),
-            float(candidate[0] + candidate[2] + left),
-            float(candidate[1] + candidate[3] + top),
+            float(candidate[0] + origin_x),
+            float(candidate[1] + origin_y),
+            float(candidate[0] + candidate[2] + origin_x),
+            float(candidate[1] + candidate[3] + origin_y),
         ]
         if _iou(candidate_box, box) < 0.2:
             return None
         from insightface.app.common import Face
 
-        landmarks = np.asarray(candidate[5:15], dtype=np.float32).reshape((5, 2))
-        landmarks[:, 0] += left
-        landmarks[:, 1] += top
+        landmarks = np.asarray(candidate[4:14], dtype=np.float32).reshape((5, 2))
+        landmarks[:, 0] += origin_x
+        landmarks[:, 1] += origin_y
         return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
+
+    def _target_from_yunet(self, frame: np.ndarray, box: list[float]) -> Any | None:
+        if self.yunet is None:
+            return None
+        return _target_from_yunet_with(self.yunet, frame, box)
+
+
+def _yunet_roi(frame: np.ndarray, box: list[float]) -> tuple[int, int, int, int] | None:
+    """Padded ROI for one detector box (None when too small to detect)."""
+
+    x1, y1, x2, y2 = (float(value) for value in box)
+    padding_x = (x2 - x1) * 0.35
+    padding_y = (y2 - y1) * 0.35
+    left = max(0, int(np.floor(x1 - padding_x)))
+    top = max(0, int(np.floor(y1 - padding_y)))
+    right = min(frame.shape[1], int(np.ceil(x2 + padding_x)))
+    bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
+    if right - left < 32 or bottom - top < 32:
+        return None
+    return left, top, right, bottom
+
+
+def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> Any | None:
+    """YuNet five-point landmark path for one detector box (clone-safe)."""
+
+    roi_box = _yunet_roi(frame, box)
+    if roi_box is None:
+        return None
+    left, top, right, bottom = roi_box
+    roi = frame[top:bottom, left:right]
+    try:
+        ynet.setInputSize((roi.shape[1], roi.shape[0]))
+        _, detections = ynet.detect(roi)
+    except cv2.error:
+        return None
+    if detections is None or not len(detections):
+        return None
+    candidate = max(
+        detections,
+        key=lambda row: _iou(
+            [row[0] + left, row[1] + top, row[0] + row[2] + left, row[1] + row[3] + top], box
+        ),
+    )
+    candidate_box = [
+        float(candidate[0] + left),
+        float(candidate[1] + top),
+        float(candidate[0] + candidate[2] + left),
+        float(candidate[1] + candidate[3] + top),
+    ]
+    if _iou(candidate_box, box) < 0.2:
+        return None
+    from insightface.app.common import Face
+
+    landmarks = np.asarray(candidate[4:14], dtype=np.float32).reshape((5, 2))
+    landmarks[:, 0] += left
+    landmarks[:, 1] += top
+    return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
+
+
+# Serializes lazy pool creation so concurrent first frames never leak pools.
+_POOL_CREATE_LOCK = threading.Lock()
+
+
+def _find_pending_job_index(pending: list[Any], stream: Any) -> int | None:
+    """Find the newest queued job from the same stream for latest-frame coalescing."""
+
+    for position in range(len(pending) - 1, -1, -1):
+        if pending[position].stream is stream:
+            return position
+    return None
+
+
+def _group_job_indices(jobs: list[Any]) -> list[list[int]]:
+    """Group batch positions by stream, preserving first-appearance order."""
+
+    order: list[int] = []
+    groups: dict[int, list[int]] = {}
+    for position, job in enumerate(jobs):
+        key = id(job.stream)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(position)
+    return [groups[key] for key in order]
 
 
 class SwapLab:
@@ -853,6 +1916,7 @@ class SwapLab:
             target_yunet=settings.target_yunet,
             debug_dir=settings.swap_debug_dir,
             debug_frames=settings.swap_debug_frames,
+            yunet_engine=settings.yunet_engine,
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -863,6 +1927,14 @@ class SwapLab:
         self.worker: asyncio.Task[None] | None = None
         self.frames = 0
         self.latencies: deque[float] = deque(maxlen=300)
+        self._stats_lock = threading.Lock()
+        self._compose_pool_attr: ThreadPoolExecutor | None = None
+        # Render FPS counts every composed frame; swap-completed FPS counts only
+        # frames with at least one successful face synthesis.
+        self.swap_completed_frames = 0
+        self.swapped_faces_total = 0
+        self.swap_latencies: deque[float] = deque(maxlen=300)
+        self.dropped_frames = 0
 
     @staticmethod
     def _load_detector(yolo: Any, detector_path: Path) -> tuple[Any, str]:
@@ -890,9 +1962,16 @@ class SwapLab:
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
         await asyncio.to_thread(self.adaface.close)
+        await asyncio.to_thread(self.swapper.close)
+        pool = getattr(self, "_compose_pool_attr", None)
+        if pool is not None:
+            self._compose_pool_attr = None
+            await asyncio.to_thread(pool.shutdown, True)
 
     def create_stream(self, session_id: str) -> StreamState:
         self.sessions.get_or_create(session_id)
+        # Tracker and recognition objects are owned per stream, so batched
+        # frames from different sessions never share identity or frame order.
         return StreamState(
             session_id=session_id,
             # The prior one-frame mask hold visibly lags fast movement.  This
@@ -909,6 +1988,17 @@ class SwapLab:
             recognition=StreamRecognition(self.adaface, RecognitionConfig(), owner=session_id),
         )
 
+    def _pending_jobs_snapshot(self) -> list[FrameJob]:
+        """Snapshot queued jobs without yielding to the event loop.
+
+        Isolates the single private ``asyncio.Queue._queue`` access. The caller
+        must not ``await`` between this snapshot and any in-place frame replace
+        so coalescing stays atomic w.r.t. the event loop. If asyncio ever
+        exposes a public snapshot API, replace this helper.
+        """
+
+        return list(self.queue._queue)  # type: ignore[attr-defined]
+
     async def submit(
         self, frame: np.ndarray, stream: StreamState
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -916,8 +2006,33 @@ class SwapLab:
         future: asyncio.Future[tuple[np.ndarray, dict[str, Any]]] = loop.create_future()
         try:
             self.queue.put_nowait(FrameJob(frame, stream, future))
-        except asyncio.QueueFull as error:
-            raise RuntimeError("detector queue is saturated; drop this frame") from error
+        except asyncio.QueueFull:
+            # Bounded latest-frame policy: prefer the newest camera frame over
+            # growing a backlog. Same-stream coalescing replaces the pending
+            # frame so per-session order stays intact; otherwise the oldest
+            # queued frame is evicted to keep queue delay bounded.
+            # No await between snapshot and frame replace -> atomic.
+            pending = self._pending_jobs_snapshot()
+            coalesced = _find_pending_job_index(pending, stream)
+            if coalesced is not None:
+                pending[coalesced].frame = frame
+                future.cancel()
+                return await pending[coalesced].future
+            try:
+                oldest = self.queue.get_nowait()
+            except asyncio.QueueEmpty as error:
+                raise RuntimeError("detector queue is saturated; drop this frame") from error
+            try:
+                if not oldest.future.done():
+                    oldest.future.set_exception(RuntimeError("dropped: superseded by newer frame"))
+            finally:
+                self.queue.task_done()
+                self.dropped_frames += 1
+            try:
+                self.queue.put_nowait(FrameJob(frame, stream, future))
+            except asyncio.QueueFull as error:
+                future.cancel()
+                raise RuntimeError("detector queue is saturated; drop this frame") from error
         return await future
 
     async def enroll(self, session_id: str, image: np.ndarray) -> dict[str, Any]:
@@ -933,23 +2048,33 @@ class SwapLab:
         while True:
             first = await self.queue.get()
             jobs = [first]
-            deadline = asyncio.get_running_loop().time() + self.settings.batch_wait_ms / 1000
-            while len(jobs) < self.settings.max_batch:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    jobs.append(await asyncio.wait_for(self.queue.get(), remaining))
-                except TimeoutError:
-                    break
+            # Only spend the batch-wait budget when a backlog already exists.
+            # An idle single session used to pay the full wait on every frame;
+            # under load the queue is non-empty and batching works as before.
+            if self.settings.max_batch > 1 and not self.queue.empty():
+                deadline = asyncio.get_running_loop().time() + self.settings.batch_wait_ms / 1000
+                while len(jobs) < self.settings.max_batch:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        jobs.append(await asyncio.wait_for(self.queue.get(), remaining))
+                    except TimeoutError:
+                        break
             try:
                 inference_started = time.perf_counter()
                 results = await asyncio.to_thread(self._predict, [job.frame for job in jobs])
                 detector_batch_ms = (time.perf_counter() - inference_started) * 1_000
-                for job, prediction in zip(jobs, results, strict=True):
-                    output, meta = await self._compose(job.frame, prediction, job.stream, len(jobs))
-                    meta["detector_batch_ms"] = round(detector_batch_ms, 2)
-                    job.future.set_result((output, meta))
+                groups = _group_job_indices(jobs)
+                if len(groups) < 2:
+                    for position, job in enumerate(jobs):
+                        output, meta = await self._compose(
+                            job.frame, results[position], job.stream, len(jobs)
+                        )
+                        meta["detector_batch_ms"] = round(detector_batch_ms, 2)
+                        job.future.set_result((output, meta))
+                else:
+                    await self._compose_groups(jobs, results, detector_batch_ms)
             except Exception as error:
                 for job in jobs:
                     if not job.future.done():
@@ -957,6 +2082,61 @@ class SwapLab:
             finally:
                 for _ in jobs:
                     self.queue.task_done()
+
+    def _compose_pool(self) -> ThreadPoolExecutor:
+        """Shared compose pool across detector batches (never nested in face pool)."""
+
+        pool = getattr(self, "_compose_pool_attr", None)
+        if pool is None:
+            with _POOL_CREATE_LOCK:
+                pool = getattr(self, "_compose_pool_attr", None)
+                if pool is None:
+                    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="swap-compose")
+                    self._compose_pool_attr = pool
+        return pool
+
+    async def _compose_groups(
+        self,
+        jobs: list[FrameJob],
+        results: list[Any],
+        detector_batch_ms: float,
+    ) -> None:
+        """Compose multi-stream batches with per-stream order preserved.
+
+        Jobs from one stream stay sequential in their group; groups run
+        concurrently.  A group failure only fails its own jobs.
+        """
+
+        loop = asyncio.get_running_loop()
+        groups = _group_job_indices(jobs)
+
+        def _compose_group(idxs: list[int]) -> list[tuple[int, bool, Any]]:
+            outcomes: list[tuple[int, bool, Any]] = []
+            for position in idxs:
+                job = jobs[position]
+                try:
+                    output, meta = self._compose_sync(
+                        job.frame, results[position], job.stream, len(jobs)
+                    )
+                except Exception as error:
+                    outcomes.append((position, False, error))
+                else:
+                    meta["detector_batch_ms"] = round(detector_batch_ms, 2)
+                    outcomes.append((position, True, (output, meta)))
+            return outcomes
+
+        grouped = await asyncio.gather(
+            *(loop.run_in_executor(self._compose_pool(), _compose_group, idxs) for idxs in groups)
+        )
+        for outcomes in grouped:
+            for position, ok, payload in outcomes:
+                job = jobs[position]
+                if job.future.done():
+                    continue
+                if ok:
+                    job.future.set_result(payload)
+                else:
+                    job.future.set_exception(payload)
 
     def _predict(self, frames: list[np.ndarray]) -> list[Any]:
         return list(
@@ -976,6 +2156,11 @@ class SwapLab:
         )
 
     async def _compose(
+        self, frame: np.ndarray, prediction: Any, stream: StreamState, batch_size: int
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        return self._compose_sync(frame, prediction, stream, batch_size)
+
+    def _compose_sync(
         self, frame: np.ndarray, prediction: Any, stream: StreamState, batch_size: int
     ) -> tuple[np.ndarray, dict[str, Any]]:
         started = time.perf_counter()
@@ -1013,7 +2198,9 @@ class SwapLab:
         if swap_candidates:
             try:
                 output, succeeded = self.swapper.apply_many(
-                    output, [item["bbox"] for item in swap_candidates]
+                    output,
+                    [item["bbox"] for item in swap_candidates],
+                    [item.get("mask_polygon") for item in swap_candidates],
                 )
             except Exception:
                 succeeded = set()
@@ -1027,19 +2214,34 @@ class SwapLab:
         if fallback_objects:
             output = _blur_objects(output, fallback_objects)
         elapsed = (time.perf_counter() - started) * 1_000
-        self.frames += 1
-        self.latencies.append(elapsed)
+        call_timing = self.swapper.last_call_timing()
+        with self._stats_lock:
+            self.frames += 1
+            self.latencies.append(elapsed)
+            if swapped > 0:
+                self.swap_completed_frames += 1
+                self.swapped_faces_total += swapped
+                self.swap_latencies.append(swap_ms)
         return output, {
             "detections": len(objects),
             "swap_faces": swapped,
             "fallback_blurs": fallback,
             "small_face_fallbacks": small_face_fallbacks,
             "swap_ms": round(swap_ms, 2),
-            "swap_alignment_ms": round(self.swapper.last_alignment_ms, 2),
-            "swap_generator_ms": round(self.swapper.last_generator_ms, 2),
+            "swap_alignment_ms": round(call_timing.get("alignment_ms", self.swapper.last_alignment_ms), 2),
+            "swap_generator_ms": round(call_timing.get("generator_ms", 0.0), 2),
             "swap_generator_timing_ms": {
-                name: round(value, 2) for name, value in self.swapper.last_generator_timing.items()
+                "prepare": round(call_timing.get("prepare_ms", 0.0), 2),
+                "forward": round(call_timing.get("forward_ms", 0.0), 2),
+                "paste": round(call_timing.get("paste_ms", 0.0), 2),
             },
+            "swap_prepare_ms": round(call_timing.get("prepare_ms", 0.0), 2),
+            "swap_forward_ms": round(call_timing.get("forward_ms", 0.0), 2),
+            "swap_paste_ms": round(call_timing.get("paste_ms", 0.0), 2),
+            "swap_batch_size": int(call_timing.get("batch_size", 0)),
+            "swap_faces_total": self.swapped_faces_total,
+            "render_frames": self.frames,
+            "swap_completed_frames": self.swap_completed_frames,
             "yolo_batch": batch_size,
             "adaface": recognition,
             "tracking": temporal,
@@ -1062,7 +2264,12 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
             )
         except (TypeError, ValueError):
             polygon = np.empty((0, 2), dtype=np.float32)
-        if len(polygon) < 3 or not np.isfinite(polygon).all():
+        # Area is strictly mask-based: a degenerate mask measures 0 (blur
+        # fallback) instead of the box rectangle, so a small face with a loose
+        # box or a failed mask can never pass the swap gate.  The rectangle is
+        # kept only as the blur region to stay fail-closed.
+        mask_valid = len(polygon) >= 3 and bool(np.isfinite(polygon).all())
+        if not mask_valid:
             x1, y1, x2, y2 = row[:4]
             polygon = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)), dtype=np.float32)
         stride = max(1, int(np.ceil(len(polygon) / MAX_POLYGON_POINTS)))
@@ -1076,7 +2283,7 @@ def _objects(prediction: Any, tracks: np.ndarray, names: dict[int, str], width: 
                 "confidence": float(row[5]),
                 "bbox": [float(value) for value in row[:4]],
                 "mask_polygon": polygon.tolist(),
-                "mask_area_px": _polygon_area(polygon),
+                "mask_area_px": _polygon_area(polygon) if mask_valid else 0.0,
             }
         )
     return objects
@@ -1173,9 +2380,13 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
+        _, turn_url, turn_username, turn_credential = _webrtc_turn_config()
         return (
             _HTML.replace("__JPEG_QUALITY__", str(settings.stream_jpeg_quality / 100))
             .replace("__CAPTURE_WIDTH__", str(settings.capture_max_width))
+            .replace("__TURN_URL__", json.dumps(turn_url))
+            .replace("__TURN_USERNAME__", json.dumps(turn_username))
+            .replace("__TURN_CREDENTIAL__", json.dumps(turn_credential))
         )
 
     @app.get("/health")
@@ -1183,12 +2394,27 @@ def create_app(settings: Settings) -> FastAPI:
         return {
             "ready": True,
             "frames": lab.frames,
+            "render_frames": lab.frames,
+            "swap_completed_frames": lab.swap_completed_frames,
+            "swapped_faces_total": lab.swapped_faces_total,
+            "dropped_frames": lab.dropped_frames,
             "queue": lab.queue.qsize(),
             "p50_ms": float(np.percentile(lab.latencies, 50)) if lab.latencies else None,
+            "p95_ms": float(np.percentile(lab.latencies, 95)) if lab.latencies else None,
+            "swap_p50_ms": float(np.percentile(lab.swap_latencies, 50))
+            if lab.swap_latencies
+            else None,
+            "swap_p95_ms": float(np.percentile(lab.swap_latencies, 95))
+            if lab.swap_latencies
+            else None,
             "swapper_providers": lab.swapper.provider_summary(),
             "detector_backend": lab.detector_backend,
             "last_swap_alignment_ms": round(lab.swapper.last_alignment_ms, 2),
             "last_swap_generator_ms": round(lab.swapper.last_generator_ms, 2),
+            "last_swap_prepare_ms": round(getattr(lab.swapper, "last_prepare_ms", 0.0), 2),
+            "last_swap_forward_ms": round(getattr(lab.swapper, "last_forward_ms", 0.0), 2),
+            "last_swap_paste_ms": round(getattr(lab.swapper, "last_paste_ms", 0.0), 2),
+            "last_swap_batch_size": int(getattr(lab.swapper, "last_batch_size", 0)),
         }
 
     @app.post("/api/enroll/{session_id}")
@@ -1351,6 +2577,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-yunet", type=Path, default=DEFAULT_FACE_DETECTOR)
     parser.add_argument(
+        "--yunet-engine",
+        type=Path,
+        default=None,
+        help="YuNet TensorRT engine (default: auto-use models/face_detection_yunet_trt.engine when built)",
+    )
+    parser.add_argument(
         "--input-video",
         type=Path,
         help="optional compressed input decoded by NVDEC and written as /hls/live.m3u8 via NVENC",
@@ -1382,6 +2614,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_swapper_engine(cli_path: Path) -> Path:
+    """Pick the swapper engine: explicit flag wins, else mixed if built, else stock."""
+
+    explicit = cli_path.expanduser().resolve()
+    default = DEFAULT_SWAPPER_ENGINE.expanduser().resolve()
+    if explicit != default:
+        return explicit
+    if MIXED_SWAPPER_ENGINE.is_file():
+        print(f"using mixed-precision swap engine: {MIXED_SWAPPER_ENGINE.name}")
+        return MIXED_SWAPPER_ENGINE.resolve()
+    return default.resolve()
+
+
 def main() -> None:
     args = parse_args()
     if (
@@ -1404,10 +2649,11 @@ def main() -> None:
     input_video = args.input_video.expanduser().resolve() if args.input_video else None
     if input_video is not None and not input_video.is_file():
         raise SystemExit(f"input video not found: {input_video}")
+    swapper_engine = _resolve_swapper_engine(args.swapper_engine)
     settings = Settings(
         args.detector.expanduser().resolve(),
         args.swapper.expanduser().resolve(),
-        args.swapper_engine.expanduser().resolve(),
+        swapper_engine,
         args.source.expanduser().resolve(),
         args.device,
         args.max_batch,
@@ -1426,6 +2672,7 @@ def main() -> None:
         args.swap_debug_frames,
         args.stream_jpeg_quality,
         args.capture_max_width,
+        args.yunet_engine.expanduser().resolve() if args.yunet_engine else None,
     )
     import uvicorn
 
@@ -1448,13 +2695,41 @@ _HTML = """<!doctype html>
 const id=crypto.randomUUID();
 const v=document.querySelector('#v'),rtcOutput=document.querySelector('#rtc-output'),wsOutput=document.querySelector('#ws-output'),m=document.querySelector('#m');
 const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__,decoder=new TextDecoder();
-let ws=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false;
+let ws=null,peer=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false,rtcChain=false,netStat={},netAt=performance.now(),prevInbound=null,prevOutbound=null,camTrack=null,serverEmaMs=0,adaptAt=0,camFps=30;
+const turnUrl=__TURN_URL__,turnUser=__TURN_USERNAME__,turnCred=__TURN_CREDENTIAL__;
+function turnIceServers(){const servers=[{urls:'stun:stun.l.google.com:19302'}];if(turnUrl)servers.push({urls:turnUrl,username:turnUser||undefined,credential:turnCred||undefined});return servers;}
 function reportWebRtc(){
   const now=performance.now(),elapsed=now-rtcWindowAt;if(elapsed<1000)return;
-  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_render_fps:+(rtcFrames*1000/elapsed).toFixed(1),capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
+  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_present_fps:+(rtcFrames*1000/elapsed).toFixed(1),client_net_fps:netStat.fps??null,client_decoded_fps:netStat.decFps??null,client_dropped_fps:netStat.dropFps??null,client_up_fps:netStat.upFps??null,client_cam_fps:camFps,client_freezes:netStat.freezes??null,client_jitter_ms:netStat.jitter??null,client_pli:netStat.pli??null,capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
   rtcFrames=0;rtcWindowAt=now;
 }
-function countWebRtcFrame(){rtcFrames++;reportWebRtc();rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
+async function adaptCaptureFps(){
+  const total=+(lastMeta.total_ms??0);if(!total||!camTrack)return;
+  serverEmaMs=serverEmaMs?serverEmaMs*0.7+total*0.3:total;
+  const now=performance.now();if(now-adaptAt<4000)return;
+  const want=serverEmaMs>50?15:serverEmaMs>40?22:serverEmaMs<28?30:camFps;
+  if(want===camFps)return;adaptAt=now;
+  try{await camTrack.applyConstraints({frameRate:{ideal:want}});camFps=want;}catch(error){console.warn('capture fps adapt failed',error);}
+}
+async function pollRtcStats(){
+  if(!peer||peer.connectionState!=='connected')return;
+  try{
+    const stats=await peer.getStats(),now=performance.now();let inbound=null,outbound=null;
+    stats.forEach(r=>{if(r.kind!=='video'||r.isRemote)return;if(r.type==='inbound-rtp')inbound=r;else if(r.type==='outbound-rtp')outbound=r;});
+    if(!inbound||!prevInbound){prevInbound=inbound;if(outbound)prevOutbound=outbound;netAt=now;return;}
+    const dt=(now-netAt)/1000;netAt=now;
+    const dFrames=(inbound.framesReceived??0)-(prevInbound.framesReceived??0);
+    const dDec=(inbound.framesDecoded??0)-(prevInbound.framesDecoded??0);
+    const dDrop=(inbound.framesDropped??0)-(prevInbound.framesDropped??0);
+    const dJit=((inbound.jitterBufferDelay??0)-(prevInbound.jitterBufferDelay??0))/Math.max(1,(inbound.jitterBufferEmittedCount??0)-(prevInbound.jitterBufferEmittedCount??0))*1000;
+    let upFps=null;
+    if(outbound&&prevOutbound){upFps=+(((outbound.framesSent??0)-(prevOutbound.framesSent??0))/dt).toFixed(1);}
+    if(outbound)prevOutbound=outbound;
+    netStat={fps:+(dFrames/dt).toFixed(1),decFps:+(dDec/dt).toFixed(1),dropFps:+(dDrop/dt).toFixed(1),upFps,freezes:inbound.freezeCount??null,jitter:+dJit.toFixed(1),pli:inbound.pliCount??null};
+    prevInbound=inbound;adaptCaptureFps();reportWebRtc();
+  }catch(error){console.warn('getStats failed',error);}
+}
+function countWebRtcFrame(){rtcFrames++;reportWebRtc();if(rtcChain)rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
 function report(){
   const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;
   const networkServerMs=Math.max(0,receivedAt-sentAt),serverE2eMs=lastMeta.wire?.server_e2e_ms??0;
@@ -1464,11 +2739,11 @@ function report(){
 function startWebSocket(){
   ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`);
   ws.onmessage=async e=>{
-    if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return;}
+    if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);if(lastMeta.error||lastMeta.dropped){busy=false;}return;}
     receivedAt=performance.now();const packet=await e.data.arrayBuffer(),headerLength=new DataView(packet).getUint32(0);
     lastMeta=JSON.parse(decoder.decode(packet.slice(4,4+headerLength)));const jpeg=new Blob([packet.slice(4+headerLength)],{type:'image/jpeg'});packetParseMs=performance.now()-receivedAt;
     if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(jpeg);wsOutput.hidden=false;
-    wsOutput.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};wsOutput.src=lastUrl;
+    wsOutput.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};wsOutput.onerror=()=>{busy=false;};wsOutput.src=lastUrl;
   };
   setInterval(()=>{
     if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;
@@ -1479,19 +2754,19 @@ function startWebSocket(){
 function iceComplete(peer){return new Promise(resolve=>{if(peer.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,3000);peer.onicegatheringstatechange=()=>{if(peer.iceGatheringState==='complete'){clearTimeout(timer);resolve();}};});}
 async function startWebRtc(stream){
   if(!window.RTCPeerConnection)throw new Error('WebRTC unavailable');
-  const peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  peer=new RTCPeerConnection({iceServers:turnIceServers()});
   const metrics=peer.createDataChannel('metrics');
   metrics.onmessage=e=>{lastMeta=JSON.parse(e.data);reportWebRtc();};
   const sender=peer.addTrack(stream.getVideoTracks()[0],stream);
   try{const parameters=sender.getParameters();parameters.encodings=parameters.encodings?.length?parameters.encodings:[{}];parameters.encodings[0].maxBitrate=12000000;parameters.encodings[0].maxFramerate=30;await sender.setParameters(parameters);}catch(error){console.warn('Unable to set FHD WebRTC sender bitrate',error);}
-  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;rtcConnected=true;rtcOutput.requestVideoFrameCallback(countWebRtcFrame);reportWebRtc();};
+  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;rtcConnected=true;if(!rtcChain){rtcChain=true;rtcOutput.requestVideoFrameCallback(countWebRtcFrame);setInterval(pollRtcStats,2000);}reportWebRtc();};
   const offer=await peer.createOffer({offerToReceiveVideo:true});await peer.setLocalDescription(offer);await iceComplete(peer);
   const response=await fetch(`/webrtc/offer/${id}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(peer.localDescription)});
   if(!response.ok)throw new Error(`WebRTC signaling failed: ${response.status}`);
   await peer.setRemoteDescription(await response.json());
   peer.onconnectionstatechange=()=>{if(peer.connectionState==='failed')m.textContent='WebRTC failed; reload to use WebSocket fallback.';};
 }
-(async()=>{const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false});v.srcObject=stream;try{await startWebRtc(stream);}catch(error){console.warn(error);m.textContent=`WebRTC unavailable (${error.message}); using WebSocket fallback`;startWebSocket();}})();
+(async()=>{const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false});v.srcObject=stream;camTrack=stream.getVideoTracks()[0];try{await startWebRtc(stream);}catch(error){console.warn(error);m.textContent=`WebRTC unavailable (${error.message}); using WebSocket fallback`;startWebSocket();}})();
 </script>"""
 
 
