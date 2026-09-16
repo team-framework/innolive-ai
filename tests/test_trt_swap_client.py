@@ -17,6 +17,7 @@ from experiments.trt_swap_client.app import (
     SwapLab,
     _aligned_seg_mask,
     _blur_objects,
+    _build_aligned_mask,
     _find_pending_job_index,
     _group_job_indices,
     _iou,
@@ -369,15 +370,21 @@ def test_apply_many_batches_faces_with_order_and_timing() -> None:
     )
     assert succeeded == {0, 1}
     assert output.shape == frame.shape
-    # The multi-face pipeline forwards once per face; both rows share the
-    # single source latent (call order across threads is not asserted).
-    assert len(generator.seen_blobs) == 2
-    assert all(blob.shape == (1, 3, 128, 128) for blob in generator.seen_blobs)
-    assert len(generator.seen_latents) == 2
-    assert np.array_equal(generator.seen_latents[0], generator.seen_latents[1])
+    # One TRT batch covers all faces; both rows share the single source latent
+    # and row order matches face index order.
+    assert len(generator.seen_blobs) == 1
+    assert generator.seen_blobs[0].shape == (2, 3, 128, 128)
+    assert len(generator.seen_latents) == 1
+    assert generator.seen_latents[0].shape == (2, 512)
+    assert np.array_equal(generator.seen_latents[0][0:1], generator.seen_latents[0][1:2])
     assert swapper.last_batch_size == 2
     assert swapper.last_face_count == 2
     assert set(swapper.last_generator_timing) == {"prepare", "forward", "paste"}
+    timing = swapper.last_call_timing()
+    assert timing["generator_ms"] >= 0
+    assert timing["prepare_ms"] + timing["forward_ms"] + timing["paste_ms"] <= timing[
+        "generator_ms"
+    ] + 5.0
     swapper.close()
 
 
@@ -394,10 +401,11 @@ def test_apply_many_per_face_latent_mapping_preserves_order() -> None:
     )
     assert succeeded == {0, 1}
     assert output.shape == frame.shape
-    seen = sorted(
-        (np.asarray(call).tobytes() for call in generator.seen_latents),
-    )
-    assert seen == sorted((latent_a.tobytes(), latent_b.tobytes()))
+    assert len(generator.seen_latents) == 1
+    batched = np.asarray(generator.seen_latents[0])
+    assert batched.shape == (2, 512)
+    assert np.array_equal(batched[0:1], latent_a)
+    assert np.array_equal(batched[1:2], latent_b)
     swapper.close()
 
 
@@ -527,7 +535,7 @@ def test_pipelined_multi_face_matches_sequential_helpers() -> None:
     swapper.close()
 
 
-def test_pipelined_prepare_failure_fails_whole_frame() -> None:
+def test_pipelined_prepare_failure_skips_only_that_face() -> None:
     swapper, _ = _batched_swapper()
     frame = np.zeros((64, 64, 3), dtype=np.uint8)
     boxes = [[0, 0, 20, 20], [40, 40, 60, 60]]
@@ -535,8 +543,10 @@ def test_pipelined_prepare_failure_fails_whole_frame() -> None:
     output, succeeded = swapper.apply_many(
         frame, boxes, None, {0: bad, 1: np.ones((1, 512), dtype=np.float32)}
     )
-    assert succeeded == set()
-    assert np.array_equal(output, frame)
+    # Per-face tolerance: the bad latent skips face 0, face 1 still swaps.
+    assert succeeded == {1}
+    assert output.shape == frame.shape
+    assert not np.array_equal(output, frame)
     swapper.close()
 
 
@@ -546,20 +556,20 @@ def test_pipelined_render_failure_skips_only_that_face() -> None:
     swapper, _ = _batched_swapper()
     frame = np.zeros((64, 64, 3), dtype=np.uint8)
     boxes = [[0, 0, 20, 20], [40, 40, 60, 60]]
-    real_render = app_module._render_face_layer
+    real_paste = app_module._paste_inswapper
     calls = {"count": 0}
 
-    def flaky_render(*args: object, **kwargs: object) -> object:
+    def flaky_paste(*args: object, **kwargs: object) -> object:
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("warp failed")
-        return real_render(*args, **kwargs)
+        return real_paste(*args, **kwargs)
 
-    app_module._render_face_layer = flaky_render  # type: ignore[method-assign]
+    app_module._paste_inswapper = flaky_paste  # type: ignore[method-assign]
     try:
         output, succeeded = swapper.apply_many(frame, boxes)
     finally:
-        app_module._render_face_layer = real_render  # type: ignore[method-assign]
+        app_module._paste_inswapper = real_paste  # type: ignore[method-assign]
     assert len(succeeded) == 1
     assert output.shape == frame.shape
     swapper.close()
@@ -1040,3 +1050,54 @@ def test_target_faces_prefers_trt_runner_when_fitting() -> None:
     assert runner.calls == 1
     assert analysis_calls == []
     assert np.allclose(targets[0].kps, np.full((5, 2), 8.0))
+
+
+def test_build_face_frame_supports_any_face_count() -> None:
+    from experiments.trt_swap_client.bench_lab import CANVAS_HEIGHT, CANVAS_WIDTH, build_face_frame
+
+    source = np.full((200, 150, 3), 200, dtype=np.uint8)
+    for faces in (1, 2, 3, 4, 5, 6):
+        frame = build_face_frame(source, faces)
+        assert frame.shape == (CANVAS_HEIGHT, CANVAS_WIDTH, 3)
+        assert frame.mean() > 0
+    with pytest.raises(ValueError):
+        build_face_frame(source, 0)
+
+
+def test_small_face_erosion_keeps_interior_mask() -> None:
+    # 20px projected face used to wipe the 128px mask (erode ~64px).
+    mask = _build_aligned_mask((128, 128), 20.0, None)
+    assert mask.shape == (128, 128)
+    assert int(mask.max()) > 0
+    with pytest.raises(RuntimeError, match="empty YOLO"):
+        _build_aligned_mask((128, 128), 100.0, np.zeros((128, 128), dtype=np.float32))
+
+
+def test_paste_before_blend_is_a_snapshot_not_an_alias() -> None:
+    target = np.full((64, 64, 3), 100, dtype=np.uint8)
+    aligned = np.full((16, 16, 3), 200, dtype=np.uint8)
+    fake = np.full((16, 16, 3), 250, dtype=np.uint8)
+    matrix = np.asarray(((1, 0, -24), (0, 1, -24)), dtype=np.float32)
+    canvas = target.copy()
+    artifacts: dict[str, np.ndarray] = {}
+    _paste_inswapper(canvas, aligned, fake, matrix, artifacts=artifacts, destination=canvas)
+    before = artifacts["paste_before_blend"]
+    assert np.array_equal(before, target)
+    # Mutating the canvas afterwards must not change the stored snapshot.
+    canvas[:] = 0
+    assert np.array_equal(before, target)
+
+
+def test_stage_timing_walls_are_consistent() -> None:
+    swapper, _ = _batched_swapper()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    _, succeeded = swapper.apply_many(frame, [[0, 0, 20, 20], [40, 40, 60, 60]])
+    assert succeeded == {0, 1}
+    timing = swapper.last_call_timing()
+    total = timing["prepare_ms"] + timing["forward_ms"] + timing["paste_ms"]
+    # Sequential walls: generator covers the stages plus small overhead.
+    assert timing["generator_ms"] + 5.0 >= total
+    assert timing["generator_ms"] >= max(
+        timing["prepare_ms"], timing["forward_ms"], timing["paste_ms"]
+    )
+    swapper.close()

@@ -41,17 +41,28 @@ CANVAS_HEIGHT = 720
 def build_face_frame(source: np.ndarray, faces: int) -> np.ndarray:
     """Tile the source portrait into a canvas with ``faces`` detectable faces."""
 
+    if faces < 1:
+        raise ValueError(f"faces must be >= 1, got {faces}")
+    import math
+
     canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
     canvas[:] = (32, 32, 32)
-    slots = {1: (1, 1), 2: (2, 1), 4: (2, 2)}[faces]
-    cols, rows = slots
+    cols = math.ceil(math.sqrt(faces))
+    rows = math.ceil(faces / cols)
     cell_w, cell_h = CANVAS_WIDTH // cols, CANVAS_HEIGHT // rows
-    scale = min(cell_w / source.shape[1], cell_h / source.shape[0], 1.0)
+    # Allow upscale so tiny sources still pass the swap gate; INTER_AREA stays
+    # sharp for downscale and acceptable for modest upscale in a bench harness.
+    scale = min(cell_w / source.shape[1], cell_h / source.shape[0])
     resized = cv2.resize(
         source,
         (max(32, int(source.shape[1] * scale)), max(32, int(source.shape[0] * scale))),
-        interpolation=cv2.INTER_AREA,
+        interpolation=cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_LINEAR,
     )
+    if resized.shape[0] * resized.shape[1] < 5_625:
+        print(
+            f"[bench_lab] warning: tiled face is {resized.shape[1]}x{resized.shape[0]} "
+            f"(<5625px default swap gate); bench may report 0 swaps. Use a larger source."
+        )
     for index in range(faces):
         col, row = index % cols, index // cols
         x = col * cell_w + (cell_w - resized.shape[1]) // 2
@@ -142,6 +153,10 @@ async def run_config(
         return [float(m.get(name, 0.0)) for m in metas if name in m]
 
     detector = [float(m.get("detector_batch_ms", 0.0)) for m in metas]
+    # swap_batch_size == TRT rows attempted per frame (== faces sent to
+    # forward_batch); faces_per_frame_mean counts successful swaps. The two
+    # differ when paste skips a face or the gate blurs it.
+    trt_rows = _mean(stage("swap_batch_size"))
     return {
         "frames_completed": len(latencies),
         "frames_dropped": drops,
@@ -160,7 +175,8 @@ async def run_config(
         "swap_alignment_ms_mean": _mean(stage("swap_alignment_ms")),
         "swap_generator_ms_mean": _mean(stage("swap_generator_ms")),
         "yolo_batch_mean": _mean(stage("yolo_batch")),
-        "swap_batch_size_mean": _mean(stage("swap_batch_size")),
+        "swap_batch_size_mean": trt_rows,
+        "trt_batch_rows_mean": trt_rows,
         "gpu_util_mean": round(statistics.fmean(sampler.samples), 1) if sampler.samples else None,
     }
 
