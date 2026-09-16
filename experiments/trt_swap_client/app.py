@@ -2647,13 +2647,28 @@ _HTML = """<!doctype html>
 const id=crypto.randomUUID();
 const v=document.querySelector('#v'),rtcOutput=document.querySelector('#rtc-output'),wsOutput=document.querySelector('#ws-output'),m=document.querySelector('#m');
 const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__,decoder=new TextDecoder();
-let ws=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false;
+let ws=null,peer=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false,rtcChain=false,netStat={},netAt=performance.now(),prevInbound=null;
 function reportWebRtc(){
   const now=performance.now(),elapsed=now-rtcWindowAt;if(elapsed<1000)return;
-  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_render_fps:+(rtcFrames*1000/elapsed).toFixed(1),capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
+  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_present_fps:+(rtcFrames*1000/elapsed).toFixed(1),client_net_fps:netStat.fps??null,client_decoded_fps:netStat.decFps??null,client_dropped_fps:netStat.dropFps??null,client_freezes:netStat.freezes??null,client_jitter_ms:netStat.jitter??null,client_pli:netStat.pli??null,capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
   rtcFrames=0;rtcWindowAt=now;
 }
-function countWebRtcFrame(){rtcFrames++;reportWebRtc();rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
+async function pollRtcStats(){
+  if(!peer||peer.connectionState!=='connected')return;
+  try{
+    const stats=await peer.getStats(),now=performance.now();let inbound=null;
+    stats.forEach(r=>{if(r.type==='inbound-rtp'&&r.kind==='video'&&!r.isRemote)inbound=r;});
+    if(!inbound||!prevInbound){prevInbound=inbound;netAt=now;return;}
+    const dt=(now-netAt)/1000;netAt=now;
+    const dFrames=(inbound.framesReceived??0)-(prevInbound.framesReceived??0);
+    const dDec=(inbound.framesDecoded??0)-(prevInbound.framesDecoded??0);
+    const dDrop=(inbound.framesDropped??0)-(prevInbound.framesDropped??0);
+    const dJit=((inbound.jitterBufferDelay??0)-(prevInbound.jitterBufferDelay??0))/Math.max(1,(inbound.jitterBufferEmittedCount??0)-(prevInbound.jitterBufferEmittedCount??0))*1000;
+    netStat={fps:+(dFrames/dt).toFixed(1),decFps:+(dDec/dt).toFixed(1),dropFps:+(dDrop/dt).toFixed(1),freezes:inbound.freezeCount??null,jitter:+dJit.toFixed(1),pli:inbound.pliCount??null};
+    prevInbound=inbound;reportWebRtc();
+  }catch(error){console.warn('getStats failed',error);}
+}
+function countWebRtcFrame(){rtcFrames++;reportWebRtc();if(rtcChain)rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
 function report(){
   const now=performance.now(),elapsed=now-windowAt;if(elapsed<1000)return;
   const networkServerMs=Math.max(0,receivedAt-sentAt),serverE2eMs=lastMeta.wire?.server_e2e_ms??0;
@@ -2663,11 +2678,11 @@ function report(){
 function startWebSocket(){
   ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${id}`);
   ws.onmessage=async e=>{
-    if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);return;}
+    if(typeof e.data==='string'){lastMeta=JSON.parse(e.data);if(lastMeta.error||lastMeta.dropped){busy=false;}return;}
     receivedAt=performance.now();const packet=await e.data.arrayBuffer(),headerLength=new DataView(packet).getUint32(0);
     lastMeta=JSON.parse(decoder.decode(packet.slice(4,4+headerLength)));const jpeg=new Blob([packet.slice(4+headerLength)],{type:'image/jpeg'});packetParseMs=performance.now()-receivedAt;
     if(lastUrl)URL.revokeObjectURL(lastUrl);lastUrl=URL.createObjectURL(jpeg);wsOutput.hidden=false;
-    wsOutput.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};wsOutput.src=lastUrl;
+    wsOutput.onload=()=>{displayMs=performance.now()-receivedAt;busy=false;frames++;report();};wsOutput.onerror=()=>{busy=false;};wsOutput.src=lastUrl;
   };
   setInterval(()=>{
     if(busy||!v.videoWidth||ws.readyState!==1)return;busy=true;
@@ -2678,12 +2693,12 @@ function startWebSocket(){
 function iceComplete(peer){return new Promise(resolve=>{if(peer.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,3000);peer.onicegatheringstatechange=()=>{if(peer.iceGatheringState==='complete'){clearTimeout(timer);resolve();}};});}
 async function startWebRtc(stream){
   if(!window.RTCPeerConnection)throw new Error('WebRTC unavailable');
-  const peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
   const metrics=peer.createDataChannel('metrics');
   metrics.onmessage=e=>{lastMeta=JSON.parse(e.data);reportWebRtc();};
   const sender=peer.addTrack(stream.getVideoTracks()[0],stream);
   try{const parameters=sender.getParameters();parameters.encodings=parameters.encodings?.length?parameters.encodings:[{}];parameters.encodings[0].maxBitrate=12000000;parameters.encodings[0].maxFramerate=30;await sender.setParameters(parameters);}catch(error){console.warn('Unable to set FHD WebRTC sender bitrate',error);}
-  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;rtcConnected=true;rtcOutput.requestVideoFrameCallback(countWebRtcFrame);reportWebRtc();};
+  peer.ontrack=e=>{rtcOutput.srcObject=e.streams[0];rtcOutput.hidden=false;wsOutput.hidden=true;rtcConnected=true;if(!rtcChain){rtcChain=true;rtcOutput.requestVideoFrameCallback(countWebRtcFrame);setInterval(pollRtcStats,2000);}reportWebRtc();};
   const offer=await peer.createOffer({offerToReceiveVideo:true});await peer.setLocalDescription(offer);await iceComplete(peer);
   const response=await fetch(`/webrtc/offer/${id}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(peer.localDescription)});
   if(!response.ok)throw new Error(`WebRTC signaling failed: ${response.status}`);
