@@ -79,16 +79,18 @@ python -m experiments.trt_swap_client.app --host 0.0.0.0 --port 8088 \
 
 | config | 베이스 | 최종 | 비고 |
 | --- | --- | --- | --- |
-| 1얼굴 x 1세션 | 23.4fps | **38.4fps** | 30fps선 돌파 |
-| 2얼굴 x 1세션 | 14.0fps | **28.5fps** | 파이프라인 +104% |
-| 4얼굴 x 1세션 | 9.9fps | **24.6fps** | 파이프라인 +148% |
+| 1얼굴 x 1세션 | 23.4fps | **52.3fps** | YuNet TRT 후 |
+| 2얼굴 x 1세션 | 14.0fps | **32.5fps** | 30fps선 돌파 |
+| 4얼굴 x 1세션 | 9.9fps | **24.0fps** | 동률 (원인 조사 중) |
 | 1얼굴 x 10세션 합계 | 25.8/s | **69.4/s** | compose 병렬 +169% |
 | 4얼굴 x 4세션 | 41sw/s | **123sw/s** | +200% |
 
-- 단계 비용(1얼굴): detector 3 / yunet 10 / forward 5.6 / paste 5.
+- 단계 비용(1얼굴): detector 3 / yunet 3.4 (TRT) / forward 5.6 / paste 5.
 - 1얼굴 프레임은 베이스와 비트 동일 출력이다.
 - YuNet landmark 인덱스 수정(#25 병합) 후 paste ROI가 정상화되면서
   뭉개짐이 사라지고 paste가 절반으로 줄었다.
+- YuNet TRT(`face_detection_yunet_trt.engine`, 동적 shape)는 CPU 구현과
+  box p50 0.38px·kps p50 0.16px로 일치한다. 엔진 없으면 CPU로 자동 fallback.
 - 측정 하네스: `python -m experiments.trt_swap_client.bench_lab --help`
   (base/opt 공용, `--faces/--sessions/--swapper-engine` 지정).
 - 시도 후 기각: 동적 배치(정확하나 속도 선형), paste 스레드 warp(역효과),

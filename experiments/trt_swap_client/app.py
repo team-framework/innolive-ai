@@ -55,6 +55,9 @@ DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp
 #: Faster mixed-precision build (see build_mixed_onnx.py); used automatically
 #: when present unless --swapper-engine is given explicitly.
 MIXED_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_mixed.engine"
+#: GPU YuNet landmark engine (see export_yunet.py); used automatically when
+#: present unless --yunet-engine selects another file.  Falls back to CPU.
+DEFAULT_YUNET_ENGINE = ROOT / "models" / "face_detection_yunet_trt.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 
@@ -106,6 +109,7 @@ class Settings:
     swap_debug_frames: int = 1
     stream_jpeg_quality: int = 90
     capture_max_width: int = 1920
+    yunet_engine: Path | None = None
 
 
 @dataclass(slots=True)
@@ -1016,6 +1020,30 @@ class PreparedFace:
     seg_mask_aligned: np.ndarray | None = None
 
 
+def _load_yunet_trt(yunet_engine: Path | None) -> Any | None:
+    """Load the GPU YuNet runner when a valid engine exists, else None (CPU)."""
+
+    from experiments.trt_swap_client.yunet_trt import YuNetTRT
+
+    explicit = yunet_engine.expanduser().resolve() if yunet_engine is not None else None
+    if explicit is not None:
+        if not explicit.is_file():
+            raise FileNotFoundError(f"YuNet TensorRT engine is missing: {explicit}")
+        runner = YuNetTRT(explicit)
+        print(f"using TensorRT YuNet engine: {explicit.name}")
+        return runner
+    default = DEFAULT_YUNET_ENGINE.expanduser().resolve()
+    if default.is_file():
+        try:
+            runner = YuNetTRT(default)
+        except Exception as error:
+            print(f"YuNet TensorRT engine unusable ({error}); using CPU YuNet")
+            return None
+        print(f"using TensorRT YuNet engine: {default.name}")
+        return runner
+    return None
+
+
 class InSwapper:
     """Keep the established generator/face-analysis behavior, isolated from server code."""
 
@@ -1032,6 +1060,7 @@ class InSwapper:
         target_yunet: Path,
         debug_dir: Path | None,
         debug_frames: int,
+        yunet_engine: Path | None = None,
     ):
         if not model_path.is_file():
             raise FileNotFoundError(f"InSwapper model is missing: {model_path}")
@@ -1083,6 +1112,9 @@ class InSwapper:
                         top_k=32,
                     )
                 )
+            self.yunet_trt = _load_yunet_trt(yunet_engine)
+        else:
+            self.yunet_trt = None
         self.last_alignment_ms = 0.0
         self.last_generator_ms = 0.0
         self.last_generator_timing: dict[str, float] = {}
@@ -1607,7 +1639,19 @@ class InSwapper:
     def _target_faces(self, frame: np.ndarray, boxes: list[list[float]]) -> dict[int, Any]:
         targets: dict[int, Any] = {}
         if self.yunet is not None:
-            if len(boxes) > 1 and len(getattr(self, "_yunet_clones", [])) >= len(boxes):
+            runner = getattr(self, "yunet_trt", None)
+            rois = [(index, _yunet_roi(frame, box)) for index, box in enumerate(boxes)]
+            if (
+                runner is not None
+                and rois
+                and all(
+                    roi is not None
+                    and max(roi[2] - roi[0], roi[3] - roi[1]) <= runner.max_side
+                    for _, roi in rois
+                )
+            ):
+                targets = self._targets_from_yunet_trt(runner, frame, boxes, rois)
+            elif len(boxes) > 1 and len(getattr(self, "_yunet_clones", [])) >= len(boxes):
                 targets = self._targets_from_yunet_parallel(frame, boxes)
             else:
                 for index, box in enumerate(boxes):
@@ -1653,14 +1697,92 @@ class InSwapper:
                 targets[index] = target
         return targets
 
+    def _targets_from_yunet_trt(
+        self,
+        runner: Any,
+        frame: np.ndarray,
+        boxes: list[list[float]],
+        rois: list[tuple[int, tuple[int, int, int, int] | None]],
+    ) -> dict[int, Any]:
+        """Run YuNet landmark detection on the GPU runner (validated = CPU)."""
+
+        targets: dict[int, Any] = {}
+        if len(boxes) < 2:
+            for index, roi in rois:
+                target = self._target_from_yunet_trt_one(runner, frame, boxes[index], roi)
+                if target is not None:
+                    targets[index] = target
+            return targets
+        pool = self._get_face_pool()
+
+        def _detect(pair: tuple[int, tuple[int, int, int, int] | None]) -> tuple[int, Any | None]:
+            index, roi = pair
+            try:
+                return index, self._target_from_yunet_trt_one(runner, frame, boxes[index], roi)
+            except Exception:
+                return index, None
+
+        for index, target in pool.map(_detect, rois):
+            if target is not None:
+                targets[index] = target
+        return targets
+
+    def _target_from_yunet_trt_one(
+        self,
+        runner: Any,
+        frame: np.ndarray,
+        box: list[float],
+        roi: tuple[int, int, int, int] | None,
+    ) -> Any | None:
+        """One GPU YuNet lookup with CPU fallback on any failure."""
+
+        from experiments.trt_swap_client.yunet_trt import extend_window
+
+        if roi is None:
+            return None
+        left, top, right, bottom = roi
+        window, (origin_x, origin_y) = extend_window(frame, left, top, right, bottom)
+        detections = runner.detect(window)
+        if detections is None or not len(detections):
+            return None
+        candidate = max(
+            (row for row in detections),
+            key=lambda row: _iou(
+                [
+                    row[0] + origin_x,
+                    row[1] + origin_y,
+                    row[0] + row[2] + origin_x,
+                    row[1] + row[3] + origin_y,
+                ],
+                box,
+            ),
+            default=None,
+        )
+        if candidate is None:
+            return None
+        candidate_box = [
+            float(candidate[0] + origin_x),
+            float(candidate[1] + origin_y),
+            float(candidate[0] + candidate[2] + origin_x),
+            float(candidate[1] + candidate[3] + origin_y),
+        ]
+        if _iou(candidate_box, box) < 0.2:
+            return None
+        from insightface.app.common import Face
+
+        landmarks = np.asarray(candidate[4:14], dtype=np.float32).reshape((5, 2))
+        landmarks[:, 0] += origin_x
+        landmarks[:, 1] += origin_y
+        return Face(bbox=np.asarray(candidate_box, dtype=np.float32), kps=landmarks)
+
     def _target_from_yunet(self, frame: np.ndarray, box: list[float]) -> Any | None:
         if self.yunet is None:
             return None
         return _target_from_yunet_with(self.yunet, frame, box)
 
 
-def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> Any | None:
-    """YuNet five-point landmark path for one detector box (clone-safe)."""
+def _yunet_roi(frame: np.ndarray, box: list[float]) -> tuple[int, int, int, int] | None:
+    """Padded ROI for one detector box (None when too small to detect)."""
 
     x1, y1, x2, y2 = (float(value) for value in box)
     padding_x = (x2 - x1) * 0.35
@@ -1671,6 +1793,16 @@ def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> A
     bottom = min(frame.shape[0], int(np.ceil(y2 + padding_y)))
     if right - left < 32 or bottom - top < 32:
         return None
+    return left, top, right, bottom
+
+
+def _target_from_yunet_with(ynet: Any, frame: np.ndarray, box: list[float]) -> Any | None:
+    """YuNet five-point landmark path for one detector box (clone-safe)."""
+
+    roi_box = _yunet_roi(frame, box)
+    if roi_box is None:
+        return None
+    left, top, right, bottom = roi_box
     roi = frame[top:bottom, left:right]
     try:
         ynet.setInputSize((roi.shape[1], roi.shape[0]))
@@ -1752,6 +1884,7 @@ class SwapLab:
             target_yunet=settings.target_yunet,
             debug_dir=settings.swap_debug_dir,
             debug_frames=settings.swap_debug_frames,
+            yunet_engine=settings.yunet_engine,
         )
         self.sessions = SessionRegistry()
         self.adaface = LazyAdaFaceRuntime(
@@ -2396,6 +2529,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-yunet", type=Path, default=DEFAULT_FACE_DETECTOR)
     parser.add_argument(
+        "--yunet-engine",
+        type=Path,
+        default=None,
+        help="YuNet TensorRT engine (default: auto-use models/face_detection_yunet_trt.engine when built)",
+    )
+    parser.add_argument(
         "--input-video",
         type=Path,
         help="optional compressed input decoded by NVDEC and written as /hls/live.m3u8 via NVENC",
@@ -2485,6 +2624,7 @@ def main() -> None:
         args.swap_debug_frames,
         args.stream_jpeg_quality,
         args.capture_max_width,
+        args.yunet_engine.expanduser().resolve() if args.yunet_engine else None,
     )
     import uvicorn
 

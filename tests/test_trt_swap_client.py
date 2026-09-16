@@ -931,3 +931,112 @@ def test_webrtc_track_emits_only_fresh_frames_when_behind() -> None:
         assert sum(gaps) < 8 * (0.05 + 0.033) + 0.5
 
     asyncio.run(scenario())
+
+
+def test_extend_window_uses_real_pixels_and_32_multiples() -> None:
+    from experiments.trt_swap_client.yunet_trt import extend_window
+
+    frame = np.arange(200 * 200 * 3, dtype=np.uint8).reshape((200, 200, 3))
+    window, origin = extend_window(frame, 50, 60, 150, 140)
+    assert window.shape == (96, 128, 3)
+    assert origin == (50, 60)
+    assert np.array_equal(window, frame[60:156, 50:178])
+    # Frame edge: grow inward with real pixels, no replicate needed.
+    window, origin = extend_window(frame[:100, :100], 80, 80, 100, 100)
+    assert window.shape == (32, 32, 3)
+    assert origin == (68, 68)
+    # Smaller than one tile: replicate-pad the remainder.
+    tiny = np.zeros((20, 20, 3), dtype=np.uint8)
+    window, origin = extend_window(tiny, 0, 0, 20, 20)
+    assert window.shape == (32, 32, 3)
+    assert origin == (0, 0)
+
+
+def test_decode_detections_matches_hand_computed_yunet_math() -> None:
+    import math
+
+    from experiments.trt_swap_client.yunet_trt import decode_detections
+
+    zeros = lambda shape: np.zeros(shape, dtype=np.float32)  # noqa: E731
+    raw = {
+        "cls_8": zeros((1, 64, 1)),
+        "obj_8": zeros((1, 64, 1)),
+        "bbox_8": zeros((1, 64, 4)),
+        "kps_8": zeros((1, 64, 10)),
+        "cls_16": zeros((1, 16, 1)),
+        "obj_16": zeros((1, 16, 1)),
+        "bbox_16": zeros((1, 16, 4)),
+        "kps_16": zeros((1, 16, 10)),
+        "cls_32": zeros((1, 4, 1)),
+        "obj_32": zeros((1, 4, 1)),
+        "bbox_32": zeros((1, 4, 4)),
+        "kps_32": zeros((1, 4, 10)),
+    }
+    raw["cls_8"][0, 19, 0] = 4.0
+    raw["obj_8"][0, 19, 0] = 4.0
+    raw["bbox_8"][0, 19] = [0.1, -0.2, 0.0, 0.0]
+    raw["kps_8"][0, 19] = [0.5] * 10
+    faces = decode_detections(raw, 64, 64)
+    assert faces.shape == (1, 15)
+    # score = sqrt(clamp(4) * clamp(4)) = 1, no sigmoid anywhere.
+    assert faces[0, 14] == 1.0
+    # cell (r=2, c=3), stride 8: cx=(3+.1)*8, cy=(2-.2)*8, w=h=8.
+    assert np.allclose(faces[0, :4], [20.8, 10.4, 8.0, 8.0])
+    assert np.allclose(faces[0, 4:14], [28.0, 20.0] * 5, atol=1e-5)
+    assert math.isclose(float(faces[0, 4]), (0.5 + 3) * 8)
+
+
+def test_target_faces_prefers_trt_runner_when_fitting() -> None:
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    class FakeFace:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    package = types.ModuleType("insightface")
+    app_module = types.ModuleType("insightface.app")
+    common_module = types.ModuleType("insightface.app.common")
+    common_module.Face = FakeFace  # type: ignore[attr-defined]
+    saved = {
+        name: sys.modules[name] for name in list(sys.modules) if name.startswith("insightface")
+    }
+    sys.modules["insightface"] = package
+    sys.modules["insightface.app"] = app_module
+    sys.modules["insightface.app.common"] = common_module
+
+    class FakeRunner:
+        max_side = 1024
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def detect(self, window: np.ndarray) -> np.ndarray:
+            self.calls += 1
+            row = np.asarray(
+                [[42, 42, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.9]],
+                dtype=np.float32,
+            )
+            return row
+
+    swapper, _ = _batched_swapper()
+    del swapper._target_faces
+    runner = FakeRunner()
+    swapper.yunet = object()
+    swapper.yunet_trt = runner
+    analysis_calls: list[int] = []
+    swapper.analysis = SimpleNamespace(get=lambda image: (analysis_calls.append(1), [])[1])
+    try:
+        targets = swapper._target_faces(
+            np.zeros((200, 200, 3), dtype=np.uint8), [[50, 50, 150, 150]]
+        )
+    finally:
+        for name in [n for n in sys.modules if n.startswith("insightface")]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+        swapper.close()
+    assert sorted(targets) == [0]
+    assert runner.calls == 1
+    assert analysis_calls == []
+    assert np.allclose(targets[0].kps, np.full((5, 2), 8.0))
