@@ -73,17 +73,25 @@ SEG_MASK_FEATHER_RADIUS = 4
 def _webrtc_ice_servers() -> list[RTCIceServer]:
     """Use public STUN by default; deployments behind NAT can provide TURN."""
 
+    return _webrtc_turn_config()[0]
+
+
+def _webrtc_turn_config() -> tuple[list[RTCIceServer], str, str, str]:
+    """Shared STUN/TURN setup for the server peer and the browser client."""
+
     servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
-    turn_url = os.getenv("WEBRTC_TURN_URL")
+    turn_url = os.getenv("WEBRTC_TURN_URL", "")
+    username = os.getenv("WEBRTC_TURN_USERNAME", "")
+    credential = os.getenv("WEBRTC_TURN_CREDENTIAL", "")
     if turn_url:
         servers.append(
             RTCIceServer(
                 urls=turn_url,
-                username=os.getenv("WEBRTC_TURN_USERNAME"),
-                credential=os.getenv("WEBRTC_TURN_CREDENTIAL"),
+                username=username or None,
+                credential=credential or None,
             )
         )
-    return servers
+    return servers, turn_url, username, credential
 
 
 @dataclass(frozen=True, slots=True)
@@ -2336,9 +2344,13 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
+        _, turn_url, turn_username, turn_credential = _webrtc_turn_config()
         return (
             _HTML.replace("__JPEG_QUALITY__", str(settings.stream_jpeg_quality / 100))
             .replace("__CAPTURE_WIDTH__", str(settings.capture_max_width))
+            .replace("__TURN_URL__", json.dumps(turn_url))
+            .replace("__TURN_USERNAME__", json.dumps(turn_username))
+            .replace("__TURN_CREDENTIAL__", json.dumps(turn_credential))
         )
 
     @app.get("/health")
@@ -2647,25 +2659,38 @@ _HTML = """<!doctype html>
 const id=crypto.randomUUID();
 const v=document.querySelector('#v'),rtcOutput=document.querySelector('#rtc-output'),wsOutput=document.querySelector('#ws-output'),m=document.querySelector('#m');
 const c=document.createElement('canvas'),ctx=c.getContext('2d'),captureWidth=__CAPTURE_WIDTH__,decoder=new TextDecoder();
-let ws=null,peer=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false,rtcChain=false,netStat={},netAt=performance.now(),prevInbound=null;
+let ws=null,peer=null,busy=false,lastUrl='',sentAt=0,receivedAt=0,lastMeta={},captureMs=0,packetParseMs=0,displayMs=0,frames=0,windowAt=performance.now(),rtcFrames=0,rtcWindowAt=performance.now(),rtcConnected=false,rtcChain=false,netStat={},netAt=performance.now(),prevInbound=null,prevOutbound=null,camTrack=null,serverEmaMs=0,adaptAt=0,camFps=30;
+const turnUrl=__TURN_URL__,turnUser=__TURN_USERNAME__,turnCred=__TURN_CREDENTIAL__;
+function turnIceServers(){const servers=[{urls:'stun:stun.l.google.com:19302'}];if(turnUrl)servers.push({urls:turnUrl,username:turnUser||undefined,credential:turnCred||undefined});return servers;}
 function reportWebRtc(){
   const now=performance.now(),elapsed=now-rtcWindowAt;if(elapsed<1000)return;
-  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_present_fps:+(rtcFrames*1000/elapsed).toFixed(1),client_net_fps:netStat.fps??null,client_decoded_fps:netStat.decFps??null,client_dropped_fps:netStat.dropFps??null,client_freezes:netStat.freezes??null,client_jitter_ms:netStat.jitter??null,client_pli:netStat.pli??null,capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
+  m.textContent=JSON.stringify({...lastMeta,transport:'webrtc',webrtc_mode:'latest-frame mailbox + paced RTP output',client_present_fps:+(rtcFrames*1000/elapsed).toFixed(1),client_net_fps:netStat.fps??null,client_decoded_fps:netStat.decFps??null,client_dropped_fps:netStat.dropFps??null,client_up_fps:netStat.upFps??null,client_cam_fps:camFps,client_freezes:netStat.freezes??null,client_jitter_ms:netStat.jitter??null,client_pli:netStat.pli??null,capture_resolution:`${v.videoWidth}x${v.videoHeight}`,output_resolution:`${rtcOutput.videoWidth}x${rtcOutput.videoHeight}`,status:rtcConnected?'connected':'connecting'},null,2);
   rtcFrames=0;rtcWindowAt=now;
+}
+async function adaptCaptureFps(){
+  const total=+(lastMeta.total_ms??0);if(!total||!camTrack)return;
+  serverEmaMs=serverEmaMs?serverEmaMs*0.7+total*0.3:total;
+  const now=performance.now();if(now-adaptAt<4000)return;
+  const want=serverEmaMs>50?15:serverEmaMs>40?22:serverEmaMs<28?30:camFps;
+  if(want===camFps)return;adaptAt=now;
+  try{await camTrack.applyConstraints({frameRate:{ideal:want}});camFps=want;}catch(error){console.warn('capture fps adapt failed',error);}
 }
 async function pollRtcStats(){
   if(!peer||peer.connectionState!=='connected')return;
   try{
-    const stats=await peer.getStats(),now=performance.now();let inbound=null;
-    stats.forEach(r=>{if(r.type==='inbound-rtp'&&r.kind==='video'&&!r.isRemote)inbound=r;});
-    if(!inbound||!prevInbound){prevInbound=inbound;netAt=now;return;}
+    const stats=await peer.getStats(),now=performance.now();let inbound=null,outbound=null;
+    stats.forEach(r=>{if(r.kind!=='video'||r.isRemote)return;if(r.type==='inbound-rtp')inbound=r;else if(r.type==='outbound-rtp')outbound=r;});
+    if(!inbound||!prevInbound){prevInbound=inbound;if(outbound)prevOutbound=outbound;netAt=now;return;}
     const dt=(now-netAt)/1000;netAt=now;
     const dFrames=(inbound.framesReceived??0)-(prevInbound.framesReceived??0);
     const dDec=(inbound.framesDecoded??0)-(prevInbound.framesDecoded??0);
     const dDrop=(inbound.framesDropped??0)-(prevInbound.framesDropped??0);
     const dJit=((inbound.jitterBufferDelay??0)-(prevInbound.jitterBufferDelay??0))/Math.max(1,(inbound.jitterBufferEmittedCount??0)-(prevInbound.jitterBufferEmittedCount??0))*1000;
-    netStat={fps:+(dFrames/dt).toFixed(1),decFps:+(dDec/dt).toFixed(1),dropFps:+(dDrop/dt).toFixed(1),freezes:inbound.freezeCount??null,jitter:+dJit.toFixed(1),pli:inbound.pliCount??null};
-    prevInbound=inbound;reportWebRtc();
+    let upFps=null;
+    if(outbound&&prevOutbound){upFps=+(((outbound.framesSent??0)-(prevOutbound.framesSent??0))/dt).toFixed(1);}
+    if(outbound)prevOutbound=outbound;
+    netStat={fps:+(dFrames/dt).toFixed(1),decFps:+(dDec/dt).toFixed(1),dropFps:+(dDrop/dt).toFixed(1),upFps,freezes:inbound.freezeCount??null,jitter:+dJit.toFixed(1),pli:inbound.pliCount??null};
+    prevInbound=inbound;adaptCaptureFps();reportWebRtc();
   }catch(error){console.warn('getStats failed',error);}
 }
 function countWebRtcFrame(){rtcFrames++;reportWebRtc();if(rtcChain)rtcOutput.requestVideoFrameCallback(countWebRtcFrame);}
@@ -2693,7 +2718,7 @@ function startWebSocket(){
 function iceComplete(peer){return new Promise(resolve=>{if(peer.iceGatheringState==='complete')return resolve();const timer=setTimeout(resolve,3000);peer.onicegatheringstatechange=()=>{if(peer.iceGatheringState==='complete'){clearTimeout(timer);resolve();}};});}
 async function startWebRtc(stream){
   if(!window.RTCPeerConnection)throw new Error('WebRTC unavailable');
-  peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  peer=new RTCPeerConnection({iceServers:turnIceServers()});
   const metrics=peer.createDataChannel('metrics');
   metrics.onmessage=e=>{lastMeta=JSON.parse(e.data);reportWebRtc();};
   const sender=peer.addTrack(stream.getVideoTracks()[0],stream);
@@ -2705,7 +2730,7 @@ async function startWebRtc(stream){
   await peer.setRemoteDescription(await response.json());
   peer.onconnectionstatechange=()=>{if(peer.connectionState==='failed')m.textContent='WebRTC failed; reload to use WebSocket fallback.';};
 }
-(async()=>{const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false});v.srcObject=stream;try{await startWebRtc(stream);}catch(error){console.warn(error);m.textContent=`WebRTC unavailable (${error.message}); using WebSocket fallback`;startWebSocket();}})();
+(async()=>{const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:captureWidth,max:captureWidth}},audio:false});v.srcObject=stream;camTrack=stream.getVideoTracks()[0];try{await startWebRtc(stream);}catch(error){console.warn(error);m.textContent=`WebRTC unavailable (${error.message}); using WebSocket fallback`;startWebSocket();}})();
 </script>"""
 
 
