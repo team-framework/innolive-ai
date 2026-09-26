@@ -5,10 +5,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import torch
+from ultralytics.engine.results import Boxes
 
+from service.detection import EXPECTED_CLASS_NAMES
 from service.runtime import (
     IMAGE_SIZE,
     RuntimeConfig,
@@ -16,6 +20,7 @@ from service.runtime import (
     select_runtime,
     validate_engine,
 )
+from service.tracking import StreamTracker
 
 
 class RuntimeContractTests(unittest.TestCase):
@@ -115,6 +120,43 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
         self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
         self.assertEqual(model.kwargs["classes"], [0, 1])
+
+    def test_raw_detections_keep_low_confidence_plates_without_changing_tracks(self):
+        image = np.zeros((360, 640, 3), dtype=np.uint8)
+        prediction = SimpleNamespace(
+            boxes=Boxes(
+                torch.tensor([[20, 20, 80, 80, 0.9, 0], [500, 200, 630, 240, 0.03, 1]]),
+                image.shape[:2],
+            ),
+            masks=SimpleNamespace(
+                xy=[
+                    np.array([[20, 20], [80, 20], [80, 80], [20, 80]]),
+                    np.array([[500, 200], [630, 200], [630, 240], [500, 240]]),
+                ]
+            ),
+        )
+        runtime = RuntimeManager.__new__(RuntimeManager)
+        runtime.names = EXPECTED_CLASS_NAMES
+        with patch.object(runtime, "_predict", return_value=prediction):
+            normal = runtime._infer_sync(image, StreamTracker(device="cpu"))
+            diagnostic = runtime._infer_sync(
+                image, StreamTracker(device="cpu"), include_raw_detections=True
+            )
+            prediction.masks.xy[1] = np.array([[500, 200], [630, 200]])
+            box_only = runtime._infer_sync(
+                image, StreamTracker(device="cpu"), include_raw_detections=True
+            )
+        self.assertEqual(normal["objects"], diagnostic["objects"])
+        self.assertEqual([item["class_name"] for item in normal["objects"]], ["face"])
+        self.assertEqual(normal["raw_objects"], [])
+        plate = diagnostic["raw_objects"][1]
+        self.assertEqual(plate["class_name"], "number_plate")
+        self.assertEqual(plate["confidence"], 0.03)
+        self.assertEqual(plate["bbox"], [500.0, 200.0, 630.0, 240.0])
+        self.assertEqual(plate["mask_area_px"], 5200.0)
+        self.assertNotIn("track_id", plate)
+        self.assertEqual(box_only["raw_objects"][1]["mask_polygon"], [])
+        self.assertEqual(box_only["raw_objects"][1]["bbox"], plate["bbox"])
 
 
 if __name__ == "__main__":

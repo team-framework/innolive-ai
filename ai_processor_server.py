@@ -447,8 +447,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         tracker: Any,
         received_at: float,
     ) -> tuple[dict[str, Any] | None, FrameOutcome | None]:
+        options = {"include_raw_detections": True} if request.include_raw_detections else {}
         task = asyncio.create_task(
-            self.runtime.infer(image, tracker),
+            self.runtime.infer(image, tracker, **options),
             name=f"grpc-infer-{request.frame_id}",
         )
         self._inference_tasks.add(task)
@@ -703,12 +704,18 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         serialize_started = time.perf_counter()
         objects = result.get("objects", [])
         faces = [self._face_metadata(item) for item in objects]
+        raw_objects = result.get("raw_objects", []) if request.include_raw_detections else []
+        if not isinstance(raw_objects, list) or len(raw_objects) > 100:
+            raise ValueError("raw detections exceed the response contract")
         timing = result.get("timing_ms", {})
         response = messages.ProcessedVideoChunk(
             data=processed_data,
             timestamp=request.timestamp,
             status_message="success",
             faces=faces,
+            raw_detections=[
+                self._face_metadata(item, allow_empty_polygon=True) for item in raw_objects
+            ],
             width=int(image.shape[1]),
             height=int(image.shape[0]),
             frame_id=request.frame_id,
@@ -743,7 +750,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         return response
 
     @staticmethod
-    def _face_metadata(item: dict[str, Any]):
+    def _face_metadata(item: dict[str, Any], *, allow_empty_polygon: bool = False):
         bbox = item.get("bbox")
         polygon = item.get("mask_polygon")
         if (
@@ -752,7 +759,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             or not all(math.isfinite(float(value)) for value in bbox)
         ):
             raise ValueError("face bbox is invalid")
-        if not isinstance(polygon, list) or not 3 <= len(polygon) <= 64:
+        if not isinstance(polygon, list) or not (
+            3 <= len(polygon) <= 64 or (allow_empty_polygon and not polygon)
+        ):
             raise ValueError("face polygon is invalid")
         points = []
         for point in polygon:

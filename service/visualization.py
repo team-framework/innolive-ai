@@ -113,7 +113,7 @@ def _draw_label(
     font_scale = max(0.45, min(0.85, min(image.shape[:2]) / 900))
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, line_width)
-    x = max(0, bbox[0])
+    x = max(0, min(bbox[0], image.shape[1] - text_width - 8))
     y = max(text_height + baseline + 4, bbox[1])
     top = y - text_height - baseline - 4
     right = min(image.shape[1], x + text_width + 8)

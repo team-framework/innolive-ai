@@ -16,6 +16,7 @@ from ai_processor_server import (
     GrpcServerSettings,
     build_grpc_server,
 )
+from grpc_client import VideoProcessorClient
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.adaface_model import FaceAlignmentError, FaceCountError, FaceTooSmallError
 from service.frame import MAX_LONG_EDGE
@@ -300,6 +301,45 @@ class LoopbackServer:
 
 
 class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_raw_plate_candidates_are_opt_in_and_do_not_change_protected_output(self):
+        class DiagnosticRuntime(FaceRuntime):
+            async def infer(self, image, tracker, *, include_raw_detections=False):
+                result = await super().infer(image, tracker)
+                if include_raw_detections:
+                    result["raw_objects"] = [
+                        {
+                            "bbox": [40.0, 20.0, 60.0, 30.0],
+                            "confidence": 0.03,
+                            "class_name": "number_plate",
+                            "mask_polygon": [],
+                        }
+                    ]
+                return result
+
+        async with (
+            LoopbackServer(DiagnosticRuntime()) as server,
+            VideoProcessorClient(f"127.0.0.1:{server.bundle.bound_port}") as client,
+        ):
+            [normal] = [
+                result.response
+                async for result in client.process_jpegs([_striped_jpeg()], session_id="session-a")
+            ]
+            [diagnostic] = [
+                result.response
+                async for result in client.process_jpegs(
+                    [_striped_jpeg()], session_id="session-a", include_raw_detections=True
+                )
+            ]
+        self.assertEqual(normal.raw_detections, [])
+        self.assertEqual(normal.faces, diagnostic.faces)
+        self.assertEqual(normal.data, diagnostic.data)
+        self.assertEqual(len(diagnostic.raw_detections), 1)
+        plate = diagnostic.raw_detections[0]
+        self.assertEqual(plate.class_name, "number_plate")
+        self.assertAlmostEqual(plate.confidence, 0.03)
+        self.assertFalse(plate.HasField("track_id"))
+        self.assertEqual(plate.polygon, [])
+
     async def test_session_registry_size_is_bounded_for_unpaginated_listing(self):
         with self.assertRaisesRegex(ValueError, "1..1024"):
             GrpcServerSettings(

@@ -18,23 +18,41 @@ VIDEO_OUTPUT_MODE_METADATA_ONLY: VideoOutputMode
 VIDEO_OUTPUT_MODE_MOSAIC_JPEG: VideoOutputMode
 
 class VideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode")
+    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode", "mosaic_config", "width", "height", "pix_fmt", "include_raw_detections")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     FRAME_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     OUTPUT_MODE_FIELD_NUMBER: _ClassVar[int]
+    MOSAIC_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    WIDTH_FIELD_NUMBER: _ClassVar[int]
+    HEIGHT_FIELD_NUMBER: _ClassVar[int]
+    PIX_FMT_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_RAW_DETECTIONS_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     frame_id: int
     batch_size: int
     session_id: str
     output_mode: VideoOutputMode
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ..., output_mode: _Optional[_Union[VideoOutputMode, str]] = ...) -> None: ...
+    mosaic_config: MosaicConfig
+    width: int
+    height: int
+    pix_fmt: str
+    include_raw_detections: bool
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ..., output_mode: _Optional[_Union[VideoOutputMode, str]] = ..., mosaic_config: _Optional[_Union[MosaicConfig, _Mapping]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., pix_fmt: _Optional[str] = ..., include_raw_detections: _Optional[bool] = ...) -> None: ...
+
+class MosaicConfig(_message.Message):
+    __slots__ = ("blur_radius", "pixel_size")
+    BLUR_RADIUS_FIELD_NUMBER: _ClassVar[int]
+    PIXEL_SIZE_FIELD_NUMBER: _ClassVar[int]
+    blur_radius: float
+    pixel_size: int
+    def __init__(self, blur_radius: _Optional[float] = ..., pixel_size: _Optional[int] = ...) -> None: ...
 
 class ProcessedVideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats", "mosaic_jpeg")
+    __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats", "mosaic_jpeg", "raw_detections")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
@@ -48,6 +66,7 @@ class ProcessedVideoChunk(_message.Message):
     ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
     STATS_FIELD_NUMBER: _ClassVar[int]
     MOSAIC_JPEG_FIELD_NUMBER: _ClassVar[int]
+    RAW_DETECTIONS_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     status_message: str
@@ -61,7 +80,8 @@ class ProcessedVideoChunk(_message.Message):
     error_message: str
     stats: FrameStats
     mosaic_jpeg: bytes
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., status_message: _Optional[str] = ..., faces: _Optional[_Iterable[_Union[FaceMetadata, _Mapping]]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., frame_id: _Optional[int] = ..., processing_ms: _Optional[float] = ..., timing: _Optional[_Union[ProcessingTiming, _Mapping]] = ..., error_code: _Optional[str] = ..., error_message: _Optional[str] = ..., stats: _Optional[_Union[FrameStats, _Mapping]] = ..., mosaic_jpeg: _Optional[bytes] = ...) -> None: ...
+    raw_detections: _containers.RepeatedCompositeFieldContainer[FaceMetadata]
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., status_message: _Optional[str] = ..., faces: _Optional[_Iterable[_Union[FaceMetadata, _Mapping]]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., frame_id: _Optional[int] = ..., processing_ms: _Optional[float] = ..., timing: _Optional[_Union[ProcessingTiming, _Mapping]] = ..., error_code: _Optional[str] = ..., error_message: _Optional[str] = ..., stats: _Optional[_Union[FrameStats, _Mapping]] = ..., mosaic_jpeg: _Optional[bytes] = ..., raw_detections: _Optional[_Iterable[_Union[FaceMetadata, _Mapping]]] = ...) -> None: ...
 
 class ProcessingTiming(_message.Message):
     __slots__ = ("queue_ms", "decode_ms", "inference_ms", "tracking_ms", "blur_encode_ms", "inference_batch_size", "serialize_ms", "server_total_ms", "runtime_total_ms")

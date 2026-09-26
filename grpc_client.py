@@ -96,6 +96,7 @@ class VideoFrame:
     timestamp: int
     frame_id: int
     mosaic: MosaicConfig | None = None
+    include_raw_detections: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +204,7 @@ class VideoSession:
         window: int = MAX_WINDOW,
         timeout: float | None = None,
         raise_frame_errors: bool = True,
+        include_raw_detections: bool = False,
     ) -> AsyncIterator[VideoResult]:
         return self._client.process_jpegs(
             jpegs,
@@ -211,6 +213,7 @@ class VideoSession:
             window=window,
             timeout=timeout,
             raise_frame_errors=raise_frame_errors,
+            include_raw_detections=include_raw_detections,
         )
 
 
@@ -595,11 +598,14 @@ class VideoProcessorClient:
         window: int = MAX_WINDOW,
         timeout: float | None = None,
         raise_frame_errors: bool = True,
+        include_raw_detections: bool = False,
     ) -> AsyncIterator[VideoResult]:
         """Convenience API that assigns monotonic IDs and timestamps to JPEGs."""
 
         if type(start_frame_id) is not int or not 0 <= start_frame_id <= MAX_FRAME_ID:
             raise ValueError(f"start_frame_id must be in 0..{MAX_FRAME_ID}")
+        if type(include_raw_detections) is not bool:
+            raise TypeError("include_raw_detections must be a boolean")
 
         async def frames() -> AsyncIterator[VideoFrame]:
             frame_id = start_frame_id
@@ -610,6 +616,7 @@ class VideoProcessorClient:
                     data=jpeg,
                     timestamp=time.perf_counter_ns(),
                     frame_id=frame_id,
+                    include_raw_detections=include_raw_detections,
                 )
                 frame_id += 1
 
@@ -667,6 +674,7 @@ class VideoProcessorClient:
                     batch_size=1,
                     session_id=session_id,
                     output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                    include_raw_detections=normalized.include_raw_detections,
                 )
                 config = normalized.mosaic
                 if config is not None:
@@ -778,7 +786,9 @@ def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
     mosaic = frame.mosaic
     if mosaic is not None and not isinstance(mosaic, MosaicConfig):
         raise TypeError("VideoFrame.mosaic must be a MosaicConfig instance")
-    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic)
+    if type(frame.include_raw_detections) is not bool:
+        raise TypeError("VideoFrame.include_raw_detections must be a boolean")
+    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic, frame.include_raw_detections)
 
 
 def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:

@@ -80,12 +80,24 @@ class FakeGrpcClient:
         *,
         session_id: str,
         window: int,
+        include_raw_detections: bool = False,
     ) -> AsyncIterator[VideoResult]:
         self.image_inference_options = (session_id, window)
+        self.include_raw_detections = include_raw_detections
         for frame_id, payload in enumerate(jpegs, start=1):
             self.image_inference_inputs.append((session_id, payload))
             frame = SimpleNamespace(data=payload, timestamp=frame_id, frame_id=frame_id)
             response = self._response(frame)
+            if include_raw_detections and self.mode == "image_inference":
+                response.raw_detections.extend(response.faces)
+                response.raw_detections.append(
+                    ai_processor_pb2.FaceMetadata(
+                        bbox=ai_processor_pb2.BoundingBox(x1=500, y1=200, x2=630, y2=240),
+                        confidence=0.03,
+                        class_name="number_plate",
+                        source="detected",
+                    )
+                )
             decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
             response.width = decoded.shape[1]
             response.height = decoded.shape[0]
@@ -385,8 +397,11 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         )
         self.assertEqual(
             [item["class_id"] for item in payload["objects"]],
-            [0, 1],
+            [0, 1, 1],
         )
+        self.assertTrue(fake.include_raw_detections)
+        self.assertEqual(payload["objects"][2]["confidence"], 0.03)
+        self.assertNotIn("track_id", payload["objects"][2])
         input_jpeg = base64.b64decode(payload["model_input"]["jpeg_base64"])
         visualization_jpeg = base64.b64decode(payload["visualization"]["jpeg_base64"])
         input_image = cv2.imdecode(np.frombuffer(input_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -397,6 +412,10 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         self.assertEqual(input_image.shape, (360, 640, 3))
         self.assertEqual(visualization.shape, (360, 640, 3))
         self.assertGreater(int(np.std(visualization)), int(np.std(input_image)))
+        # The untracked, maskless plate still has an orange box in the output JPEG.
+        blue, green, red = (int(value) for value in visualization[240, 560])
+        self.assertGreater(red, green + 60)
+        self.assertGreater(green, blue + 30)
         self.assertEqual(fake.image_inference_options, ("session-image", 1))
         self.assertEqual(len(fake.image_inference_inputs), 1)
         self.assertEqual(

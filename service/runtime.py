@@ -281,7 +281,13 @@ class RuntimeManager:
             raise RuntimeError(f"B1 inference returned {len(results)} results")
         return results[0]
 
-    async def infer(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
+    async def infer(
+        self,
+        image: np.ndarray,
+        tracker: StreamTracker,
+        *,
+        include_raw_detections: bool = False,
+    ) -> dict[str, Any]:
         if not self.ready or self._closed:
             raise RuntimeError("runtime is not ready")
         loop = asyncio.get_running_loop()
@@ -293,6 +299,7 @@ class RuntimeManager:
                 self._infer_sync,
                 image,
                 tracker,
+                include_raw_detections,
             )
         result["timing_ms"]["queue"] = round((admitted_at - queued_at) * 1000, 2)
         self.frames += 1
@@ -300,7 +307,9 @@ class RuntimeManager:
             self._latency[stage].append(float(value))
         return result
 
-    def _infer_sync(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
+    def _infer_sync(
+        self, image: np.ndarray, tracker: StreamTracker, include_raw_detections: bool = False
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         try:
             prediction = self._predict(image)
@@ -325,12 +334,18 @@ class RuntimeManager:
                 image.shape[1],
                 image.shape[0],
             )
+            raw_objects = (
+                self._objects(prediction, None, image.shape[1], image.shape[0])
+                if include_raw_detections
+                else []
+            )
         except Exception as error:
             raise TrackingFailure("mask tracking failed") from error
         serialized_at = time.perf_counter()
         confidences = np.asarray(boxes.conf, dtype=np.float32)
         return {
             "objects": objects,
+            "raw_objects": raw_objects,
             "detections": int((confidences >= ACTIVATION_CONFIDENCE).sum()),
             "raw_detections": len(boxes),
             "continuation_candidates": int(
@@ -354,16 +369,18 @@ class RuntimeManager:
     def _objects(
         self,
         prediction: Any,
-        tracks: np.ndarray,
+        tracks: np.ndarray | None,
         width: int,
         height: int,
     ) -> list[dict[str, Any]]:
+        """Serialize tracks, or pre-tracking detector candidates when tracks is None."""
         polygons = prediction.masks.xy if prediction.masks is not None else []
         objects: list[dict[str, Any]] = []
-        for row in tracks:
-            if len(row) < 8:
+        rows = prediction.boxes.data.cpu().numpy() if tracks is None else tracks
+        for index, row in enumerate(rows):
+            if tracks is not None and len(row) < 8:
                 continue
-            detection_index = int(row[-1])
+            detection_index = index if tracks is None else int(row[-1])
             if not 0 <= detection_index < len(prediction.boxes):
                 raise RuntimeError("tracker returned an invalid detection index")
             points: list[list[float]] = []
@@ -379,19 +396,21 @@ class RuntimeManager:
                         ]
                         for x, y in polygon
                     ]
+            if tracks is None and len(points) < 3:
+                points = []
             x1, y1, x2, y2 = (float(value) for value in row[:4])
             area = (
                 float(cv2.contourArea(np.asarray(points, dtype=np.float32)))
                 if len(points) >= 3
                 else 0.0
             )
-            class_id = int(row[6])
+            class_id = int(row[5] if tracks is None else row[6])
             objects.append(
                 {
-                    "track_id": int(row[4]),
+                    **({"track_id": int(row[4])} if tracks is not None else {}),
                     "class_id": class_id,
                     "class_name": self.names.get(class_id, str(class_id)),
-                    "confidence": round(float(row[5]), 4),
+                    "confidence": round(float(row[4] if tracks is None else row[5]), 4),
                     "bbox": [
                         round(float(np.clip(x1, 0, width - 1)), 1),
                         round(float(np.clip(y1, 0, height - 1)), 1),

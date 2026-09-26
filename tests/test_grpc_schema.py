@@ -108,9 +108,14 @@ class GrpcSchemaContractTests(unittest.TestCase):
 
     def test_session_and_whitelist_fields_are_additive(self):
         expected = {
-            "VideoChunk": {"session_id": 5, "output_mode": 6, "mosaic_config": 7},
+            "VideoChunk": {
+                "session_id": 5,
+                "output_mode": 6,
+                "mosaic_config": 7,
+                "include_raw_detections": 11,
+            },
             "MosaicConfig": {"blur_radius": 1, "pixel_size": 2},
-            "ProcessedVideoChunk": {"mosaic_jpeg": 13},
+            "ProcessedVideoChunk": {"mosaic_jpeg": 13, "raw_detections": 14},
             "FaceMetadata": {"whitelisted": 10},
             "FrameStats": {
                 "adaface_calls": 9,

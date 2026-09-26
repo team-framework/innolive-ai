@@ -413,6 +413,9 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(result.response.data == result.processed_jpeg for result in results))
         self.assertTrue(all(result.response.mosaic_jpeg == b"" for result in results))
         self.assertTrue(
+            all(not request.include_raw_detections for request in loopback.servicer.requests)
+        )
+        self.assertTrue(
             all(request.session_id == "client-session" for request in loopback.servicer.requests)
         )
         self.assertTrue(

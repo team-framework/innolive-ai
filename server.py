@@ -319,6 +319,7 @@ class GrpcDemoGateway:
                     [model_input_jpeg],
                     session_id=session_id,
                     window=1,
+                    include_raw_detections=True,
                 )
             ) as results:
                 async for item in results:
@@ -335,6 +336,13 @@ class GrpcDemoGateway:
                     "gRPC image result dimensions do not match the resized model input"
                 )
             objects = [_face_object(face) for face in response.faces]
+            if response.raw_detections:
+                objects = [item for item in objects if item["class_name"] != "number_plate"]
+                objects.extend(
+                    _face_object(item)
+                    for item in response.raw_detections
+                    if item.class_name == "number_plate"
+                )
             visualization = annotate_detections(model_input, objects)
             visualization_jpeg = encode_jpeg(visualization, JPEG_QUALITY)
         except PayloadTooLarge as error:

@@ -41,6 +41,8 @@ message VideoChunk {
   uint32 height = 9;
   // Pixel format of data when it is raw (e.g. "yuv420p"). Empty means data is a self-describing JPEG.
   string pix_fmt = 10;
+  // Include detector candidates before tracking for diagnostic image visualization.
+  bool include_raw_detections = 11;
 }
 
 message MosaicConfig {
@@ -72,6 +74,8 @@ message ProcessedVideoChunk {
   FrameStats stats = 12;
   // Transitional alias retained for wire compatibility. Servers leave this empty.
   bytes mosaic_jpeg = 13 [deprecated = true];
+  // Untracked candidates, only when requested. These do not affect mosaic or recognition.
+  repeated FaceMetadata raw_detections = 14;
 }
 
 message ProcessingTiming {

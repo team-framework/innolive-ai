@@ -200,6 +200,10 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 브라우저 demo gateway는 `POST /api/infer-image?session_id=...`에 JPEG·PNG·WebP를 raw body로
 받습니다. 입력은 long edge 640 이하로 resize한 뒤 gRPC `ProcessVideo`에 전달하며, 응답에는
 동일한 model input JPEG, box/mask overlay JPEG, object metadata가 포함됩니다.
+단건 시각화는 `include_raw_detections=true`로 tracking 이전 탐지 후보도 요청하고,
+번호판은 detector confidence 기준(0.01)부터 주황색으로 표시합니다. 낮은 confidence의
+후보에는 오탐이 포함될 수 있습니다. 기본 동영상 응답·tracking·모자이크 기준은 유지되며,
+이 옵션을 사용하려면 gateway와 gRPC 서버를 함께 업데이트해야 합니다.
 
 등록 이미지는 저장하지 않고 정규화된 AdaFace embedding만 메모리에 유지합니다. 자세한
 message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor.proto)를
