@@ -68,13 +68,25 @@ class PresetTests(unittest.TestCase):
     def test_occlusion_retention_expiration_and_cleanup(self):
         stream = StreamFaceIdentities(retention_frames=30, choose=lambda _: 0)
         first, _ = stream.observe(1, ATTRS, 1)
+        stream.cache_metadata(1, AttributePrediction(ATTRS, {}), 1)
         stream.expire(set(), 31)
+        self.assertIn(1, stream.metadata)
         self.assertIs(first, stream.observe(1, CHANGED, 32)[0])
+        stream.expire({1}, 32)
         stream.expire(set(), 63)
         self.assertNotIn(1, stream.tracks)
+        self.assertNotIn(1, stream.metadata)
         stream.observe(2, ATTRS, 64)
+        stream.cache_metadata(2, None, 64)
         stream.clear()
         self.assertEqual(stream.tracks, {})
+        self.assertEqual(stream.metadata, {})
+
+    def test_failed_metadata_without_identity_expires(self):
+        stream = StreamFaceIdentities()
+        stream.cache_metadata(1, None, 1)
+        stream.expire(set(), 32)
+        self.assertEqual(stream.metadata, {})
 
     def test_catalog_allows_partial_sets_but_no_duplicate_or_unsafe_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -158,20 +170,127 @@ class AnonymizationTests(unittest.TestCase):
         self.assertEqual(payload, mosaic_jpeg(self.image, [face()]))
         self.assertIsNone(self.runtime.renderer)
 
-    def test_dynamic_variant_is_applied_next_frame_without_identity_change(self):
+    def test_dynamic_variant_refreshes_every_30_frames_without_identity_change(self):
         self.presets()
         self.runtime.renderer = Mock()
         self.runtime.renderer.swap.side_effect = lambda image, *_: np.full_like(image, 80)
-        first, second = [face()], [face()]
+        first = [face()]
         self.process(first)
         self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
-        self.process(second, frame=2)
+        for frame in range(2, 31):
+            objects = [face()]
+            self.process(objects, frame=frame)
+            info = objects[0]["anonymization"]
+            self.assertEqual(info["attributes"], asdict(ATTRS))
+            self.assertEqual(info["confidence"]["exp"], 0.9)
+            self.assertEqual(info["preset_key"], "female/20s/1/off/none")
+            self.assertEqual(info["status"], "swapped")
+        self.assertEqual(self.runtime.extractor.predict.call_count, 1)
+        second = [face()]
+        self.process(second, frame=31)
         info1, info2 = first[0]["anonymization"], second[0]["anonymization"]
         self.assertEqual(info1["identity_key"], info2["identity_key"])
         self.assertEqual(info1["preset_key"], "female/20s/1/off/none")
         self.assertEqual(info2["preset_key"], "female/20s/1/on/happy")
         self.assertEqual(info2["status"], "swapped")
-        self.assertEqual(self.runtime.renderer.swap.call_count, 2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        for frame in range(32, 61):
+            self.process([face()], frame=frame)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        self.process([face()], frame=61)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 3)
+        self.assertEqual(self.runtime.renderer.swap.call_count, 61)
+
+    def test_tracks_refresh_on_independent_schedules_and_batch_only_due_faces(self):
+        self.process([face(1)], mode=2)
+        self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
+        objects = [face(1), face(2)]
+        self.process(objects, frame=10, mode=2)
+        self.assertEqual(objects[0]["anonymization"]["attributes"], asdict(ATTRS))
+        self.assertEqual(objects[1]["anonymization"]["attributes"], asdict(CHANGED))
+        self.assertEqual(len(self.runtime.extractor.predict.call_args.args[0]), 1)
+        self.process([face(1), face(2)], frame=30, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        self.process([face(1), face(2)], frame=31, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 3)
+        self.assertEqual(len(self.runtime.extractor.predict.call_args.args[0]), 1)
+        self.process([face(1), face(2)], frame=39, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 3)
+        self.process([face(1), face(2)], frame=40, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 4)
+        self.assertEqual(len(self.runtime.extractor.predict.call_args.args[0]), 1)
+
+    def test_new_tracks_due_together_are_batched(self):
+        self.runtime.extractor.predict.return_value = [
+            AttributePrediction(ATTRS, {}),
+            AttributePrediction(CHANGED, {}),
+        ]
+        objects = [face(1), face(2)]
+        self.process(objects, mode=2)
+        self.runtime.extractor.predict.assert_called_once()
+        self.assertEqual(len(self.runtime.extractor.predict.call_args.args[0]), 2)
+        self.assertEqual(objects[0]["anonymization"]["attributes"], asdict(ATTRS))
+        self.assertEqual(objects[1]["anonymization"]["attributes"], asdict(CHANGED))
+        self.process([face(1), face(2)], frame=2, mode=2)
+        self.runtime.extractor.predict.assert_called_once()
+
+    def test_due_held_face_refreshes_when_fresh_detection_returns(self):
+        self.process([face()], mode=2)
+        self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
+        held = [face(held=True)]
+        self.process(held, frame=31, mode=2)
+        self.runtime.extractor.predict.assert_called_once()
+        self.assertEqual(held[0]["anonymization"]["reason"], "held_face")
+        objects = [face()]
+        self.process(objects, frame=32, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        self.assertEqual(objects[0]["anonymization"]["attributes"], asdict(CHANGED))
+
+    def test_failed_refresh_blurs_until_next_attempt_and_preserves_identity(self):
+        self.presets()
+        self.process([face()], mode=2)
+        self.runtime.extractor.predict.side_effect = ValueError("invalid logits")
+        objects = [face()]
+        with self.assertLogs("innolive.face_swap", level="WARNING"):
+            result = self.process(objects, frame=31)
+        self.assertEqual(result, mosaic_jpeg(self.image, [face()]))
+        self.assertEqual(objects[0]["anonymization"]["identity_key"], "female/20s/1")
+        self.assertNotIn("attributes", objects[0]["anonymization"])
+        self.runtime.extractor.predict.side_effect = None
+        self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
+        for frame in range(32, 61):
+            objects = [face()]
+            self.process(objects, frame=frame)
+            self.assertEqual(objects[0]["anonymization"]["reason"], "metadata_unavailable")
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        objects = [face()]
+        self.process(objects, frame=61, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 3)
+        self.assertEqual(objects[0]["anonymization"]["attributes"], asdict(CHANGED))
+        self.assertEqual(objects[0]["anonymization"]["identity_key"], "female/20s/1")
+
+    def test_initial_failure_waits_30_frames_without_allocating_identity(self):
+        self.runtime.extractor.predict.side_effect = ValueError("invalid logits")
+        with self.assertLogs("innolive.face_swap", level="WARNING"):
+            self.process([face()])
+        self.assertEqual(self.stream.tracks, {})
+        self.runtime.extractor.predict.side_effect = None
+        self.process([face()], frame=30)
+        self.runtime.extractor.predict.assert_called_once()
+        self.process([face()], frame=31)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        self.assertIn(1, self.stream.tracks)
+
+    def test_expired_track_loses_cached_metadata_and_refreshes_immediately(self):
+        self.process([face()], mode=2)
+        self.process([], frame=32, mode=2)
+        self.assertEqual(self.stream.tracks, {})
+        self.assertEqual(self.stream.metadata, {})
+        self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
+        objects = [face()]
+        self.process(objects, frame=33, mode=2)
+        self.assertEqual(self.runtime.extractor.predict.call_count, 2)
+        self.assertEqual(objects[0]["anonymization"]["attributes"], asdict(CHANGED))
 
     def test_missing_dynamic_variant_never_substitutes_another_identity(self):
         self.presets()
@@ -180,7 +299,7 @@ class AnonymizationTests(unittest.TestCase):
             AttributePrediction(FaceAttributes("female", "20s", "on", "anger"), {})
         ]
         objects = [face()]
-        self.process(objects, frame=2)
+        self.process(objects, frame=31)
         self.assertEqual(objects[0]["anonymization"]["identity_key"], "female/20s/1")
         self.assertEqual(objects[0]["anonymization"]["reason"], "preset_missing")
 
@@ -233,6 +352,38 @@ class AnonymizationTests(unittest.TestCase):
 
 
 class GrpcAnonymizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_uses_rpc_frame_sequence_and_cache_is_not_shared_between_rpcs(self):
+        async with LoopbackServer(FaceRuntime()) as server:
+            runtime = server.bundle.servicer.face_anonymization
+            runtime.extractor = Mock(
+                predict=Mock(
+                    side_effect=[
+                        [AttributePrediction(ATTRS, {"exp": 0.9})],
+                        [AttributePrediction(CHANGED, {"exp": 0.8})],
+                        [AttributePrediction(ATTRS, {"exp": 0.7})],
+                    ]
+                )
+            )
+            runtime.catalog = Mock(match=Mock(return_value=None))
+            requests = [_request(frame_id=10000 - i * 100) for i in range(31)]
+            for request in requests:
+                request.anonymization_mode = messages.FACE_ANONYMIZATION_MODE_FACE_METADATA
+            responses = await _collect(server.stub.ProcessVideo(_requests(*requests)))
+            self.assertEqual(runtime.extractor.predict.call_count, 2)
+            for response in responses[:30]:
+                info = response.faces[0].anonymization
+                self.assertEqual(info.attributes.exp, "none")
+                self.assertAlmostEqual(info.attributes.confidence["exp"], 0.9)
+                self.assertEqual(
+                    info.identity_key, responses[0].faces[0].anonymization.identity_key
+                )
+            self.assertEqual(responses[30].faces[0].anonymization.attributes.exp, "happy")
+            (reconnected,) = await _collect(server.stub.ProcessVideo(_requests(requests[0])))
+            self.assertEqual(runtime.extractor.predict.call_count, 3)
+            self.assertAlmostEqual(
+                reconnected.faces[0].anonymization.attributes.confidence["exp"], 0.7
+            )
+
     async def test_default_request_never_loads_metadata_or_renderer(self):
         async with LoopbackServer(FaceRuntime()) as server:
             runtime = server.bundle.servicer.face_anonymization
