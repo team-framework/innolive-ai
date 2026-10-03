@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ class FacePreset:
     attributes: FaceAttributes
     identity: int
     image: Path
+    sha256: str | None = None
 
     @property
     def key(self) -> str:
@@ -50,7 +52,12 @@ class PresetCatalog:
             if key in self.presets:
                 raise ValueError(f"duplicate preset: {key}")
             # Incomplete image sets are allowed; missing files fail closed per face.
-            self.presets[key] = FacePreset(attrs, identity, image)
+            sha256 = entry.get("sha256")
+            if sha256 is not None and (
+                not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            ):
+                raise ValueError("invalid preset SHA-256")
+            self.presets[key] = FacePreset(attrs, identity, image, sha256)
 
     def match(self, attributes: FaceAttributes, identity: int) -> FacePreset | None:
         return self.presets.get((attributes, identity))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -75,15 +76,31 @@ class InSwapperRenderer:
         self.sources: OrderedDict[Path, np.ndarray] = OrderedDict()
 
     def detect(self, image: np.ndarray) -> list[np.ndarray]:
-        self.detector.setInputSize((image.shape[1], image.shape[0]))
-        _, faces = self.detector.detect(image)
-        return [] if faces is None else list(faces)
+        height, width = image.shape[:2]
+        factor = min(1.0, 640 / max(width, height))
+        detection_size = (max(1, round(width * factor)), max(1, round(height * factor)))
+        detected_image = image
+        if factor < 1:
+            detected_image = cv2.resize(image, detection_size, interpolation=cv2.INTER_AREA)
+        self.detector.setInputSize(detection_size)
+        _, faces = self.detector.detect(detected_image)
+        if faces is None:
+            return []
+        faces = faces.copy()
+        # Restore bbox and all five landmarks to native image coordinates.
+        sx, sy = width / detection_size[0], height / detection_size[1]
+        faces[:, [0, 2, 4, 6, 8, 10, 12]] *= sx
+        faces[:, [1, 3, 5, 7, 9, 11, 13]] *= sy
+        return list(faces)
 
     def source_latent(self, preset: FacePreset) -> np.ndarray:
         if preset.image in self.sources:
             self.sources.move_to_end(preset.image)
             return self.sources[preset.image]
-        image = cv2.imread(str(preset.image))
+        data = preset.image.read_bytes()
+        if preset.sha256 is not None and hashlib.sha256(data).hexdigest() != preset.sha256:
+            raise ValueError("preset image SHA-256 does not match the catalog")
+        image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("preset image could not be decoded")
         faces = self.detect(image)
