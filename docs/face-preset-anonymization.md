@@ -24,8 +24,11 @@ flowchart LR
   A[JPEG 또는 yuv420p] --> B[YOLO → BoT-SORT → whitelist]
   B --> C{anonymization_mode}
   C -->|blur| D[Gaussian blur]
-  C -->|face_metadata 또는 face_swap| E[얼굴 bbox crop → metadata]
-  E --> F[트랙 identity 유지 → 현재 exp / glasses 매칭]
+  C -->|face_metadata 또는 face_swap| E{새 트랙 또는 갱신 후 30프레임}
+  E -->|예| M[얼굴 bbox crop → metadata]
+  E -->|아니오| K[트랙 metadata 캐시]
+  M --> F[트랙 identity 유지 → 최신 exp / glasses 매칭]
+  K --> F
   F -->|face_swap + 프리셋 존재| G[YuNet 정렬 → InSwapper-128]
   F -->|프리셋 누락 또는 metadata 모드| D
   G -->|실패| D
@@ -36,18 +39,31 @@ flowchart LR
 ## 트랙과 프리셋 계약
 
 처음 metadata를 얻은 BoT-SORT track에서 `gender`, `age`와 1..5 중 무작위 identity slot을
-고정한다. 이후 매 프레임 `glasses`, `exp`를 다시 추출해 같은 identity의 해당 variant를
-찾는다. `gender`나 `age` 예측이 흔들려도 첫 bucket을 유지하므로 identity가 바뀌지 않는다.
-관측된 최신 속성은 응답에 그대로 기록하며 고정된 bucket은 `identity_key`에 기록한다.
+고정한다. 새 트랙은 즉시 metadata를 추출하며 이후 트랙별 30프레임마다 다시 추출한다.
+갱신 사이에는 직전 attributes와 confidence를 재사용해 같은 identity의 variant를 찾는다.
+`gender`나 `age` 예측이 흔들려도 첫 bucket을 유지하므로 identity가 바뀌지 않는다.
+최근 추출한 속성은 응답에 기록하며 고정된 bucket은 `identity_key`에 기록한다.
+
+주기는 서버가 해당 RPC에서 받은 프레임 순서로 계산하며 클라이언트 `frame_id`나 timestamp와
+무관하다. 첫 관측이 RPC의 1번째 프레임이면 1·31·61번째, 10번째 프레임이면 10·40·70번째에
+추출한다. 해당 시점에 held 또는 너무 작은 얼굴이면 다음 적격 검출에서 추출한다.
+같은 프레임에 갱신이 필요한 얼굴만 모아 batch 추론한다. InSwapper 합성은 현재 프레임의
+얼굴에서 계속 실행하며 metadata 갱신 주기만 줄인다. `exp`와 `glasses` 변화는 다음 갱신
+시점에 반영되므로 감지까지 최대 30 입력 프레임의 지연이 생길 수 있다.
+
+metadata 추론 실패 시 이전 속성을 폐기하고 다음 30프레임 갱신 시도까지 blur로 처리한다.
+이미 할당한 identity는 유지한다. 아직 track ID가 없는 얼굴은 트랙 캐시를 사용하지 않으며
+속성 추출 후 기존 `untracked_face` blur 정책을 유지한다. API 파라미터 추가 없이
+`face_metadata`와 `face_swap` 모두 같은 주기를 적용한다.
 
 - identity key: `female/20s/3`
 - variant key: `female/20s/3/on/happy`
 - 동일 `gender/age/identity`의 모든 표정·안경 프리셋은 같은 가짜 인물이어야 한다.
 - 전체 구성: 2 genders × 4 ages × 5 identities × 2 glasses × 7 expressions = 560 images
-- RPC마다 별도 identity state 보유; 같은 `session_id`의 서로 다른 RPC도 독립된 tracker와 state 보유
+- RPC마다 별도 identity와 metadata 캐시 보유; 같은 `session_id`의 서로 다른 RPC도 독립된 tracker와 state 보유
 - 트랙 부재 시 기본 30 frames 유지; `--face-identity-retention-frames`는 BoT-SORT `track_buffer` 이상으로 설정
 - held mask는 새 metadata나 합성을 실행하지 않고 blur 처리; 기존 identity state 유지
-- RPC 종료 시 state 정리; 재접속 후 기존 identity 유지나 사람 재식별은 범위 밖
+- 트랙 만료와 RPC 종료 시 identity 및 metadata 캐시 정리; 재접속 후 기존 identity 유지나 사람 재식별은 범위 밖
 - 다른 트랙이 같은 slot을 선택할 수 있음; 현재 5개 identity pool에서 전역 유일성 보장 없음
 
 `config/face_presets.json`은 현재 `synthetic_faces`의 560개 variant를 포함한다.
@@ -231,6 +247,9 @@ SDK는 얼굴이 있는 opt-in 응답에 새 anonymization metadata가 없으면
 
 ## 이번 구현의 검증 범위
 
+아래 초기 smoke와 실제 synthetic_faces 연결 검증은 매 프레임 metadata를 추출하던
+30프레임 주기 적용 전의 결과이다.
+
 2026-10-04 macOS arm64, CPU에서 다음 항목을 확인했다.
 
 - `python -m unittest discover -s tests`: 215 tests 통과; 신규 20 tests에 트랙 identity 고정,
@@ -279,3 +298,21 @@ scripts와 기존 TensorRT lab의 lint 오류 23개가 남아 있다. 전체 for
 안경 라벨이 14/14 일치했고 표정 생성 라벨과 예측값은 10/14 일치했다. 단일 생성 인물의
 smoke 결과로 분류 정확도를 일반화하지 않는다. 학습 코드의 preprocessing/activation
 일치, 실제 webcam과 NVIDIA 배포 검증은 여전히 별도 항목이다.
+
+## 트랙별 metadata 30프레임 갱신 검증
+
+2026-10-04에 트랙별 metadata 캐시와 30프레임 갱신 주기를 적용했다.
+
+- 전체 Python 231 tests 통과; 얼굴 합성 관련 28 tests에 신규 회귀 8개 포함
+- 61프레임의 동일 트랙에서 metadata 추론 1·31·61번째 총 3회와 매 프레임 합성 호출 확인
+- 서로 다른 시점에 등장한 트랙의 독립 주기와 갱신 대상만 포함하는 batch 확인
+- held 검출의 갱신 유예, 초기/갱신 실패의 30프레임 재시도 및 blur와 identity 유지 확인
+- 트랙 만료와 RPC 종료의 캐시 정리 및 재접속 첫 프레임 추론 확인
+- 실제 gRPC loopback 31개 요청에서 불연속 client frame ID와 무관한 갱신 경계 확인
+- 실제 metadata checkpoint와 설치된 synthetic_faces 이미지로 runtime 61프레임 입력,
+  1·31·61번째 총 3회 추론과 동일 identity 및 attributes/confidence 캐시 재사용 확인
+- 변경 코드 Ruff check와 format check 및 `git diff --check` 통과
+
+실제 checkpoint smoke는 프리셋 이미지의 전체 영역을 crop으로 사용한 metadata runtime
+검증이며 YOLO/BoT-SORT 영상 추적이나 InSwapper 시각적 품질 검증은 포함하지 않는다.
+추론 호출 감소를 검증했으며 전체 영상 FPS와 배포 GPU 성능은 측정하지 않았다.
