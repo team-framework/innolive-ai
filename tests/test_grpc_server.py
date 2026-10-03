@@ -463,7 +463,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             data=source,
                             frame_id=2,
                             output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
-                            mosaic_config=ai_processor_pb2.MosaicConfig(pixel_size=1),
+                            mosaic_config=ai_processor_pb2.MosaicConfig(pixel_size=2),
                         ),
                     )
                 )
