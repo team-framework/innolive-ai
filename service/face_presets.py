@@ -9,10 +9,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from service.face_metadata import FaceAttributes
+from service.face_metadata import AttributePrediction, FaceAttributes
 
 DEFAULT_PRESET_MANIFEST = Path(__file__).resolve().parents[1] / "config" / "face_presets.json"
 IDENTITY_COUNT = 5
+METADATA_REFRESH_FRAMES = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +76,15 @@ class TrackIdentity:
         return f"{self.gender}/{self.age}/{self.identity}"
 
 
+@dataclass(slots=True)
+class TrackMetadata:
+    prediction: AttributePrediction | None
+    refreshed_at: int
+    last_seen: int
+
+
 class StreamFaceIdentities:
-    """Pin gender/age/slot once; exp/glasses select variants on every fresh frame."""
+    """Pin identity once and retain metadata between track-local refreshes."""
 
     def __init__(
         self, *, retention_frames: int = 30, choose: Callable[[int], int] = secrets.randbelow
@@ -84,6 +92,13 @@ class StreamFaceIdentities:
         self.retention_frames = retention_frames
         self.choose = choose
         self.tracks: dict[int, TrackIdentity] = {}
+        self.metadata: dict[int, TrackMetadata] = {}
+
+    def cache_metadata(
+        self, track_id: int, prediction: AttributePrediction | None, frame: int
+    ) -> None:
+        # A failed refresh is cached too: keep blur until the next scheduled attempt.
+        self.metadata[track_id] = TrackMetadata(prediction, frame, frame)
 
     def observe(
         self, track_id: int, attributes: FaceAttributes, frame: int
@@ -99,11 +114,13 @@ class StreamFaceIdentities:
         return state, variant
 
     def expire(self, current_ids: set[int], frame: int) -> None:
-        for track_id, state in tuple(self.tracks.items()):
-            if track_id in current_ids:
-                state.last_seen = frame
-            elif frame - state.last_seen > self.retention_frames:
-                del self.tracks[track_id]
+        for states in (self.tracks, self.metadata):
+            for track_id, state in tuple(states.items()):
+                if track_id in current_ids:
+                    state.last_seen = frame
+                elif frame - state.last_seen > self.retention_frames:
+                    del states[track_id]
 
     def clear(self) -> None:
         self.tracks.clear()
+        self.metadata.clear()

@@ -10,8 +10,13 @@ from typing import Any
 import numpy as np
 
 from service.detection import is_face_object
-from service.face_metadata import DEFAULT_METADATA_MODEL, MetadataExtractor
-from service.face_presets import DEFAULT_PRESET_MANIFEST, PresetCatalog, StreamFaceIdentities
+from service.face_metadata import DEFAULT_METADATA_MODEL, AttributePrediction, MetadataExtractor
+from service.face_presets import (
+    DEFAULT_PRESET_MANIFEST,
+    METADATA_REFRESH_FRAMES,
+    PresetCatalog,
+    StreamFaceIdentities,
+)
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
 from service.mosaic import (
     _encode_jpeg,
@@ -109,6 +114,8 @@ class FaceAnonymizationRuntime:
         remaining = list(objects)
         eligible = []
         crops = []
+        refresh_indices = []
+        predictions: list[AttributePrediction | None] = []
         for item in objects:
             if not is_face_object(item) or item.get("whitelisted") is True:
                 continue
@@ -116,10 +123,11 @@ class FaceAnonymizationRuntime:
                 "status": "blur_fallback",
                 "reason": "held_face" if item.get("held") else "metadata_unavailable",
             }
+            track_id = item.get("track_id")
+            state = identities.tracks.get(track_id)
+            if state is not None:
+                item["anonymization"]["identity_key"] = state.key
             if item.get("held"):
-                state = identities.tracks.get(item.get("track_id"))
-                if state is not None:
-                    item["anonymization"]["identity_key"] = state.key
                 continue
             bbox = np.asarray(item["bbox"], dtype=float)
             if bbox.shape != (4,) or not np.isfinite(bbox).all():
@@ -133,49 +141,62 @@ class FaceAnonymizationRuntime:
                 item["anonymization"]["reason"] = "face_too_small"
                 continue
             eligible.append(item)
+            cached = identities.metadata.get(track_id)
+            if cached is not None and frame - cached.refreshed_at < METADATA_REFRESH_FRAMES:
+                predictions.append(cached.prediction)
+                continue
+            predictions.append(None)
+            refresh_indices.append(len(eligible) - 1)
             crops.append(crop)
-        if eligible and self.load_error is None:
+            if track_id is not None:
+                identities.cache_metadata(int(track_id), None, frame)
+        if crops and self.load_error is None:
             try:
                 self._metadata()
-                predictions = self.extractor.predict(crops)
-                if len(predictions) != len(eligible):
+                refreshed = self.extractor.predict(crops)
+                if len(refreshed) != len(refresh_indices):
                     raise ValueError("metadata batch size mismatch")
             except Exception:
                 LOGGER.warning("metadata extraction failed; applying blur", exc_info=True)
-                predictions = []
-            for item, prediction in zip(eligible, predictions, strict=False):
-                info = item["anonymization"]
-                info.update(
-                    attributes=asdict(prediction.attributes), confidence=prediction.confidence
-                )
-                track_id = item.get("track_id")
-                if track_id is None:
-                    info["reason"] = "untracked_face"
-                    continue
-                state, variant = identities.observe(int(track_id), prediction.attributes, frame)
-                info["identity_key"] = state.key
-                preset = self.catalog.match(variant, state.identity)
-                if preset is None or not preset.image.is_file():
-                    info["reason"] = "preset_missing"
-                    continue
-                info["preset_key"] = preset.key
-                if mode == MODES["face_metadata"] or not render:
-                    info.update(status="metadata_only", reason="")
-                    continue
-                if self.renderer_error:
-                    info["reason"] = "swapper_unavailable"
-                    continue
-                try:
-                    self._renderer()
-                    candidate = self.renderer.swap(output.copy(), item, preset)
-                    if candidate.shape != image.shape or candidate.dtype != np.uint8:
-                        raise ValueError("invalid rendered frame")
-                    output = candidate
-                    remaining = [entry for entry in remaining if entry is not item]
-                    info.update(status="swapped", reason="")
-                except Exception:
-                    info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
-                    LOGGER.warning("track %s swap failed; applying blur", track_id, exc_info=True)
+                refreshed = []
+            for index, prediction in zip(refresh_indices, refreshed, strict=False):
+                predictions[index] = prediction
+                track_id = eligible[index].get("track_id")
+                if track_id is not None:
+                    identities.cache_metadata(int(track_id), prediction, frame)
+        for item, prediction in zip(eligible, predictions, strict=True):
+            if prediction is None:
+                continue
+            info = item["anonymization"]
+            info.update(attributes=asdict(prediction.attributes), confidence=prediction.confidence)
+            track_id = item.get("track_id")
+            if track_id is None:
+                info["reason"] = "untracked_face"
+                continue
+            state, variant = identities.observe(int(track_id), prediction.attributes, frame)
+            info["identity_key"] = state.key
+            preset = self.catalog.match(variant, state.identity)
+            if preset is None or not preset.image.is_file():
+                info["reason"] = "preset_missing"
+                continue
+            info["preset_key"] = preset.key
+            if mode == MODES["face_metadata"] or not render:
+                info.update(status="metadata_only", reason="")
+                continue
+            if self.renderer_error:
+                info["reason"] = "swapper_unavailable"
+                continue
+            try:
+                self._renderer()
+                candidate = self.renderer.swap(output.copy(), item, preset)
+                if candidate.shape != image.shape or candidate.dtype != np.uint8:
+                    raise ValueError("invalid rendered frame")
+                output = candidate
+                remaining = [entry for entry in remaining if entry is not item]
+                info.update(status="swapped", reason="")
+            except Exception:
+                info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
+                LOGGER.warning("track %s swap failed; applying blur", track_id, exc_info=True)
         if not render:
             return b""
         # Apply failed/held face and number-plate blur last so it takes precedence
