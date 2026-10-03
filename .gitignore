@@ -78,3 +78,7 @@ Thumbs.db
 /models/*.onnx
 /models/face_swap/
 /face_swap_lab_output/
+
+# Synthetic preset image assets and test-client recordings.
+/config/face_presets/
+/face_preset_client_output/

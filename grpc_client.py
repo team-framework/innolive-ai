@@ -96,6 +96,7 @@ class VideoFrame:
     timestamp: int
     frame_id: int
     mosaic: MosaicConfig | None = None
+    anonymization_mode: str = "blur"
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +668,9 @@ class VideoProcessorClient:
                     batch_size=1,
                     session_id=session_id,
                     output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                    anonymization_mode={"blur": 0, "face_swap": 1, "face_metadata": 2}[
+                        normalized.anonymization_mode
+                    ],
                 )
                 config = normalized.mosaic
                 if config is not None:
@@ -717,6 +721,16 @@ class VideoProcessorClient:
             raise VideoProtocolError(
                 f"frame {source.frame_id} response used deprecated mosaic_jpeg data"
             )
+        if source.anonymization_mode != "blur":
+            for face in response.faces:
+                if (
+                    face.class_name in {"", "face"}
+                    and not face.whitelisted
+                    and not face.HasField("anonymization")
+                ):
+                    raise VideoProtocolError(
+                        "server does not report experimental face anonymization; update the server proto and runtime"
+                    )
         try:
             _validate_jpeg(response.data)
         except (TypeError, ValueError) as error:
@@ -778,7 +792,9 @@ def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
     mosaic = frame.mosaic
     if mosaic is not None and not isinstance(mosaic, MosaicConfig):
         raise TypeError("VideoFrame.mosaic must be a MosaicConfig instance")
-    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic)
+    if frame.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
+        raise ValueError("VideoFrame.anonymization_mode must be blur, face_swap, or face_metadata")
+    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic, frame.anonymization_mode)
 
 
 def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:
