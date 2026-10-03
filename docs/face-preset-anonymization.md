@@ -50,11 +50,33 @@ flowchart LR
 - RPC 종료 시 state 정리; 재접속 후 기존 identity 유지나 사람 재식별은 범위 밖
 - 다른 트랙이 같은 slot을 선택할 수 있음; 현재 5개 identity pool에서 전역 유일성 보장 없음
 
-`config/face_presets.json`은 빈 catalog로 배포한다. 이미지가 준비되는 대로 아래 entry를
-추가한다. 이미지 경로는 manifest 디렉터리를 기준으로 상대 경로이며 그 디렉터리 밖으로
-나갈 수 없다. 기본 위치에서는 `config/face_presets/` 아래에 이미지를 놓는다.
-이 이미지 디렉터리는 Git에서 제외되어 있으므로 배포할 때 별도로 전달한다.
+`config/face_presets.json`은 현재 `synthetic_faces`의 560개 variant를 포함한다.
+데이터의 `(gender, age_group, local_id)`가 가짜 인물 한 명이다. 원본 local ID `0..4`는
+기존 serving slot `1..5`로 `identity = local_id + 1` 대응한다. 파일명과 원본을 바꾸지
+않으며 entry의 `source_person_key`, `source_local_id`로 원래 인물 키를 추적할 수 있다.
+예를 들어 `female/20s/3`은 `g0_a1_id2`에 해당한다.
+
+이미지 경로는 manifest 디렉터리를 기준으로 상대 경로이며 그 디렉터리 밖으로 나갈 수
+없다. 기본 설치 위치는 `config/face_presets/images/`이다. importer가 원본 PNG를 그대로
+복사하고 CSV와 이미지의 SHA-256, 실제 크기, 560개 고유 조합을 검증한다. catalog에는
+이미지별 SHA-256과 원천 CSV digest를 기록한다. renderer도 처음 source latent를 만들 때
+이미지 hash를 확인하며 수정된 이미지로 합성하지 않는다. 아래 JSON은 수동 catalog의
+최소 entry 예시이며 importer는 provenance와 hash 필드를 함께 생성한다.
+
+이미지 약 1.12GB와 source CSV 등은 Git에서 제외한 배포 assets이다. 코드와 catalog만
+checkout한 배포 호스트에서는 다음 importer를 실행하거나 검증한 `config/face_presets/`
+디렉터리를 같은 위치에 전달한다. catalog는 Downloads의 절대 경로에 의존하지 않는다.
 다른 위치의 manifest는 `--face-preset-manifest`로 지정할 수 있다.
+
+```bash
+.venv/bin/python scripts/import_face_presets.py --source /path/to/synthetic_faces
+```
+
+현재 개발 호스트에는 `~/Downloads/synthetic_faces`로부터 설치를 완료했다. 반복 import는
+같은 파일이면 동일 결과를 유지한다. 설치된 asset이 다르면 기존 파일과 catalog를 보존하고
+실패한다. 설치 전 전체 source를 검증하고, 첫 설치에서는 staging 디렉터리의 복사 hash까지
+확인한 뒤 assets와 catalog를 게시한다. 원본 폴더의 파일은 수정하지 않는다. 서버가 이미
+빈 catalog를 로드한 상태였다면 설치 후 서버를 재시작한다.
 
 ```json
 {
@@ -116,7 +138,9 @@ InsightFace dependency를 메인 서버에 강제하지 않는다. 기본 CPU이
 기존 `~/.insightface/models/buffalo_l/w600k_r50.onnx`를 사용하려면 서버에
 `--face-swap-arcface`로 그 파일을 명시하거나 기본 경로에 복사한다. source image는
 YuNet이 정확히 한 얼굴을 찾을 수 있어야 한다. source latent는 variant image별로
-최대 64개까지 캐시한다. target landmarks는 현재 YOLO bbox ROI에서 IoU로 연결한다.
+최대 64개까지 캐시한다. target landmarks는 현재 YOLO bbox ROI에서 IoU로 연결한다. YuNet 입력의 long edge는
+최대 640px이며 bbox와 landmarks를 원본 좌표로 복원한 뒤 원본에서 정렬 crop을 만든다.
+1254px PNG의 크기나 픽셀을 수정하지 않는다.
 합성은 해당 얼굴 segmentation polygon 안으로 제한하고, 실패한 얼굴·held 얼굴·번호판의
 blur를 마지막에 적용한다. whitelist 얼굴은 기존 정책대로 보호 처리에서 제외한다.
 
@@ -136,7 +160,10 @@ InSwapper는 source 이미지의 **identity embedding**을 입력으로 사용�
 
 ## 서버와 테스트 클라이언트
 
-metadata 확인은 기존 서버 dependencies만 필요하다. 합성할 호스트에서는 추가로 설치한다.
+metadata 확인은 기존 서버 dependencies만 필요하다. 현재 개발 호스트에는 프리셋,
+optional ONNX dependencies와 기본 경로의 ArcFace까지 준비되어 있다. 기존
+`./scripts/run_local.sh`로 서버를 시작한 뒤 테스트 클라이언트에 `--mode face_swap`을
+명시하면 된다. 새 합성 호스트에서는 모델 artifacts와 프리셋을 준비한 뒤 추가 dependencies를 설치한다.
 
 ```bash
 .venv/bin/python -m pip install -r requirements-face-swap.txt
@@ -232,3 +259,23 @@ smoke 입력과 source는 설치된 Matplotlib의 `grace_hopper.jpg` sample imag
 scripts와 기존 TensorRT lab의 lint 오류 23개가 남아 있다. 전체 format check에도
 변경하지 않은 `tests/test_trt_swap_client.py` 1개가 남아 있으며 해당 파일은 이번 범위에
 포함하지 않았다.
+
+
+## 실제 synthetic_faces 연결 검증
+
+2026-10-04에 사용자가 제공한 `~/Downloads/synthetic_faces`를 연결했다.
+
+- 원천 CSV SHA-256: `e252f624126005e3234d23643ec8de9363b5bb391dc62782416b0aa29ffab1a4`
+- 560장의 SHA-256과 decode, 1254×1254 크기, 40 identities의 각 14개 조합 확인
+- 원본 PNG 총 1,122,453,120 bytes를 변경 없이 로컬 배포 assets로 복사 및 복사본 hash 확인
+- 실제 YuNet 640px 검출과 ArcFace/InSwapper projection에서 560/560 source latent 준비 성공,
+  source 얼굴 1개 조건 및 유한한 `(1, 512)` normalized latent 확인, 실패 0개
+- 실제 메인 gRPC 서버에 가짜 인물 `g0_a1_id0`의 14개 표정/안경 입력을 한 RPC로 전송,
+  14/14 `swapped`, 동일 BoT-SORT track `1`과 `female/20s/1` 유지 확인
+- 표정/안경 metadata 변화에 따라 같은 identity의 10개 variant key로 즉시 매칭 전환 확인
+- 전체 Python 223 tests 및 browser protocol test 통과, 변경 코드 Ruff 통과
+
+매칭은 생성 라벨이 아닌 metadata classifier의 관측값을 사용한다. 위 14프레임에서는
+안경 라벨이 14/14 일치했고 표정 생성 라벨과 예측값은 10/14 일치했다. 단일 생성 인물의
+smoke 결과로 분류 정확도를 일반화하지 않는다. 학습 코드의 preprocessing/activation
+일치, 실제 webcam과 NVIDIA 배포 검증은 여전히 별도 항목이다.

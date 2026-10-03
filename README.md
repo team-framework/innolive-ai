@@ -214,11 +214,17 @@ message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor
 `VideoChunk.anonymization_mode`에 `FACE_ANONYMIZATION_MODE_FACE_SWAP`을 명시한 경우에만
 metadata 기반 프리셋 매칭과 InSwapper-128 합성을 실행합니다. 동일 BoT-SORT 트랙의
 identity를 유지하고 표정·안경 variant를 매 프레임 갱신하며, 프리셋 누락·합성 실패는
-blur로 처리합니다. 프리셋이 아직 없으면 `FACE_ANONYMIZATION_MODE_FACE_METADATA`로
-속성과 identity부터 확인할 수 있습니다.
+blur로 처리합니다. 기본 catalog에는 `synthetic_faces`의 40명·560개 variant가 연결되어
+있으며 원본 ID `0..4`를 serving slot `1..5`로 대응합니다. 이미지 assets는 배포 시
+importer로 설치합니다. `FACE_ANONYMIZATION_MODE_FACE_METADATA`로 속성과 매칭만
+확인할 수도 있습니다.
 
 ```bash
-.venv/bin/python scripts/face_preset_client.py --camera 0 --mode face_metadata
+# 새 호스트에 프리셋 설치; 현재 개발 호스트에는 설치 완료
+.venv/bin/python scripts/import_face_presets.py --source /path/to/synthetic_faces
+
+# 서버 실행 후 명시적으로 experimental 합성 요청
+.venv/bin/python scripts/face_preset_client.py --camera 0 --mode face_swap
 ```
 
 프리셋 manifest, 모델 준비, 배포 서버 테스트와 모델 제약은
