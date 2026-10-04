@@ -133,11 +133,18 @@ head 4개이다. `input_size=224`, targets는 `gender`, `age`, `glasses`, `exp` 
 `torch.load(weights_only=True)`를 유지하며 checkpoint에 포함된 NumPy RNG를 위한 구체적인
 NumPy primitive만 allowlist한다. optimizer와 RNG state는 추론에 사용하지 않는다.
 
-checkpoint는 normalization과 head activation을 기록하지 않는다. 현재 구현은 bbox crop을
-224×224로 resize하고 BGR → RGB, 0..1, ImageNet mean `(0.485, 0.456, 0.406)` /
-std `(0.229, 0.224, 0.225)`를 적용하며 head는 ReLU를 사용한다. Dropout은 eval에서 비활성이다.
-**학습 코드와의 preprocessing 및 activation 일치와 분류 정확도는 추가 확인 대상이다.**
-추론 smoke 통과가 분류 정확도 검증을 의미하지 않는다.
+checkpoint는 normalization과 head activation을 기록하지 않는다. 학습 run의
+`runs/metadata_large_v1/source/common.py`와 대조한 결과 head는
+`Linear(960,128) → Hardswish → Dropout(0.2) → Linear(128,C)`이며 Dropout은 eval에서 비활성이다.
+원본 frame의 face bbox에 각 방향 15% margin을 더하고 이미지 경계에서 clip한다.
+종횡비를 보존해 긴 변을 224px로 resize하고 나머지는 중앙 배치한 edge padding으로 채운다.
+축소는 `INTER_AREA`, 확대는 `INTER_LINEAR`를 사용한다. BGR → RGB, 0..1, ImageNet mean
+`(0.485, 0.456, 0.406)` / std `(0.229, 0.224, 0.225)`로 normalize하며 channels-last로 추론한다.
+metadata 갱신이 필요한 얼굴에만 margin crop을 만들고 기존 30프레임 캐시 주기를 유지한다.
+
+2026-10-04의 학습 원본 대조와 CPU FP32 48입력 비교에서 입력 tensor와 네 head logits의
+최대 절대 차이 0.0을 확인했다. 이는 구현 일치 검증이며 실제 분류 정확도, live webcam 및
+CUDA mixed precision 일치를 의미하지 않는다. 자세한 원본 hash와 재현 명령은 아래에 있다.
 
 InSwapper adapter는 optional ONNX Runtime와 ONNX만 사용한다. 기존 Tk 실험 클라이언트의
 InsightFace dependency를 메인 서버에 강제하지 않는다. 기본 CPU이고 NVIDIA에서
@@ -248,7 +255,7 @@ SDK는 얼굴이 있는 opt-in 응답에 새 anonymization metadata가 없으면
 ## 이번 구현의 검증 범위
 
 아래 초기 smoke와 실제 synthetic_faces 연결 검증은 매 프레임 metadata를 추출하던
-30프레임 주기 적용 전의 결과이다.
+30프레임 주기 및 학습 원본 일치 수정 적용 전의 결과이다.
 
 2026-10-04 macOS arm64, CPU에서 다음 항목을 확인했다.
 
@@ -296,8 +303,9 @@ scripts와 기존 TensorRT lab의 lint 오류 23개가 남아 있다. 전체 for
 
 매칭은 생성 라벨이 아닌 metadata classifier의 관측값을 사용한다. 위 14프레임에서는
 안경 라벨이 14/14 일치했고 표정 생성 라벨과 예측값은 10/14 일치했다. 단일 생성 인물의
-smoke 결과로 분류 정확도를 일반화하지 않는다. 학습 코드의 preprocessing/activation
-일치, 실제 webcam과 NVIDIA 배포 검증은 여전히 별도 항목이다.
+smoke 결과로 분류 정확도를 일반화하지 않는다. 위 라벨 일치 수치는 학습 원본 일치 수정 전
+관측이며 현재 모델의 정확도 평가로 사용하지 않는다. 실제 webcam과 NVIDIA 배포 검증은
+여전히 별도 항목이다.
 
 ## 트랙별 metadata 30프레임 갱신 검증
 
@@ -316,3 +324,69 @@ smoke 결과로 분류 정확도를 일반화하지 않는다. 학습 코드의 
 실제 checkpoint smoke는 프리셋 이미지의 전체 영역을 crop으로 사용한 metadata runtime
 검증이며 YOLO/BoT-SORT 영상 추적이나 InSwapper 시각적 품질 검증은 포함하지 않는다.
 추론 호출 감소를 검증했으며 전체 영상 FPS와 배포 GPU 성능은 측정하지 않았다.
+
+## 학습 원본과 연동 출력 일치 검증
+
+2026-10-04에 GPU 서버 `/home/gorani/apps/face-workspace`의 완료된
+`runs/metadata_large_v1/source/` snapshot을 읽어 모델과 전처리를 대조했다.
+`common.py`, `cache.py`, `data.py`, `train.py`, `predict.py`의 SHA-256이 학습 시 기록한
+`environment.json.source_sha256`과 모두 일치했다. 학습이나 GPU run을 재실행하지 않았다.
+
+| 근거 | SHA-256 |
+| --- | --- |
+| 로컬 checkpoint와 학습 run `best.pt` | `be9b42f67dbab87c6a6a73161995ddb43b73e64c6203748f3ab3222edef4448a` |
+| 학습 snapshot `common.py` | `9a4a546af1ed75c3dc63a1ead6eb3c76f0949386d64e4cceba8b244ad8d33226` |
+| 학습 snapshot `cache.py` | `1d508f8b3805413f511a12d6bc11476be4f368aa2a67f9862a97be4481667258` |
+| 학습 snapshot `data.py` | `c8094b50323ee6aaec8ce5eab8db91887ec02751b81e02b709944896ef70abf8` |
+| 학습 snapshot `train.py` | `f8323eed121afcb5990d435b86eea6628382df6a6bf1efecf9fd66bc91c50a42` |
+| 학습 snapshot `predict.py` | `bb858b0799988619083485ded5d823d87128892feadd7bcd34f0e850cee5d069` |
+
+원본 head는 Hardswish인데 연동 commit `84e17cf`는 ReLU였으며, 원본의 margin·비율 유지·
+padding을 연동의 bbox crop·정사각형 stretch가 대체하고 있었다. 이 두 차이를 수정했다.
+activation과 전처리는 state dict에 weight가 없어 strict 로딩 성공만으로 검증되지 않는다.
+
+실제 synthetic_faces 40 identities의 `off/none` 40장과 각 gender/age의 slot 1 `on/happy`
+8장, 총 48장을 사용했다. YuNet에서 얻은 동일 bbox를 학습 원본과 수정 전후 연동에 전달해
+CPU FP32로 비교했다. batch size 16, macOS arm64, torch 2.13.0, OpenCV 5.0.0 조건이다.
+
+| 비교 조건 | gender 예측 차이 | age 예측 차이 | glasses 예측 차이 | exp 예측 차이 |
+| --- | ---: | ---: | ---: | ---: |
+| 수정 전 ReLU + tight crop/stretch | 9/48 | 12/48 | 0/48 | 6/48 |
+| 같은 전처리에서 ReLU만 적용 | 2/48 | 1/48 | 1/48 | 0/48 |
+| Hardswish에서 tight crop/stretch만 적용 | 5/48 | 12/48 | 0/48 | 5/48 |
+| 수정 후 연동 | 0/48 | 0/48 | 0/48 | 0/48 |
+
+수정 후 입력 tensor와 네 head logits 및 softmax 확률의 최대 절대 차이는 모두 **0.0**이다.
+두 문제의 영향을 각각 분리했으며 표의 값은 생성 라벨에 대한 정확도가 아니라 학습 구현과의
+예측 불일치 개수다. 촬영 영상의 검출 박스나 장치/precision이 달라지면 별도 비교가 필요하다.
+학습 캐시의 JPEG pack 재압축이나 학습 증강은 raw 얼굴의 inference 비교에 적용하지 않았다.
+
+`scripts/compare_face_metadata.py`는 명시한 학습 `common.py`를 import하고 같은 checkpoint를
+양쪽 모델에 strict 로딩한다. 입력 tensor와 logits를 비교하고 클래스별 확률을 JSON에 저장한다.
+오차 기준 `atol=1e-5`, `rtol=1e-4`를 넘으면 결과를 저장한 뒤 exit code 1을 반환한다.
+다른 checkpoint나 학습 소스로 교체할 때에도 이 비교를 다시 실행한다.
+
+입력 파일 예시와 재현 명령:
+
+```json
+{
+  "cases": [
+    {"id": "face-1", "image": "/path/to/input.jpg", "bbox": [100, 80, 240, 260]}
+  ]
+}
+```
+
+```bash
+.venv/bin/python scripts/compare_face_metadata.py \
+  --training-source /path/to/training/source/common.py \
+  --cases /path/to/cases.json --output /tmp/metadata-parity.json
+```
+
+`bbox`는 원본 이미지 좌표의 xyxy이며 image의 상대 경로는 cases JSON을 기준으로 해석한다.
+`--baseline-source /path/to/old/face_metadata.py`를 추가하면 과거 연동의 activation과 전처리
+영향도 분리해 기록한다. 학습 원본이나 checkpoint, 얼굴 이미지 자체는 Git에 추가하지 않는다.
+
+- 전체 Python 241 tests 통과; 새 회귀에서 Hardswish의 음수 hidden 응답, margin/clip,
+  비율 유지·edge padding·축소 interpolation, RGB normalize와 batch layout 확인
+- 메인 runtime의 원본 frame margin crop과 캐시 중 재추론 생략 확인
+- 변경 코드 Ruff check 및 format check와 `git diff --check` 통과
