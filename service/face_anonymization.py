@@ -10,7 +10,12 @@ from typing import Any
 import numpy as np
 
 from service.detection import is_face_object
-from service.face_metadata import DEFAULT_METADATA_MODEL, AttributePrediction, MetadataExtractor
+from service.face_metadata import (
+    DEFAULT_METADATA_MODEL,
+    AttributePrediction,
+    MetadataExtractor,
+    crop_metadata_face,
+)
 from service.face_presets import (
     DEFAULT_PRESET_MANIFEST,
     METADATA_REFRESH_FRAMES,
@@ -147,7 +152,7 @@ class FaceAnonymizationRuntime:
                 continue
             predictions.append(None)
             refresh_indices.append(len(eligible) - 1)
-            crops.append(crop)
+            crops.append(crop_metadata_face(image, bbox))
             if track_id is not None:
                 identities.cache_metadata(int(track_id), None, frame)
         if crops and self.load_error is None:
