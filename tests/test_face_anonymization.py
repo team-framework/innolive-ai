@@ -234,6 +234,14 @@ class AnonymizationTests(unittest.TestCase):
         self.process([face(1), face(2)], frame=2, mode=2)
         self.runtime.extractor.predict.assert_called_once()
 
+    def test_metadata_receives_margin_crop_from_original_frame_only_when_due(self):
+        self.process([face()], mode=2)
+        (crop,) = self.runtime.extractor.predict.call_args.args[0]
+        # bbox [10, 2, 50, 34] expands by 6 horizontally and 4.8 vertically.
+        np.testing.assert_array_equal(crop, self.image[:36, 4:56])
+        self.process([face()], frame=2, mode=2)
+        self.runtime.extractor.predict.assert_called_once()
+
     def test_due_held_face_refreshes_when_fresh_detection_returns(self):
         self.process([face()], mode=2)
         self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
