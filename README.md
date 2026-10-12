@@ -229,6 +229,8 @@ importer로 설치합니다. `FACE_ANONYMIZATION_MODE_FACE_METADATA`로 속성�
 
 프리셋 manifest, 모델 준비, 배포 서버 테스트와 모델 제약은
 [상세 실행 문서](docs/face-preset-anonymization.md)를 참고합니다.
+Go 서버의 요청 필드와 값별 동작은 [Go 연동 가이드](docs/go-face-swap-grpc.md),
+모델 다운로드와 프리셋 설치는 [모델 준비 가이드](docs/face-swap-model-download.md)를 참고합니다.
 
 ## 검증
 

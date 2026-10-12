@@ -67,3 +67,5 @@ matched the training implementation's input tensors and all four logits exactly.
 InSwapper and ArcFace binaries, plus synthetic preset images, are deployment artifacts.
 See [the preset pipeline guide](../docs/face-preset-anonymization.md) for artifact paths,
 optional ONNX dependencies, the manifest, and the actual gRPC test client.
+For official download commands and preset installation, see
+[the model download guide](../docs/face-swap-model-download.md).
