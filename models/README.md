@@ -52,3 +52,18 @@ license. Review those rights separately before commercial deployment.
 
 The server stores only normalized embeddings in memory. Enrollment images and
 aligned face crops are not written to this directory.
+
+## Experimental face metadata and swap
+
+`face_metadata_extracter.pt` is the supplied MobileNetV3-Large attribute checkpoint
+(SHA-256 `be9b42f67dbab87c6a6a73161995ddb43b73e64c6203748f3ab3222edef4448a`).
+The serving adapter validates its gender/age/glasses/exp class order and reconstructs
+the backbone and four heads. It is loaded only for explicitly requested experimental
+metadata/swap modes. The training run snapshot verifies Hardswish heads and RGB ImageNet
+normalization. Face boxes receive a 15% margin on each side, then aspect-preserving resize
+and centered replicated-edge padding. A CPU FP32 comparison of 48 synthetic face inputs
+matched the training implementation's input tensors and all four logits exactly.
+
+InSwapper and ArcFace binaries, plus synthetic preset images, are deployment artifacts.
+See [the preset pipeline guide](../docs/face-preset-anonymization.md) for artifact paths,
+optional ONNX dependencies, the manifest, and the actual gRPC test client.

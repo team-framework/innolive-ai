@@ -8,30 +8,92 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class FaceAnonymizationMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    FACE_ANONYMIZATION_MODE_BLUR: _ClassVar[FaceAnonymizationMode]
+    FACE_ANONYMIZATION_MODE_FACE_SWAP: _ClassVar[FaceAnonymizationMode]
+    FACE_ANONYMIZATION_MODE_FACE_METADATA: _ClassVar[FaceAnonymizationMode]
+
 class VideoOutputMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     VIDEO_OUTPUT_MODE_UNSPECIFIED: _ClassVar[VideoOutputMode]
     VIDEO_OUTPUT_MODE_METADATA_ONLY: _ClassVar[VideoOutputMode]
     VIDEO_OUTPUT_MODE_MOSAIC_JPEG: _ClassVar[VideoOutputMode]
+FACE_ANONYMIZATION_MODE_BLUR: FaceAnonymizationMode
+FACE_ANONYMIZATION_MODE_FACE_SWAP: FaceAnonymizationMode
+FACE_ANONYMIZATION_MODE_FACE_METADATA: FaceAnonymizationMode
 VIDEO_OUTPUT_MODE_UNSPECIFIED: VideoOutputMode
 VIDEO_OUTPUT_MODE_METADATA_ONLY: VideoOutputMode
 VIDEO_OUTPUT_MODE_MOSAIC_JPEG: VideoOutputMode
 
 class VideoChunk(_message.Message):
-    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode")
+    __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode", "mosaic_config", "width", "height", "pix_fmt", "anonymization_mode")
     DATA_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     FRAME_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     OUTPUT_MODE_FIELD_NUMBER: _ClassVar[int]
+    MOSAIC_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    WIDTH_FIELD_NUMBER: _ClassVar[int]
+    HEIGHT_FIELD_NUMBER: _ClassVar[int]
+    PIX_FMT_FIELD_NUMBER: _ClassVar[int]
+    ANONYMIZATION_MODE_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     timestamp: int
     frame_id: int
     batch_size: int
     session_id: str
     output_mode: VideoOutputMode
-    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ..., output_mode: _Optional[_Union[VideoOutputMode, str]] = ...) -> None: ...
+    mosaic_config: MosaicConfig
+    width: int
+    height: int
+    pix_fmt: str
+    anonymization_mode: FaceAnonymizationMode
+    def __init__(self, data: _Optional[bytes] = ..., timestamp: _Optional[int] = ..., frame_id: _Optional[int] = ..., batch_size: _Optional[int] = ..., session_id: _Optional[str] = ..., output_mode: _Optional[_Union[VideoOutputMode, str]] = ..., mosaic_config: _Optional[_Union[MosaicConfig, _Mapping]] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., pix_fmt: _Optional[str] = ..., anonymization_mode: _Optional[_Union[FaceAnonymizationMode, str]] = ...) -> None: ...
+
+class FaceAttributes(_message.Message):
+    __slots__ = ("gender", "age", "glasses", "exp", "confidence")
+    class ConfidenceEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: float
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[float] = ...) -> None: ...
+    GENDER_FIELD_NUMBER: _ClassVar[int]
+    AGE_FIELD_NUMBER: _ClassVar[int]
+    GLASSES_FIELD_NUMBER: _ClassVar[int]
+    EXP_FIELD_NUMBER: _ClassVar[int]
+    CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
+    gender: str
+    age: str
+    glasses: str
+    exp: str
+    confidence: _containers.ScalarMap[str, float]
+    def __init__(self, gender: _Optional[str] = ..., age: _Optional[str] = ..., glasses: _Optional[str] = ..., exp: _Optional[str] = ..., confidence: _Optional[_Mapping[str, float]] = ...) -> None: ...
+
+class FaceAnonymization(_message.Message):
+    __slots__ = ("attributes", "identity_key", "preset_key", "status", "fallback_reason")
+    ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
+    IDENTITY_KEY_FIELD_NUMBER: _ClassVar[int]
+    PRESET_KEY_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    FALLBACK_REASON_FIELD_NUMBER: _ClassVar[int]
+    attributes: FaceAttributes
+    identity_key: str
+    preset_key: str
+    status: str
+    fallback_reason: str
+    def __init__(self, attributes: _Optional[_Union[FaceAttributes, _Mapping]] = ..., identity_key: _Optional[str] = ..., preset_key: _Optional[str] = ..., status: _Optional[str] = ..., fallback_reason: _Optional[str] = ...) -> None: ...
+
+class MosaicConfig(_message.Message):
+    __slots__ = ("blur_radius", "pixel_size")
+    BLUR_RADIUS_FIELD_NUMBER: _ClassVar[int]
+    PIXEL_SIZE_FIELD_NUMBER: _ClassVar[int]
+    blur_radius: float
+    pixel_size: int
+    def __init__(self, blur_radius: _Optional[float] = ..., pixel_size: _Optional[int] = ...) -> None: ...
 
 class ProcessedVideoChunk(_message.Message):
     __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats", "mosaic_jpeg")
@@ -106,7 +168,7 @@ class BoundingBox(_message.Message):
     def __init__(self, x1: _Optional[float] = ..., y1: _Optional[float] = ..., x2: _Optional[float] = ..., y2: _Optional[float] = ...) -> None: ...
 
 class FaceMetadata(_message.Message):
-    __slots__ = ("bbox", "confidence", "polygon", "track_id", "source", "held", "hold_frames", "class_name", "mask_area_px", "whitelisted")
+    __slots__ = ("bbox", "confidence", "polygon", "track_id", "source", "held", "hold_frames", "class_name", "mask_area_px", "whitelisted", "anonymization")
     BBOX_FIELD_NUMBER: _ClassVar[int]
     CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
     POLYGON_FIELD_NUMBER: _ClassVar[int]
@@ -117,6 +179,7 @@ class FaceMetadata(_message.Message):
     CLASS_NAME_FIELD_NUMBER: _ClassVar[int]
     MASK_AREA_PX_FIELD_NUMBER: _ClassVar[int]
     WHITELISTED_FIELD_NUMBER: _ClassVar[int]
+    ANONYMIZATION_FIELD_NUMBER: _ClassVar[int]
     bbox: BoundingBox
     confidence: float
     polygon: _containers.RepeatedCompositeFieldContainer[Point]
@@ -127,7 +190,8 @@ class FaceMetadata(_message.Message):
     class_name: str
     mask_area_px: float
     whitelisted: bool
-    def __init__(self, bbox: _Optional[_Union[BoundingBox, _Mapping]] = ..., confidence: _Optional[float] = ..., polygon: _Optional[_Iterable[_Union[Point, _Mapping]]] = ..., track_id: _Optional[int] = ..., source: _Optional[str] = ..., held: _Optional[bool] = ..., hold_frames: _Optional[int] = ..., class_name: _Optional[str] = ..., mask_area_px: _Optional[float] = ..., whitelisted: _Optional[bool] = ...) -> None: ...
+    anonymization: FaceAnonymization
+    def __init__(self, bbox: _Optional[_Union[BoundingBox, _Mapping]] = ..., confidence: _Optional[float] = ..., polygon: _Optional[_Iterable[_Union[Point, _Mapping]]] = ..., track_id: _Optional[int] = ..., source: _Optional[str] = ..., held: _Optional[bool] = ..., hold_frames: _Optional[int] = ..., class_name: _Optional[str] = ..., mask_area_px: _Optional[float] = ..., whitelisted: _Optional[bool] = ..., anonymization: _Optional[_Union[FaceAnonymization, _Mapping]] = ...) -> None: ...
 
 class FrameStats(_message.Message):
     __slots__ = ("detections", "raw_detections", "continuation_candidates", "detector_backed_tracks", "low_confidence_continuations", "held_tracks", "tracks", "tracker_frame", "adaface_calls", "adaface_queue_overflow", "whitelisted_tracks")

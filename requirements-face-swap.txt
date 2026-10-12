@@ -1,0 +1,4 @@
+# Optional production experimental InSwapper adapter; install only on opt-in hosts.
+# For NVIDIA replace onnxruntime with the compatible onnxruntime-gpu package.
+onnx>=1.17,<2
+onnxruntime>=1.20,<2

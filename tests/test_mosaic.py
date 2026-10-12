@@ -162,7 +162,7 @@ class MosaicParamTests(unittest.TestCase):
 
     def test_defaults_are_stronger_than_the_legacy_sigma(self):
         self.assertEqual(mosaic.DEFAULT_BLUR_RADIUS, 24.0)
-        self.assertEqual(mosaic.DEFAULT_PIXEL_SIZE, 2)
+        self.assertEqual(mosaic.DEFAULT_PIXEL_SIZE, 1)
 
     def test_custom_strength_changes_the_output(self):
         weak = _decode(

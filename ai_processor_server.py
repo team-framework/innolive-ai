@@ -37,6 +37,8 @@ from service.adaface_model import (
     FaceTooSmallError,
 )
 from service.detection import is_number_plate_object
+from service.face_anonymization import MODES, FaceAnonymizationConfig, FaceAnonymizationRuntime
+from service.face_presets import StreamFaceIdentities
 from service.frame import (
     MAX_LONG_EDGE,
     MIN_FRAME_DIMENSION,
@@ -104,6 +106,7 @@ def _output_mode(value: int) -> int:
 class GrpcServerSettings:
     runtime: RuntimeConfig
     adaface: AdaFaceConfig = field(default_factory=AdaFaceConfig)
+    face_anonymization: FaceAnonymizationConfig = field(default_factory=FaceAnonymizationConfig)
     recognition: RecognitionConfig = field(default_factory=RecognitionConfig)
     tracker_config: Path = DEFAULT_TRACKER
     host: str = "127.0.0.1"
@@ -150,6 +153,8 @@ class StreamState:
     session_id: str
     output_mode: int
     recognition: StreamRecognition
+    anonymization_mode: int = 0
+    identities: StreamFaceIdentities = field(default_factory=StreamFaceIdentities)
     session: SessionState | None = None
 
 
@@ -170,6 +175,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.settings = settings
         self.sessions = sessions
         self.adaface = adaface
+        self.face_anonymization = FaceAnonymizationRuntime(settings.face_anonymization)
         self.tracker_factory = tracker_factory
         self.mark_unhealthy = mark_unhealthy
         self.active_streams = 0
@@ -218,10 +224,18 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     output_mode = _output_mode(request.output_mode)
                 except ValueError as error:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+                if request.anonymization_mode not in MODES.values():
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT, "unsupported anonymization_mode"
+                    )
                 if stream is None:
                     stream = StreamState(
                         session_id=request_session_id,
                         output_mode=output_mode,
+                        anonymization_mode=request.anonymization_mode,
+                        identities=StreamFaceIdentities(
+                            retention_frames=self.settings.face_anonymization.retention_frames
+                        ),
                         recognition=StreamRecognition(
                             self.adaface,
                             self.settings.recognition,
@@ -237,6 +251,11 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     await context.abort(
                         grpc.StatusCode.INVALID_ARGUMENT,
                         "output_mode cannot change within a ProcessVideo stream",
+                    )
+                if request.anonymization_mode != stream.anonymization_mode:
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        "anonymization_mode cannot change within a ProcessVideo stream",
                     )
                 frame_sequence += 1
                 try:
@@ -258,6 +277,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 await self._settle_inference(pending_inference)
             if stream is not None:
                 stream.recognition.close()
+                stream.identities.clear()
                 if stream.session is not None:
                     self.sessions.release_stream(stream.session)
             if tracker is not None:
@@ -287,7 +307,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
 
         blur_radius = DEFAULT_BLUR_RADIUS
         pixel_size = DEFAULT_PIXEL_SIZE
-        if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
+        render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
+        if render or stream.anonymization_mode != MODES["blur"]:
             config = request.mosaic_config
             if request.HasField("mosaic_config"):
                 if config.HasField("blur_radius"):
@@ -368,10 +389,26 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
 
         processed_data = b""
         blur_encode_ms = 0.0
-        if stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
+        render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
+        if render or stream.anonymization_mode != MODES["blur"]:
             mosaic_started = time.perf_counter()
             try:
-                if any(
+                if stream.anonymization_mode != MODES["blur"]:
+                    compose = partial(
+                        self.face_anonymization.process,
+                        image,
+                        objects,
+                        stream.identities,
+                        frame_sequence,
+                        stream.anonymization_mode,
+                        render=render,
+                        pix_fmt=request.pix_fmt,
+                        blur_radius=blur_radius,
+                        pixel_size=pixel_size,
+                        max_bytes=self.settings.max_jpeg_bytes,
+                    )
+                    processed_data = await self._compose_frame(compose)
+                elif any(
                     item.get("whitelisted") is not True or is_number_plate_object(item)
                     for item in objects
                 ):
@@ -392,12 +429,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             pixel_size=pixel_size,
                             max_bytes=self.settings.max_jpeg_bytes,
                         )
-                    async with self._mosaic_slots:
-                        loop = asyncio.get_running_loop()
-                        processed_data = await loop.run_in_executor(
-                            self._mosaic_executor,
-                            compose,
-                        )
+                    processed_data = await self._compose_frame(compose)
                 else:
                     processed_data = bytes(request.data)
             except Exception:
@@ -654,6 +686,16 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             active_stream_count=summary.active_stream_count,
         )
 
+    async def _compose_frame(self, compose: Callable[[], bytes]) -> bytes:
+        async with self._mosaic_slots:
+            future = asyncio.get_running_loop().run_in_executor(self._mosaic_executor, compose)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # The worker owns this RPC's identity state until it settles.
+                await self._settle_inference(future)
+                raise
+
     async def close(self) -> None:
         self._accepting = False
         tasks = tuple(self._inference_tasks)
@@ -677,7 +719,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 LOGGER.exception("failed to publish NOT_SERVING health state")
 
     @staticmethod
-    async def _settle_inference(task: asyncio.Task) -> None:
+    async def _settle_inference(task: asyncio.Future) -> None:
         """Do not release/reset tracker state before shielded GPU work settles."""
 
         while not task.done():
@@ -785,6 +827,23 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         )
         if "track_id" in item and item["track_id"] is not None:
             face.track_id = int(item["track_id"])
+        info = item.get("anonymization")
+        if info is not None:
+            face.anonymization.CopyFrom(
+                messages.FaceAnonymization(
+                    identity_key=info.get("identity_key", ""),
+                    preset_key=info.get("preset_key", ""),
+                    status=info["status"],
+                    fallback_reason=info.get("reason", ""),
+                )
+            )
+            if "attributes" in info:
+                face.anonymization.attributes.CopyFrom(
+                    messages.FaceAttributes(
+                        **info["attributes"],
+                        confidence=info["confidence"],
+                    )
+                )
         return face
 
     @staticmethod
@@ -1053,6 +1112,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.getenv("GRPC_SHUTDOWN_GRACE", "5")),
     )
+    experimental = FaceAnonymizationConfig()
+    parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
+    parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
+    parser.add_argument("--face-swap-model", type=Path, default=experimental.swapper_model)
+    parser.add_argument("--face-swap-arcface", type=Path, default=experimental.arcface_model)
+    parser.add_argument("--face-swap-yunet", type=Path, default=experimental.yunet_model)
+    parser.add_argument(
+        "--face-metadata-device", default="cpu", help="torch device: cpu, mps, cuda:0"
+    )
+    parser.add_argument("--face-swap-provider", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--face-identity-retention-frames", type=positive_int, default=30)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
@@ -1072,6 +1142,16 @@ def main() -> None:
             backend=arguments.backend,
             device=arguments.device,
             warmup_runs=arguments.warmup_runs,
+        ),
+        face_anonymization=FaceAnonymizationConfig(
+            metadata_model=arguments.face_metadata_model,
+            preset_manifest=arguments.face_preset_manifest,
+            swapper_model=arguments.face_swap_model,
+            arcface_model=arguments.face_swap_arcface,
+            yunet_model=arguments.face_swap_yunet,
+            metadata_device=arguments.face_metadata_device,
+            swap_provider=arguments.face_swap_provider,
+            retention_frames=arguments.face_identity_retention_frames,
         ),
         adaface=AdaFaceConfig(
             architecture=arguments.adaface_architecture,
