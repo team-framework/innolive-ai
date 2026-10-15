@@ -1,0 +1,96 @@
+[
+  {
+    "faces": 1,
+    "width": 640,
+    "height": 360,
+    "detected": 1,
+    "attributes": [
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      }
+    ]
+  },
+  {
+    "faces": 1,
+    "width": 1280,
+    "height": 720,
+    "detected": 1,
+    "attributes": [
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      }
+    ]
+  },
+  {
+    "faces": 1,
+    "width": 1920,
+    "height": 1080,
+    "detected": 1,
+    "attributes": [
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      }
+    ]
+  },
+  {
+    "faces": 2,
+    "width": 1280,
+    "height": 720,
+    "detected": 2,
+    "attributes": [
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      },
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      }
+    ]
+  },
+  {
+    "faces": 4,
+    "width": 1280,
+    "height": 720,
+    "detected": 4,
+    "attributes": [
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      },
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      },
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      },
+      {
+        "gender": "female",
+        "age": "20s",
+        "glasses": "off",
+        "exp": "none"
+      }
+    ]
+  }
+]

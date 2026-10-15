@@ -390,3 +390,20 @@ CPU FP32로 비교했다. batch size 16, macOS arm64, torch 2.13.0, OpenCV 5.0.0
   비율 유지·edge padding·축소 interpolation, RGB normalize와 batch layout 확인
 - 메인 runtime의 원본 frame margin crop과 캐시 중 재추론 생략 확인
 - 변경 코드 Ruff check 및 format check와 `git diff --check` 통과
+
+## GPU 성능 측정 — 2026-10-10
+
+GPU 서버의 `feat/face-metadata-swap/#37`를 `c3910ec`로 pull한 뒤 RTX 3090에서
+네트워크를 제외해 측정했다. 메인 경로는 YOLO TensorRT + metadata CUDA + InSwapper
+ONNX CUDA 구성이다. 얼굴 1개에서 640×360 34.88 FPS, 720p 17.48 FPS,
+1080p 12.82 FPS였으며 총 2,040프레임의 2,520개 얼굴이 fallback 없이 합성됐다.
+
+순수 InSwapper forward는 ONNX CUDA 평균 16.71 ms, TensorRT FP32 14.05 ms,
+TensorRT mixed 5.42 ms였다. 기존 별도 TensorRT 실험 경로는 YuNet TensorRT·ROI
+합성을 함께 사용해 720p 얼굴 1개 54.88 FPS를 기록했다. 메인의 InSwapper TensorRT
+연동은 아직 없고, 실험 경로에는 metadata·프리셋 정책과 JPEG 비용도 포함되지 않는다.
+
+고정 synthetic portrait 반복 측정으로 실시간 카메라나 다양한 얼굴의 품질 검증은 아니다.
+측정용 서버와 임시 자원은 정리하고 기존 서비스는 유지했다. 환경·얼굴 수·동시 session별
+결과·모델 오차·재현 명령·원본 JSON은
+[GPU 성능 보고서](../reports/2026-10-10-inswapper-gpu-benchmark.md)에 기록했다.

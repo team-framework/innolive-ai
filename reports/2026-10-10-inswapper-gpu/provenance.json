@@ -1,0 +1,76 @@
+{
+  "recorded_at_kst": "2026-10-10T22:14:27.191639+09:00",
+  "repo_path": "/home/gorani/apps/new-inno-live-server-python",
+  "before_commit": "4270fd2",
+  "after_commit": "c3910ec295d44fa4536e926e9f9dafb5ed67dad7",
+  "branch": "feat/face-metadata-swap/#37",
+  "baseline_untracked": [
+    ".venv-trt10-swap/",
+    "cuda-keyring_1.1-1_all.deb",
+    "models/.trt-swap-export-ybnhn27q/",
+    "runs/"
+  ],
+  "git_status_before_record": [
+    "?? .venv-trt10-swap/",
+    "?? cuda-keyring_1.1-1_all.deb",
+    "?? models/.trt-swap-export-ybnhn27q/",
+    "?? runs/"
+  ],
+  "cpu": "AMD Ryzen 9 7900 12-Core Processor; 24 logical CPUs visible",
+  "kernel": "7.0.0-31-generic",
+  "loaded_nvidia_kernel_driver": "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.91.07  Release Build  (dvs-builder@U22-I3-B08-02-2)  Wed Jul 29 03:01:16 UTC 2026\nGCC version:  gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1) \n",
+  "nvml_error": "Failed to initialize NVML: Driver/library version mismatch; NVML library 595.99; kernel 595.91.07",
+  "laboratory_artifacts": {
+    "models/best_swap_b4.engine": {
+      "sha256": "b8c5426aa395349a18492dab25f8f0acace26096fab36af94f12040690e57d1b",
+      "manifest": {
+        "schema_version": 1,
+        "purpose": "independent TensorRT face-swap test client",
+        "created_at": "2026-09-12T22:31:09.097923+00:00",
+        "source_checkpoint": "best.pt",
+        "source_sha256": "307e9b5895654d25d264903451abc4acad9ee30f5e2f2bf64af164a9f46bc115",
+        "engine": "best_swap_b4.engine",
+        "engine_sha256": "b8c5426aa395349a18492dab25f8f0acace26096fab36af94f12040690e57d1b",
+        "precision": "fp16",
+        "dynamic": true,
+        "batch_range": {
+          "min": 1,
+          "opt": 4,
+          "max": 4
+        },
+        "image_size": 640,
+        "class_names": {
+          "0": "face",
+          "1": "number_plate"
+        },
+        "workspace_gib": 4.0,
+        "gpu": "NVIDIA GeForce RTX 3090",
+        "torch": "2.13.0+cu130",
+        "ultralytics": "8.4.104",
+        "tensorrt": "11.1.0.106",
+        "python": "3.11.15"
+      }
+    },
+    "models/face_detection_yunet_trt.engine": {
+      "sha256": "81fde35f8bdf28df6bed37b85bee905de6cc36d30339f3ea26579b8ec5dc7066",
+      "manifest": {
+        "format": 1,
+        "model_sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        "engine_sha256": "81fde35f8bdf28df6bed37b85bee905de6cc36d30339f3ea26579b8ec5dc7066",
+        "tensorrt_version": "11.1.0.106",
+        "opt_size": 320,
+        "max_size": 1024
+      }
+    }
+  },
+  "active_benchmark_python_processes": [],
+  "existing_services": [
+    "    PID COMMAND",
+    "   2963 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers",
+    "1214488 /home/gorani/apps/face-workspace/.venv/bin/python -u /home/gorani/apps/face-workspace/experiments/metadata_large_v1/web/server.py --host 0.0.0.0 --port 9090 --https-port 9091 --cert /home/gorani/apps/face-workspace/runs/metadata_large_v1/web/localhost.crt --key /home/gorani/apps/face-workspace/runs/metadata_large_v1/web/localhost.key",
+    "1230585 /home/gorani/.venvs/jupyterlab/.venv/bin/python3 /home/gorani/.venvs/jupyterlab/.venv/bin/jupyter-lab --ip=0.0.0.0 --port=8888 --no-browser --ContentsManager.allow_hidden=True",
+    "1255460 .venv311/bin/python -m uvicorn index:app --host 0.0.0.0 --port 9001 --reload"
+  ],
+  "temporary_dependency_overlay": "aiortc and dependencies installed only in scratch/extra-deps; .venv and system packages not installed or upgraded",
+  "transfer_note": "Bulk asset transfer interrupted after required benchmark presets became available. All benchmarked variants existed and were hash-validated by the renderer. Transfer stopped during all timed runs."
+}

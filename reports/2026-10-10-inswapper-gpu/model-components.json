@@ -1,0 +1,307 @@
+{
+  "method": "Prepared inputs; no network, image decode/encode, tracking, alignment, or paste-back in forward timings",
+  "note": "ORT CUDA I/O binding uses synchronized wall time; TensorRT and PyTorch use CUDA events on their execution stream",
+  "components": {
+    "inswapper_onnx_cuda_host_io": {
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 16.7092384560965,
+        "p50": 16.69840037357062,
+        "p95": 16.967047529760748,
+        "max": 17.100223107263446
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "inswapper_onnx_cuda_gpu_io": {
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 16.70643600751646,
+        "p50": 16.68858900666237,
+        "p95": 16.802071873098612,
+        "max": 17.051954055204988
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "inswapper_trt_fp32_host_io": {
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 14.13292589597404,
+        "p50": 14.077762607485056,
+        "p95": 14.425324706826359,
+        "max": 15.396031085401773
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "inswapper_trt_fp32_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 14.053108477592469,
+        "p50": 14.047183990478516,
+        "p95": 14.194980669021607,
+        "max": 14.352191925048828
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 14.065995657583699,
+        "p50": 14.055837993510067,
+        "p95": 14.21049804193899,
+        "max": 14.652495039626956
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "inswapper_trt_mixed_host_io": {
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 5.529238530434668,
+        "p50": 5.500066909007728,
+        "p95": 5.723326932638884,
+        "max": 5.968299927189946
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "inswapper_trt_mixed_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 5.422873439788819,
+        "p50": 5.410736083984375,
+        "p95": 5.503022336959839,
+        "max": 5.516287803649902
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 5.433656657114625,
+        "p50": 5.421057576313615,
+        "p95": 5.512840475421399,
+        "max": 5.525351036339998
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "yolo_b1_640_trt_fp16_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 1.0531140786409379,
+        "p50": 1.0516480207443237,
+        "p95": 1.0731535851955414,
+        "max": 1.099776029586792
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 1.0628031438682228,
+        "p50": 1.0611140169203281,
+        "p95": 1.0846554883755744,
+        "max": 1.1115351226180792
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "metadata_cuda_fp32_batch1_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 1.960557440519333,
+        "p50": 1.9485440254211426,
+        "p95": 2.03812004327774,
+        "max": 2.1422080993652344
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 1.9707694731187075,
+        "p50": 1.9593939650803804,
+        "p95": 2.0478524384088814,
+        "max": 2.1526699420064688
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "metadata_cuda_fp32_batch2_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 1.9770851230621338,
+        "p50": 1.9640320539474487,
+        "p95": 2.037391972541809,
+        "max": 2.3502719402313232
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 1.987674665870145,
+        "p50": 1.9751390209421515,
+        "p95": 2.0467294147238135,
+        "max": 2.360316924750805
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    },
+    "metadata_cuda_fp32_batch4_gpu_forward": {
+      "gpu_event_ms": {
+        "n": 200,
+        "mean": 1.9575782430171966,
+        "p50": 1.955568015575409,
+        "p95": 1.9876207947731017,
+        "max": 2.0305919647216797
+      },
+      "synchronized_wall_ms": {
+        "n": 200,
+        "mean": 1.9679101870860904,
+        "p50": 1.9650295143947005,
+        "p95": 1.9977095071226358,
+        "max": 2.043440006673336
+      },
+      "warmup_iterations": 30,
+      "measured_iterations": 200
+    }
+  },
+  "same_input_output_checks": {
+    "onnx_gpu_io_vs_host_io": {
+      "shape": [
+        1,
+        3,
+        128,
+        128
+      ],
+      "finite": true,
+      "mean_absolute_error_raw_0_1": 0.0,
+      "max_absolute_error_raw_0_1": 0.0,
+      "mean_absolute_error_times_255": 0.0
+    },
+    "trt_fp32_vs_onnx_cuda": {
+      "shape": [
+        1,
+        3,
+        128,
+        128
+      ],
+      "finite": true,
+      "mean_absolute_error_raw_0_1": 9.858936027740128e-05,
+      "max_absolute_error_raw_0_1": 0.0013432502746582031,
+      "mean_absolute_error_times_255": 0.025140286870737327
+    },
+    "trt_mixed_vs_onnx_cuda": {
+      "shape": [
+        1,
+        3,
+        128,
+        128
+      ],
+      "finite": true,
+      "mean_absolute_error_raw_0_1": 0.0013565636036219075,
+      "max_absolute_error_raw_0_1": 0.01648998260498047,
+      "mean_absolute_error_times_255": 0.3459237189235864
+    }
+  },
+  "artifacts": {
+    "/home/gorani/apps/new-inno-live-server-python/models/face_swap/inswapper_128_trt11_fp32.engine": {
+      "sha256": "7e2ea6378c808b5f7c1faada207927970538386c5c6310e1e1284c1787d3e40c",
+      "manifest": {
+        "format": 1,
+        "model_sha256": "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af",
+        "engine_sha256": "7e2ea6378c808b5f7c1faada207927970538386c5c6310e1e1284c1787d3e40c",
+        "tensorrt_version": "11.1.0.106",
+        "precision": "fp32",
+        "preserve_onnx_fp32_io": true
+      },
+      "bindings": [
+        "TensorRTDirect",
+        "input=DataType.FLOAT",
+        "latent=DataType.FLOAT",
+        "output=DataType.FLOAT",
+        "image_name=target",
+        "latent_name=source",
+        "output_name=output",
+        "batch=1",
+        "binding=target,source->output"
+      ]
+    },
+    "/home/gorani/apps/new-inno-live-server-python/models/face_swap/inswapper_128_trt11_mixed.engine": {
+      "sha256": "460046cf698437d5dae5eed8b72d33ff703e57c5b0667e03a0adc88ff4143af9",
+      "manifest": {
+        "format": 1,
+        "model_sha256": "388e06f3566aa33ac2f4d4a1542ef44d5561746f0d6cc4a048675952e8a2231e",
+        "engine_sha256": "460046cf698437d5dae5eed8b72d33ff703e57c5b0667e03a0adc88ff4143af9",
+        "tensorrt_version": "11.1.0.106",
+        "precision": "fp32",
+        "preserve_onnx_fp32_io": true,
+        "batch_range": {
+          "min": 1,
+          "opt": 1,
+          "max": 1
+        },
+        "base_model_sha256": "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af",
+        "mixed_recipe": {
+          "base_model_sha256": "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af",
+          "converted_convs": [
+            "Conv_107",
+            "Conv_152",
+            "Conv_197",
+            "Conv_242",
+            "Conv_287",
+            "Conv_332",
+            "Conv_377",
+            "Conv_42",
+            "Conv_422",
+            "Conv_44",
+            "Conv_46",
+            "Conv_467",
+            "Conv_512",
+            "Conv_557",
+            "Conv_590",
+            "Conv_594",
+            "Conv_596",
+            "Conv_612",
+            "Conv_62"
+          ],
+          "kept_fp32_convs": []
+        }
+      },
+      "bindings": [
+        "TensorRTDirect",
+        "input=DataType.FLOAT",
+        "latent=DataType.FLOAT",
+        "output=DataType.FLOAT",
+        "image_name=target",
+        "latent_name=source",
+        "output_name=output",
+        "batch=1",
+        "binding=target,source->output"
+      ]
+    },
+    "/tmp/innolive-bench-20261010-IbBR9b/best_b1.engine": {
+      "sha256": "7f0bb9eaa0b2f1d92c44855d20263adf4787d29a6abd865720fde8b28f726778",
+      "bindings": [
+        {
+          "name": "images",
+          "shape": [
+            1,
+            3,
+            640,
+            640
+          ],
+          "dtype": "DataType.FLOAT"
+        },
+        {
+          "name": "output0",
+          "shape": [
+            1,
+            300,
+            38
+          ],
+          "dtype": "DataType.FLOAT"
+        },
+        {
+          "name": "output1",
+          "shape": [
+            1,
+            32,
+            160,
+            160
+          ],
+          "dtype": "DataType.FLOAT"
+        }
+      ]
+    }
+  }
+}

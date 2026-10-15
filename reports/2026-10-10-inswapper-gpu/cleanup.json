@@ -1,0 +1,58 @@
+{
+  "checked_at_kst": "2026-10-10T22:20:05.190502+09:00",
+  "temporary_remote_path": "/tmp/innolive-bench-20261010-IbBR9b",
+  "temporary_remote_path_removed": true,
+  "temporary_dependencies_and_b1_engine_removed": true,
+  "active_benchmark_processes": [],
+  "preexisting_services_preserved": [
+    {
+      "pid": 2963,
+      "cmd": "python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
+    },
+    {
+      "pid": 1214488,
+      "cmd": "/home/gorani/apps/face-workspace/.venv/bin/python -u /home/gorani/apps/face-workspace/experiments/metadata_large_v1/web/server.py --host 0.0.0.0 --port 9090 --https-port 9091 --cert /home/gorani/apps/face-workspace/runs/metadata_large_v1/web/localhost.crt --key /home/gorani/apps/face-workspace/runs/metadata_large_v1/web/localhost.key"
+    },
+    {
+      "pid": 1230585,
+      "cmd": "/home/gorani/.venvs/jupyterlab/.venv/bin/python3 /home/gorani/.venvs/jupyterlab/.venv/bin/jupyter-lab --ip=0.0.0.0 --port=8888 --no-browser --ContentsManager.allow_hidden=True"
+    },
+    {
+      "pid": 1255460,
+      "cmd": ".venv311/bin/python -m uvicorn index:app --host 0.0.0.0 --port 9001 --reload"
+    }
+  ],
+  "preexisting_untracked_preserved": [
+    ".venv-trt10-swap/",
+    "cuda-keyring_1.1-1_all.deb",
+    "models/.trt-swap-export-ybnhn27q/",
+    "runs/"
+  ],
+  "existing_models_hash_verified_unchanged": true,
+  "venv_or_system_package_install": false,
+  "git_commit": "c3910ec295d44fa4536e926e9f9dafb5ed67dad7",
+  "tracked_changes": [
+    "docs/face-preset-anonymization.md"
+  ],
+  "git_status": [
+    " M docs/face-preset-anonymization.md",
+    "?? .venv-trt10-swap/",
+    "?? cuda-keyring_1.1-1_all.deb",
+    "?? models/.trt-swap-export-ybnhn27q/",
+    "?? reports/2026-10-10-inswapper-gpu-benchmark.md",
+    "?? reports/2026-10-10-inswapper-gpu/",
+    "?? runs/"
+  ],
+  "commit_push_pr_created": false,
+  "tailscale": "kept active per user instruction",
+  "ultralytics_settings_note": "Import emitted settings reset-to-default warning; original settings not available for restore.",
+  "ultralytics_settings_exists": true,
+  "ultralytics_settings_mtime_kst": "2026-10-10T21:59:09.922916+09:00",
+  "temporary_local_files_removed": [
+    "/tmp/innolive-current-feature-bench-20261010.py",
+    "/tmp/innolive-model-components-20261010.py",
+    "/tmp/__pycache__/innolive-current-feature-bench-20261010.cpython-313.pyc",
+    "/tmp/__pycache__/innolive-model-components-20261010.cpython-313.pyc"
+  ],
+  "tailscale_backend_state_after_cleanup": "Running"
+}

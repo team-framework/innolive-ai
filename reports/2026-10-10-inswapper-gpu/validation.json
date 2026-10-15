@@ -1,0 +1,18 @@
+{
+  "validated_at_kst": "2026-10-10T22:19:08.160171+09:00",
+  "passed": true,
+  "main_configs": 7,
+  "main_frames": 2040,
+  "main_face_swaps": 2520,
+  "main_full_swap_coverage": true,
+  "main_loopback_swap_smoke": true,
+  "standard_blur_loopback_gate": true,
+  "cuda_provider_active": true,
+  "lab_configs": 6,
+  "lab_frames": 1800,
+  "lab_face_swaps": 4200,
+  "lab_drops": 0,
+  "finite_same_input_outputs": true,
+  "model_repetitions": 200,
+  "report_links_exist": true
+}
