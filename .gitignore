@@ -82,3 +82,6 @@ Thumbs.db
 # Synthetic preset image assets and test-client recordings.
 /config/face_presets/
 /face_preset_client_output/
+
+# Local benchmark reports and measurement logs.
+/reports/
