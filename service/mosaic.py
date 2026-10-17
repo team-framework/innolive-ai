@@ -104,15 +104,15 @@ def _mosaic_masked_region(
 ) -> np.ndarray:
     """Apply the protected-region transform to the smallest blur-safe crop."""
 
-    x, y, width, height = cv2.boundingRect(blend_mask)
-    if width == 0 or height == 0:
+    mask_left, mask_top, mask_width, mask_height = cv2.boundingRect(blend_mask)
+    if not mask_width:
         return image
 
     padding = math.ceil(blur_radius * 3)
-    top = max(0, y - padding)
-    bottom = min(image.shape[0], y + height + padding)
-    left = max(0, x - padding)
-    right = min(image.shape[1], x + width + padding)
+    top = max(0, mask_top - padding)
+    bottom = min(image.shape[0], mask_top + mask_height + padding)
+    left = max(0, mask_left - padding)
+    right = min(image.shape[1], mask_left + mask_width + padding)
     region = image[top:bottom, left:right]
     reduced_size = (
         max(1, math.ceil(region.shape[1] / pixel_size)),
@@ -191,7 +191,8 @@ def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) ->
     margin protects exactly that polygon; negative margins are never accepted.
     """
     mask_margin = validate_mask_margin(mask_margin)
-    if not np.any(mask):
+    left, top, width, height = cv2.boundingRect(mask)
+    if not width:
         return mask
     if mask_margin == 0:
         return (mask != 0).astype(np.uint8) * 255
@@ -199,10 +200,9 @@ def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) ->
     if mask_margin != DEFAULT_MASK_MARGIN:
         # One distance transform keeps custom margins independent of kernel area.
         # Restrict it to the protected bounds plus the requested outer band.
-        x, y, width, height = cv2.boundingRect(mask)
-        left, top = max(0, x - mask_margin), max(0, y - mask_margin)
-        right = min(mask.shape[1], x + width + mask_margin)
-        bottom = min(mask.shape[0], y + height + mask_margin)
+        right = min(mask.shape[1], left + width + mask_margin)
+        bottom = min(mask.shape[0], top + height + mask_margin)
+        left, top = max(0, left - mask_margin), max(0, top - mask_margin)
         distance = cv2.distanceTransform(
             255 - mask[top:bottom, left:right], cv2.DIST_L2, cv2.DIST_MASK_PRECISE
         )
@@ -220,13 +220,22 @@ def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) ->
         return feathered
 
     # Preserve the old 8px morphology and rounding exactly for existing clients.
+    # 팽창 반경 바깥에 빈 픽셀 한 줄이 남는 범위만 계산한다. 범위 밖의 빈 픽셀까지의 거리는
+    # 범위 가장자리 빈 픽셀까지의 거리보다 짧을 수 없어 화면 전체로 계산한 값과 같다.
+    margin = DEFAULT_MASK_MARGIN + 1
+    bottom = min(mask.shape[0], top + height + margin)
+    right = min(mask.shape[1], left + width + margin)
+    top, left = max(0, top - margin), max(0, left - margin)
+    crop = mask[top:bottom, left:right]
     kernel_size = DEFAULT_MASK_MARGIN * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    expanded = cv2.dilate(mask, kernel)
+    expanded = cv2.dilate(crop, kernel)
     distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     alpha = np.minimum(distance / DEFAULT_MASK_MARGIN, 1.0) * 255.0
-    feathered = np.rint(alpha).astype(np.uint8)
-    feathered[mask != 0] = 255
+    feathered = np.zeros_like(mask)
+    region = np.rint(alpha).astype(np.uint8)
+    region[crop != 0] = 255
+    feathered[top:bottom, left:right] = region
     return feathered
 
 

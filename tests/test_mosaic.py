@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,54 @@ def _decode(jpeg: bytes) -> np.ndarray:
     if image is None:
         raise RuntimeError("test JPEG decode failed")
     return image
+
+
+def _full_frame_feathered_mask(mask: np.ndarray) -> np.ndarray:
+    """Reference: the previous whole-frame feathering."""
+    if not np.any(mask):
+        return mask
+    kernel_size = mosaic.MASK_FEATHER_RADIUS * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    expanded = cv2.dilate(mask, kernel)
+    distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    feathered = np.rint(np.minimum(distance / mosaic.MASK_FEATHER_RADIUS, 1.0) * 255.0).astype(
+        np.uint8
+    )
+    feathered[mask != 0] = 255
+    return feathered
+
+
+def _full_frame_mosaic(image, blend_mask, blur_radius, pixel_size):
+    """Reference: the previous whole-frame protected-region bounds."""
+    rows, columns = np.nonzero(blend_mask)
+    if not rows.size:
+        return image
+    padding = math.ceil(blur_radius * 3)
+    top = max(0, int(rows.min()) - padding)
+    bottom = min(image.shape[0], int(rows.max()) + padding + 1)
+    left = max(0, int(columns.min()) - padding)
+    right = min(image.shape[1], int(columns.max()) + padding + 1)
+    region = image[top:bottom, left:right]
+    reduced = cv2.resize(
+        region,
+        (
+            max(1, math.ceil(region.shape[1] / pixel_size)),
+            max(1, math.ceil(region.shape[0] / pixel_size)),
+        ),
+        interpolation=cv2.INTER_AREA,
+    )
+    sigma = blur_radius / pixel_size
+    blurred = cv2.resize(
+        cv2.GaussianBlur(reduced, (0, 0), sigma, sigma),
+        (region.shape[1], region.shape[0]),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    output = image.copy()
+    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
+    output[top:bottom, left:right] = (
+        region.astype(np.uint32) * (255 - alpha) + blurred.astype(np.uint32) * alpha + 127
+    ) // 255
+    return output
 
 
 class MosaicTests(unittest.TestCase):
@@ -114,6 +163,55 @@ class MosaicTests(unittest.TestCase):
         self.assertGreater(int(feathered[40, 20]), 0)
         self.assertLess(int(feathered[40, 20]), 255)
         self.assertEqual(int(feathered[40, 16]), 0)
+
+    def test_feathered_mask_matches_full_frame_computation(self):
+        rng = np.random.default_rng(52)
+        for height, width in ((720, 1280), (1280, 720), (120, 160), (9, 9)):
+            for _ in range(40):
+                mask = np.zeros((height, width), dtype=np.uint8)
+                for _ in range(int(rng.integers(1, 4))):
+                    center = (
+                        int(rng.integers(-20, width + 20)),
+                        int(rng.integers(-20, height + 20)),
+                    )
+                    axes = (
+                        int(rng.integers(0, max(1, width // 4))),
+                        int(rng.integers(0, max(1, height // 4))),
+                    )
+                    cv2.ellipse(mask, center, axes, float(rng.uniform(0, 180)), 0, 360, 255, -1)
+                with self.subTest(size=(height, width), pixels=int(np.count_nonzero(mask))):
+                    np.testing.assert_array_equal(
+                        _feathered_mask(mask), _full_frame_feathered_mask(mask)
+                    )
+
+    def test_feathered_mask_skips_pixels_far_from_the_protected_region(self):
+        mask = np.zeros((720, 1280), dtype=np.uint8)
+        mask[300:420, 600:690] = 255
+
+        with patch("service.mosaic.cv2.distanceTransform", wraps=cv2.distanceTransform) as distance:
+            _feathered_mask(mask)
+
+        margin = mosaic.MASK_FEATHER_RADIUS + 1
+        self.assertEqual(distance.call_args.args[0].shape, (120 + 2 * margin, 90 + 2 * margin))
+
+    def test_mosaic_matches_full_frame_mask_computation(self):
+        rng = np.random.default_rng(7)
+        image = rng.integers(0, 256, (360, 640, 3), dtype=np.uint8)
+        for objects in (
+            [{"mask_polygon": [[300, 120], [380, 130], [370, 240], [290, 230]]}],
+            [{"mask_polygon": [[0, 0], [60, 0], [60, 80], [0, 80]]}],
+            [
+                {"mask_polygon": [[20, 200], [90, 210], [80, 330], [10, 320]]},
+                {"mask_polygon": [[560, 20], [639, 30], [630, 140], [550, 130]]},
+            ],
+            [],
+        ):
+            mask = mosaic._protected_mask(image.shape[:2], objects)
+            expected = _full_frame_mosaic(
+                image, _full_frame_feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, 2
+            )
+            with self.subTest(objects=len(objects)):
+                self.assertEqual(mosaic_yuv420p(image, objects), mosaic._encode_yuv420p(expected))
 
     def test_protected_blur_tapers_into_the_scene_outside_the_face_mask(self):
         output = _decode(
