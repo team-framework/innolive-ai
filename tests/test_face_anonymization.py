@@ -29,7 +29,7 @@ from service.face_anonymization import FaceAnonymizationConfig, FaceAnonymizatio
 from service.face_metadata import AttributePrediction, FaceAttributes
 from service.face_presets import PresetCatalog, StreamFaceIdentities
 from service.inswapper import REFERENCE, alignment
-from service.mosaic import mosaic_jpeg
+from service.mosaic import DEFAULT_PIXEL_SIZE, mosaic_jpeg
 
 ATTRS = FaceAttributes("female", "20s", "off", "none")
 CHANGED = FaceAttributes("female", "20s", "on", "happy")
@@ -140,7 +140,7 @@ class AnonymizationTests(unittest.TestCase):
             render=render,
             pix_fmt=pix_fmt,
             blur_radius=24.0,
-            pixel_size=1,
+            pixel_size=DEFAULT_PIXEL_SIZE,
             max_bytes=4 * 1024 * 1024,
         )
 

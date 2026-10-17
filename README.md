@@ -215,7 +215,7 @@ message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor
 
 ## experimental metadata 프리셋 합성
 
-메인 gRPC 파이프라인은 기본 Gaussian blur(`pixel_size=1`)를 사용합니다.
+메인 gRPC 파이프라인은 기본 Gaussian blur(`pixel_size=2`)를 사용합니다.
 `VideoChunk.anonymization_mode`에 `FACE_ANONYMIZATION_MODE_FACE_SWAP`을 명시한 경우에만
 metadata 기반 프리셋 매칭과 InSwapper-128 합성을 실행합니다. 동일 BoT-SORT 트랙의
 identity를 유지하고 metadata와 표정·안경 variant를 트랙별 30프레임마다 갱신합니다.
