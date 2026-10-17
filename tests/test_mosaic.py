@@ -404,5 +404,74 @@ class MosaicRawTests(unittest.TestCase):
             mosaic_yuv420p(odd, [])
 
 
+class MaskPadTests(unittest.TestCase):
+    def test_zero_pad_keeps_the_polygon_mask(self):
+        objects = [{"mask_polygon": [[30, 20], [90, 25], [80, 70], [25, 60]]}]
+        np.testing.assert_array_equal(
+            mosaic._protected_mask((120, 160), objects, 0),
+            mosaic._protected_mask((120, 160), objects),
+        )
+
+    def test_pad_matches_full_frame_dilation(self):
+        rng = np.random.default_rng(58)
+        for height, width in ((1920, 1080), (720, 1280), (40, 40)):
+            for pad in (1, 2, 3):
+                points = rng.integers(-10, [width + 10, height + 10], (5, 2)).tolist()
+                objects = [
+                    {"mask_polygon": cv2.convexHull(np.array(points)).reshape(-1, 2).tolist()}
+                ]
+                try:
+                    base = mosaic._protected_mask((height, width), objects)
+                except ValueError:
+                    continue
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
+                with self.subTest(size=(height, width), pad=pad):
+                    np.testing.assert_array_equal(
+                        mosaic._protected_mask((height, width), objects, pad),
+                        cv2.dilate(base, kernel),
+                    )
+
+    def test_pad_widens_the_fully_blurred_area_before_the_feather_band(self):
+        objects = [{"mask_polygon": [[60, 40], [100, 40], [100, 80], [60, 80]]}]
+        plain = _feathered_mask(mosaic._protected_mask((120, 160), objects))
+        padded = _feathered_mask(mosaic._protected_mask((120, 160), objects, 3))
+        for line_plain, line_padded in ((plain[60], padded[60]), (plain[:, 80], padded[:, 80])):
+            opaque_plain = np.flatnonzero(line_plain == 255)
+            opaque_padded = np.flatnonzero(line_padded == 255)
+            self.assertEqual(opaque_padded.min(), opaque_plain.min() - 3)
+            self.assertEqual(opaque_padded.max(), opaque_plain.max() + 3)
+            self.assertEqual(np.count_nonzero(line_padded), np.count_nonzero(line_plain) + 6)
+
+    def test_pad_skips_whitelisted_faces_and_empty_masks(self):
+        objects = [
+            {"mask_polygon": [[10, 10], [40, 10], [40, 40], [10, 40]], "whitelisted": True},
+        ]
+        mask = mosaic._protected_mask((60, 60), objects, 3)
+        self.assertFalse(mask.any())
+
+    def test_invalid_pad_fails_closed(self):
+        objects = [{"mask_polygon": [[10, 10], [40, 10], [40, 40], [10, 40]]}]
+        for pad in (-1, mosaic.MAX_MASK_PAD + 1, 1.5, True):
+            with self.subTest(pad=pad), self.assertRaisesRegex(ValueError, "mask pad"):
+                mosaic._protected_mask((60, 60), objects, pad)
+
+    def test_raw_and_jpeg_compose_with_the_padded_mask(self):
+        image = np.random.default_rng(3).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+        objects = [{"mask_polygon": [[60, 40], [100, 40], [100, 80], [60, 80]]}]
+        expected = mosaic._mosaic_masked_region(
+            image,
+            _feathered_mask(mosaic._protected_mask(image.shape[:2], objects, 2)),
+            mosaic.DEFAULT_BLUR_RADIUS,
+            mosaic.DEFAULT_PIXEL_SIZE,
+        )
+        self.assertEqual(
+            mosaic_yuv420p(image, objects, mask_pad=2), mosaic._encode_yuv420p(expected)
+        )
+        self.assertNotEqual(
+            mosaic_yuv420p(image, objects, mask_pad=2), mosaic_yuv420p(image, objects)
+        )
+        self.assertNotEqual(mosaic_jpeg(image, objects, mask_pad=2), mosaic_jpeg(image, objects))
+
+
 if __name__ == "__main__":
     unittest.main()

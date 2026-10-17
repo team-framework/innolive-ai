@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import platform
 import threading
 import time
@@ -41,6 +42,18 @@ BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_ENGINE = ROOT / "models" / "best_b1.engine"
+
+
+def detector_mask_pad(height: int, width: int) -> int:
+    """Output pixels spanned by one detector mask pixel, used to widen protected regions.
+
+    Mask outlines come from the IMAGE_SIZE letterboxed mask, so their edges can sit up to one
+    mask pixel inside the face. 1080x1920 frames measured 1-3px shrinkage; padding by one mask
+    pixel covers it.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    return math.ceil(max(height, width) / IMAGE_SIZE)
 
 
 class InferenceFailure(RuntimeError):
@@ -277,7 +290,10 @@ class RuntimeManager:
                 iou=0.70,
                 classes=list(EXPECTED_CLASS_NAMES),
                 max_det=MAX_DETECTIONS,
-                retina_masks=True,
+                # 마스크 윤곽을 640 기준 마스크에서 뽑는다. 원본 해상도 업샘플링은 FHD 프레임 시간의
+                # 절반 가까이를 쓰지만 윤곽은 어차피 64점으로 줄어든다. 줄어든 경계는
+                # detector_mask_pad만큼 보호 영역을 넓혀 보정한다.
+                retina_masks=False,
                 device=self.device,
                 verbose=False,
             )
