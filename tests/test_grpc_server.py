@@ -6,6 +6,7 @@ import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import cv2
 import grpc
@@ -20,6 +21,7 @@ from ai_processor_server import (
 from protos import ai_processor_pb2, ai_processor_pb2_grpc
 from service.adaface_model import FaceAlignmentError, FaceCountError, FaceTooSmallError
 from service.frame import MAX_LONG_EDGE
+from service.mosaic import mosaic_yuv420p
 from service.recognition import SessionRegistry
 from service.runtime import InferenceFailure, RuntimeConfig
 
@@ -550,6 +552,18 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(r.faces == responses[0].faces for r in responses))
                 if pix_fmt:
                     self.assertTrue(all(len(r.data) == 160 * 120 * 3 // 2 for r in responses))
+
+    async def test_composition_pads_masks_by_one_detector_mask_pixel(self):
+        image = np.zeros((720, 1280, 3), np.uint8)
+        image[:, ::2] = 255
+        request = _request(data=cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420).tobytes())
+        request.pix_fmt = "yuv420p"
+        request.width, request.height = 1280, 720
+        with patch("ai_processor_server.mosaic_yuv420p", wraps=mosaic_yuv420p) as compose:
+            async with LoopbackServer(FaceRuntime()) as server:
+                responses = await _collect(server.stub.ProcessVideo(_requests(request)))
+        self.assertEqual([r.status_message for r in responses], ["success"])
+        self.assertEqual(compose.call_args.kwargs["mask_pad"], 2)
 
     async def test_invalid_mask_margin_rejects_only_that_frame_before_inference(self):
         runtime = FaceRuntime()

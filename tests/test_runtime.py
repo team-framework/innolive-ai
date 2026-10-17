@@ -13,6 +13,7 @@ from service.runtime import (
     IMAGE_SIZE,
     RuntimeConfig,
     RuntimeManager,
+    detector_mask_pad,
     select_runtime,
     validate_engine,
 )
@@ -115,6 +116,15 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
         self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
         self.assertEqual(model.kwargs["classes"], [0, 1])
+
+    def test_mask_pad_is_one_detector_mask_pixel_in_output_pixels(self):
+        cases = {(1920, 1080): 3, (1080, 1920): 3, (1280, 720): 2, (640, 360): 1, (64, 64): 1}
+        for (height, width), expected in cases.items():
+            with self.subTest(height=height, width=width):
+                self.assertEqual(detector_mask_pad(height, width), expected)
+        for height, width in ((0, 640), (640, 0)):
+            with self.subTest(height=height, width=width), self.assertRaises(ValueError):
+                detector_mask_pad(height, width)
 
 
 class _FakePrediction:

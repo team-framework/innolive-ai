@@ -81,6 +81,7 @@ from service.runtime import (
     RuntimeConfig,
     RuntimeManager,
     TrackingFailure,
+    detector_mask_pad,
 )
 from service.tracking import StreamTracker
 
@@ -414,6 +415,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
         if render or stream.anonymization_mode != MODES["blur"]:
             mosaic_started = time.perf_counter()
+            mask_pad = detector_mask_pad(*image.shape[:2])
             try:
                 if stream.anonymization_mode != MODES["blur"]:
                     compose = partial(
@@ -428,6 +430,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                         blur_radius=blur_radius,
                         pixel_size=pixel_size,
                         mask_margin=mask_margin,
+                        mask_pad=mask_pad,
                         max_bytes=self.settings.max_jpeg_bytes,
                     )
                     processed_data = await self._compose_frame(compose, face_anonymization=True)
@@ -443,6 +446,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             blur_radius=blur_radius,
                             pixel_size=pixel_size,
                             mask_margin=mask_margin,
+                            mask_pad=mask_pad,
                         )
                     else:
                         compose = partial(
@@ -452,6 +456,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             blur_radius=blur_radius,
                             pixel_size=pixel_size,
                             mask_margin=mask_margin,
+                            mask_pad=mask_pad,
                             max_bytes=self.settings.max_jpeg_bytes,
                         )
                     processed_data = await self._compose_frame(compose)

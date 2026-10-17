@@ -20,6 +20,7 @@ DEFAULT_MASK_MARGIN = 8
 MASK_FEATHER_RADIUS = DEFAULT_MASK_MARGIN  # Compatibility for existing compositor imports.
 MAX_MASK_MARGIN = 64
 MAX_MASK_POINTS = 64
+MAX_MASK_PAD = 16
 
 
 def validate_mosaic_params(
@@ -55,6 +56,7 @@ def mosaic_jpeg(
     blur_radius: float = DEFAULT_BLUR_RADIUS,
     pixel_size: int = DEFAULT_PIXEL_SIZE,
     mask_margin: int = DEFAULT_MASK_MARGIN,
+    mask_pad: int = 0,
     max_bytes: int = MAX_JPEG_BYTES,
 ) -> bytes:
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -63,7 +65,7 @@ def mosaic_jpeg(
         raise ValueError(f"mosaic byte limit must be in 1..{MAX_JPEG_BYTES}")
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
-    mask = _protected_mask(image.shape[:2], objects)
+    mask = _protected_mask(image.shape[:2], objects, mask_pad)
     output = _mosaic_masked_region(
         image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
     )
@@ -78,6 +80,7 @@ def mosaic_yuv420p(
     blur_radius: float = DEFAULT_BLUR_RADIUS,
     pixel_size: int = DEFAULT_PIXEL_SIZE,
     mask_margin: int = DEFAULT_MASK_MARGIN,
+    mask_pad: int = 0,
 ) -> bytes:
     """Compose the mosaic and return raw yuv420p bytes for the raw wire format."""
 
@@ -88,7 +91,7 @@ def mosaic_yuv420p(
         raise ValueError("raw mosaic requires even dimensions")
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
-    mask = _protected_mask(image.shape[:2], objects)
+    mask = _protected_mask(image.shape[:2], objects, mask_pad)
     output = _mosaic_masked_region(
         image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
     )
@@ -170,7 +173,11 @@ def _encode_jpeg(image: np.ndarray, max_bytes: int) -> bytes:
 def _protected_mask(
     dimensions: tuple[int, int],
     objects: list[dict[str, Any]],
+    pad: int = 0,
 ) -> np.ndarray:
+    """Fill protected polygons, then widen them by ``pad`` fully opaque pixels."""
+    if isinstance(pad, bool) or not isinstance(pad, int) or not 0 <= pad <= MAX_MASK_PAD:
+        raise ValueError(f"mask pad must be an integer in 0..{MAX_MASK_PAD}")
     height, width = dimensions
     mask = np.zeros((height, width), dtype=np.uint8)
     for item in objects:
@@ -178,6 +185,17 @@ def _protected_mask(
             continue
         polygon = _polygon(item.get("mask_polygon"), width, height)
         cv2.fillPoly(mask, [polygon], 255)
+    if not pad:
+        return mask
+    left, top, box_width, box_height = cv2.boundingRect(mask)
+    if not box_width:
+        return mask
+    # 보호 영역 경계 주변만 팽창한다. 범위 밖 픽셀은 반경 pad 안에 보호 픽셀이 없다.
+    bottom = min(height, top + box_height + pad)
+    right = min(width, left + box_width + pad)
+    top, left = max(0, top - pad), max(0, left - pad)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
+    mask[top:bottom, left:right] = cv2.dilate(mask[top:bottom, left:right], kernel)
     return mask
 
 

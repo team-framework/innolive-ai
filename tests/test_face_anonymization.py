@@ -30,6 +30,7 @@ from service.face_metadata import AttributePrediction, FaceAttributes
 from service.face_presets import PresetCatalog, StreamFaceIdentities
 from service.inswapper import REFERENCE, alignment
 from service.mosaic import DEFAULT_PIXEL_SIZE, mosaic_jpeg
+from service.runtime import detector_mask_pad
 
 ATTRS = FaceAttributes("female", "20s", "off", "none")
 CHANGED = FaceAttributes("female", "20s", "on", "happy")
@@ -386,7 +387,12 @@ class GrpcAnonymizationTests(unittest.IsolatedAsyncioTestCase):
                     objects = [{"mask_polygon": [[p.x, p.y] for p in response.faces[0].polygon]}]
                     self.assertEqual(
                         response.data,
-                        mosaic_jpeg(image, objects, mask_margin=request.mosaic_config.mask_margin),
+                        mosaic_jpeg(
+                            image,
+                            objects,
+                            mask_margin=request.mosaic_config.mask_margin,
+                            mask_pad=detector_mask_pad(*image.shape[:2]),
+                        ),
                     )
                 self.assertEqual(len({r.data for r in responses}), 3)
 

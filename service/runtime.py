@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import platform
 import threading
 import time
@@ -39,6 +40,18 @@ BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_ENGINE = ROOT / "models" / "best_b1.engine"
+
+
+def detector_mask_pad(height: int, width: int) -> int:
+    """Output pixels spanned by one detector mask pixel, used to widen protected regions.
+
+    Mask outlines come from the IMAGE_SIZE letterboxed mask, so their edges can sit up to one
+    mask pixel inside the face. 1080x1920 frames measured 1-3px shrinkage; padding by one mask
+    pixel covers it.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    return math.ceil(max(height, width) / IMAGE_SIZE)
 
 
 class InferenceFailure(RuntimeError):
