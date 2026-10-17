@@ -224,7 +224,7 @@ class MaskMarginTests(unittest.TestCase):
     def test_margin_preserves_the_polygon_and_controls_only_the_outer_band(self):
         mask = np.zeros((768, 768), np.uint8)
         mask[320:448, 320:448] = 255
-        for margin in (0, 1, 4, 8, 16, 32, 64, 128, 256):
+        for margin in (0, 1, 4, 8, 16, 32, 64):
             with self.subTest(margin=margin):
                 result = _feathered_mask(mask, margin)
                 self.assertTrue(np.all(result[mask != 0] == 255))
@@ -257,13 +257,13 @@ class MaskMarginTests(unittest.TestCase):
         for shape in ((32, 32), (80, 160)):
             for value in (0, 255):
                 mask = np.full(shape, value, np.uint8)
-                for margin in (0, 8, 256):
+                for margin in (0, 8, 64):
                     np.testing.assert_array_equal(_feathered_mask(mask, margin), mask)
             mask = np.zeros(shape, np.uint8)
             cv2.fillPoly(mask, [np.array([[0, 0], [20, 0], [30, 20], [0, 30]])], 255)
             mask[-20:, -20:] = 255
             mask[:10, :10] = 255
-            for margin in (0, 4, 8, 256):
+            for margin in (0, 4, 8, 64):
                 result = _feathered_mask(mask, margin)
                 self.assertEqual(result.shape, mask.shape)
                 self.assertTrue(np.all(result[mask != 0] == 255))
@@ -274,12 +274,12 @@ class MaskMarginTests(unittest.TestCase):
         for compose in (mosaic_jpeg, mosaic_yuv420p):
             self.assertEqual(compose(image, objects), compose(image, objects, mask_margin=8))
             self.assertNotEqual(
-                compose(image, objects, mask_margin=0), compose(image, objects, mask_margin=256)
+                compose(image, objects, mask_margin=0), compose(image, objects, mask_margin=64)
             )
 
     def test_invalid_margin_is_rejected_even_without_protected_objects(self):
         image = np.zeros((32, 32, 3), np.uint8)
-        for margin in (-1, 257, 1.5, True, "8", float("nan"), float("inf")):
+        for margin in (-1, 65, 256, 1.5, True, "8", float("nan"), float("inf")):
             for compose in (mosaic_jpeg, mosaic_yuv420p):
                 with (
                     self.subTest(margin=margin, compose=compose.__name__),

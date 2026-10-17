@@ -533,7 +533,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     else _striped_jpeg(160, 120)
                 )
                 requests = []
-                for frame_id, margin in enumerate((None, 0, 8, 256, None)):
+                for frame_id, margin in enumerate((None, 0, 8, 64, None)):
                     request = _request(data=data, frame_id=frame_id)
                     request.pix_fmt = pix_fmt
                     request.width, request.height = 160, 120
@@ -557,7 +557,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             responses = await _collect(
                 server.stub.ProcessVideo(
                     _requests(
-                        _request(mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=257)),
+                        _request(mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=65)),
                         _request(
                             mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=2**32 - 1)
                         ),
@@ -607,7 +607,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             frame_id=1,
                             output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY,
                             mosaic_config=ai_processor_pb2.MosaicConfig(
-                                blur_radius=100.0, mask_margin=257
+                                blur_radius=100.0, mask_margin=65
                             ),
                         )
                     )

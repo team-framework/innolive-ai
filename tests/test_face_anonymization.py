@@ -373,7 +373,7 @@ class GrpcAnonymizationTests(unittest.IsolatedAsyncioTestCase):
                     )
                     runtime.catalog = Mock(match=Mock(return_value=None))
                     requests = []
-                    for margin in (0, 8, 256):
+                    for margin in (0, 8, 64):
                         request = _request(data=_striped_jpeg(160, 120))
                         request.anonymization_mode = mode
                         request.mosaic_config.mask_margin = margin
