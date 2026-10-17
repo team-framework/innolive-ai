@@ -18,7 +18,7 @@ MAX_BLUR_RADIUS = 64.0
 MAX_PIXEL_SIZE = 8
 DEFAULT_MASK_MARGIN = 8
 MASK_FEATHER_RADIUS = DEFAULT_MASK_MARGIN  # Compatibility for existing compositor imports.
-MAX_MASK_MARGIN = 32
+MAX_MASK_MARGIN = 256
 MAX_MASK_POINTS = 64
 
 
@@ -182,8 +182,9 @@ def _protected_mask(
 def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) -> np.ndarray:
     """Extend the protected area and taper only its outer boundary.
 
-    The source protected pixels always remain at full opacity.  The short outer
-    taper blends the already-strongly blurred image into the scene instead of
+    The source protected pixels always remain at full opacity. The outer taper
+    stays at most 8px wide, so larger margins extend the fully blurred area into
+    the scene instead of just stretching a translucent band. It avoids
     leaving a conspicuous hard edge around the segmentation polygon. A zero
     margin protects exactly that polygon; negative margins are never accepted.
     """
@@ -204,9 +205,10 @@ def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) ->
             255 - mask[top:bottom, left:right], cv2.DIST_L2, cv2.DIST_MASK_PRECISE
         )
         outside = distance > mask_margin
+        feather_width = min(mask_margin, DEFAULT_MASK_MARGIN)
         # Reuse the distance buffer rather than allocate full-frame float arrays.
         np.subtract(mask_margin + 1, distance, out=distance)
-        distance *= 255.0 / mask_margin
+        distance *= 255.0 / feather_width
         np.clip(distance, 0.0, 255.0, out=distance)
         np.rint(distance, out=distance)
         alpha = distance.astype(np.uint8)

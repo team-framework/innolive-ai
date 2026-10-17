@@ -77,8 +77,8 @@ message MosaicConfig {
   optional double blur_radius = 1;
   // Mosaic block size in pixels; 1 disables pixelation. Valid range: 1..8.
   optional uint32 pixel_size = 2;
-  // Outer mask margin in input-frame pixels, 0..32. Unset preserves the legacy 8px edge.
-  // Zero still protects the entire detected polygon. The outer margin fades into the scene.
+  // Outer mask margin in input-frame pixels, 0..256. Unset preserves the legacy 8px edge.
+  // Zero protects the entire polygon. Larger values extend full blur with an outer fade <=8px.
   optional uint32 mask_margin = 3;
 }
 

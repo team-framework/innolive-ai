@@ -600,7 +600,7 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             {"pixel_size": 2.5},
             {"pixel_size": True},
             {"mask_margin": -1},
-            {"mask_margin": 33},
+            {"mask_margin": 257},
             {"mask_margin": 1.5},
             {"mask_margin": True},
             {"mask_margin": "8"},
@@ -624,7 +624,7 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
                 MosaicConfig(blur_radius=32.0, pixel_size=4),
             ),
             VideoFrame(_jpeg(3), 2, 3, MosaicConfig(pixel_size=1, mask_margin=0)),
-            VideoFrame(_jpeg(4), 3, 4, MosaicConfig(mask_margin=32)),
+            VideoFrame(_jpeg(4), 3, 4, MosaicConfig(mask_margin=256)),
         )
         async with (
             ClientLoopback() as loopback,
@@ -650,7 +650,7 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[2].mosaic_config.mask_margin, 0)
         self.assertFalse(received[3].mosaic_config.HasField("blur_radius"))
         self.assertFalse(received[3].mosaic_config.HasField("pixel_size"))
-        self.assertEqual(received[3].mosaic_config.mask_margin, 32)
+        self.assertEqual(received[3].mosaic_config.mask_margin, 256)
 
 
 if __name__ == "__main__":

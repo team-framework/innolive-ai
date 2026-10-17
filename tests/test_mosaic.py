@@ -216,22 +216,24 @@ class MosaicParamTests(unittest.TestCase):
 
 class MaskMarginTests(unittest.TestCase):
     def test_margin_preserves_the_polygon_and_controls_only_the_outer_band(self):
-        mask = np.zeros((160, 160), np.uint8)
-        mask[60:100, 60:100] = 255
-        for margin in (0, 1, 4, 8, 16, 32):
+        mask = np.zeros((768, 768), np.uint8)
+        mask[320:448, 320:448] = 255
+        for margin in (0, 1, 4, 8, 16, 32, 64, 128, 256):
             with self.subTest(margin=margin):
                 result = _feathered_mask(mask, margin)
                 self.assertTrue(np.all(result[mask != 0] == 255))
                 rows, columns = np.nonzero(result)
-                self.assertEqual((rows.min(), columns.min()), (60 - margin, 60 - margin))
-                self.assertEqual((rows.max(), columns.max()), (99 + margin, 99 + margin))
+                self.assertEqual((rows.min(), columns.min()), (320 - margin, 320 - margin))
+                self.assertEqual((rows.max(), columns.max()), (447 + margin, 447 + margin))
                 if margin:
-                    band = result[80, 100 : 100 + margin].astype(int)
+                    band = result[384, 448 : 448 + margin].astype(int)
                     self.assertTrue(np.all(np.diff(band) <= 0))
                     self.assertGreater(band[-1], 0)
                 if margin > 1:
                     self.assertLess(band[-1], 255)
-                self.assertEqual(result[80, 100 + margin], 0)
+                if margin > 8:
+                    self.assertTrue(np.all(band[: margin - 8 + 1] == 255))
+                self.assertEqual(result[384, 448 + margin], 0)
 
     def test_minimum_margin_still_blurs_the_entire_protected_region(self):
         image = np.zeros((160, 160, 3), np.uint8)
@@ -249,13 +251,13 @@ class MaskMarginTests(unittest.TestCase):
         for shape in ((32, 32), (80, 160)):
             for value in (0, 255):
                 mask = np.full(shape, value, np.uint8)
-                for margin in (0, 8, 32):
+                for margin in (0, 8, 256):
                     np.testing.assert_array_equal(_feathered_mask(mask, margin), mask)
             mask = np.zeros(shape, np.uint8)
             cv2.fillPoly(mask, [np.array([[0, 0], [20, 0], [30, 20], [0, 30]])], 255)
             mask[-20:, -20:] = 255
             mask[:10, :10] = 255
-            for margin in (0, 4, 8, 32):
+            for margin in (0, 4, 8, 256):
                 result = _feathered_mask(mask, margin)
                 self.assertEqual(result.shape, mask.shape)
                 self.assertTrue(np.all(result[mask != 0] == 255))
@@ -266,12 +268,12 @@ class MaskMarginTests(unittest.TestCase):
         for compose in (mosaic_jpeg, mosaic_yuv420p):
             self.assertEqual(compose(image, objects), compose(image, objects, mask_margin=8))
             self.assertNotEqual(
-                compose(image, objects, mask_margin=0), compose(image, objects, mask_margin=32)
+                compose(image, objects, mask_margin=0), compose(image, objects, mask_margin=256)
             )
 
     def test_invalid_margin_is_rejected_even_without_protected_objects(self):
         image = np.zeros((32, 32, 3), np.uint8)
-        for margin in (-1, 33, 1.5, True, "8", float("nan"), float("inf")):
+        for margin in (-1, 257, 1.5, True, "8", float("nan"), float("inf")):
             for compose in (mosaic_jpeg, mosaic_yuv420p):
                 with (
                     self.subTest(margin=margin, compose=compose.__name__),

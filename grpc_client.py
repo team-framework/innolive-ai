@@ -23,7 +23,7 @@ MAX_WINDOW = 5
 MAX_FRAME_ID = 2**32 - 1
 MAX_MOSAIC_BLUR_RADIUS = 64.0
 MAX_MOSAIC_PIXEL_SIZE = 8
-MAX_MOSAIC_MASK_MARGIN = 32
+MAX_MOSAIC_MASK_MARGIN = 256
 
 
 class VideoClientError(RuntimeError):
@@ -60,8 +60,8 @@ class MosaicConfig:
 
     ``blur_radius`` is the Gaussian blur radius in pixels (larger = stronger
     blur) and ``pixel_size`` is the mosaic block size in pixels (1 disables
-    pixelation). ``mask_margin`` extends the protected polygon by 0..32 input
-    pixels with an outer fade (unset: 8). Zero keeps the full polygon protected.
+    pixelation). ``mask_margin`` extends the protected polygon by 0..256 input
+    pixels with an outer fade up to 8px (unset: 8). Zero keeps the polygon protected.
     All fields may change from frame to frame on one open stream.
     """
 
