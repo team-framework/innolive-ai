@@ -36,6 +36,8 @@ IMAGE_SIZE = 640
 STANDARD_PROFILE = "B1-640-Q90-W5"
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
+POLYGON_EPSILON_START = 0.5
+POLYGON_EPSILON_GROWTH = 1.25
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
@@ -399,8 +401,7 @@ class RuntimeManager:
             if detection_index < len(polygons):
                 polygon = np.asarray(polygons[detection_index], dtype=np.float32)
                 if len(polygon):
-                    stride = max(1, int(np.ceil(len(polygon) / MAX_POLYGON_POINTS)))
-                    polygon = polygon[::stride][:MAX_POLYGON_POINTS]
+                    polygon = _limit_polygon_points(polygon)
                     points = [
                         [
                             round(float(np.clip(x, 0, width - 1)), 1),
@@ -473,6 +474,24 @@ class RuntimeManager:
             del self._model
         with self._guard:
             type(self)._live_instances = max(0, type(self)._live_instances - 1)
+
+
+def _limit_polygon_points(polygon: np.ndarray) -> np.ndarray:
+    """Reduce a mask contour to the wire point limit without cutting off its corners.
+
+    Contours use CHAIN_APPROX_SIMPLE, so a straight run such as a frame edge is only its two
+    end points. Douglas-Peucker keeps those turning points and bounds the deviation by the
+    smallest epsilon that fits, where index sampling could drop a corner and cut across the mask.
+    """
+    if len(polygon) <= MAX_POLYGON_POINTS:
+        return polygon
+    contour = polygon.reshape((-1, 1, 2))
+    epsilon = POLYGON_EPSILON_START
+    while True:
+        simplified = cv2.approxPolyDP(contour, epsilon, True).reshape((-1, 2))
+        if len(simplified) <= MAX_POLYGON_POINTS:
+            return simplified
+        epsilon *= POLYGON_EPSILON_GROWTH
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:

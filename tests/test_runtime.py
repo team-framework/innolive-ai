@@ -7,12 +7,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from service.runtime import (
     IMAGE_SIZE,
+    MAX_POLYGON_POINTS,
     RuntimeConfig,
     RuntimeManager,
+    _limit_polygon_points,
     detector_mask_pad,
     select_runtime,
     validate_engine,
@@ -208,6 +211,32 @@ class ParallelMotionTests(unittest.TestCase):
             runtime._infer_sync(np.zeros((8, 8, 3), dtype=np.uint8), tracker)
         self.assertEqual(tracker.events, ["motion"])
         self.assertEqual(tracker.received, "unset")
+
+
+class PolygonLimitTests(unittest.TestCase):
+    @staticmethod
+    def contour(mask: np.ndarray) -> np.ndarray:
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        return contours[0].reshape((-1, 2)).astype(np.float32)
+
+    def test_short_contour_is_kept_as_is(self):
+        polygon = np.asarray([[0, 0], [10, 0], [10, 10]], dtype=np.float32)
+        self.assertIs(_limit_polygon_points(polygon), polygon)
+
+    def test_mask_cut_by_frame_corner_keeps_the_corner(self):
+        height, width = 720, 1280
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.ellipse(mask, (1230, 690), (170, 230), 0, 0, 360, 1, -1)
+        contour = self.contour(mask)
+        self.assertGreater(len(contour), MAX_POLYGON_POINTS)
+
+        limited = _limit_polygon_points(contour)
+
+        self.assertLessEqual(len(limited), MAX_POLYGON_POINTS)
+        self.assertIn([width - 1, height - 1], limited.tolist())
+        covered = np.zeros_like(mask)
+        cv2.fillPoly(covered, [np.rint(limited).astype(np.int32)], 1)
+        self.assertGreaterEqual((mask & covered).sum() / mask.sum(), 0.99)
 
 
 if __name__ == "__main__":
