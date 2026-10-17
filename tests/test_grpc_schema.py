@@ -95,10 +95,15 @@ class GrpcSchemaContractTests(unittest.TestCase):
         mosaic = ai_processor_pb2.MosaicConfig()
         self.assertFalse(mosaic.HasField("blur_radius"))
         self.assertFalse(mosaic.HasField("pixel_size"))
+        self.assertFalse(mosaic.HasField("mask_margin"))
         mosaic.blur_radius = 24.0
         mosaic.pixel_size = 2
+        mosaic.mask_margin = 0
         self.assertTrue(mosaic.HasField("blur_radius"))
         self.assertTrue(mosaic.HasField("pixel_size"))
+        parsed = ai_processor_pb2.MosaicConfig.FromString(mosaic.SerializeToString())
+        self.assertTrue(parsed.HasField("mask_margin"))
+        self.assertEqual(parsed.mask_margin, 0)
 
         video = ai_processor_pb2.VideoChunk.DESCRIPTOR
         processed = ai_processor_pb2.ProcessedVideoChunk.DESCRIPTOR
@@ -114,7 +119,7 @@ class GrpcSchemaContractTests(unittest.TestCase):
                 "mosaic_config": 7,
                 "anonymization_mode": 11,
             },
-            "MosaicConfig": {"blur_radius": 1, "pixel_size": 2},
+            "MosaicConfig": {"blur_radius": 1, "pixel_size": 2, "mask_margin": 3},
             "ProcessedVideoChunk": {"mosaic_jpeg": 13},
             "FaceMetadata": {"whitelisted": 10, "anonymization": 11},
             "FrameStats": {
@@ -199,6 +204,25 @@ class GrpcSchemaContractTests(unittest.TestCase):
         self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_UNSPECIFIED"].number, 0)
         self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_METADATA_ONLY"].number, 1)
         self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_MOSAIC_JPEG"].number, 2)
+
+    def test_mask_margin_is_compatible_with_legacy_mosaic_config_readers_and_writers(self):
+        file = descriptor_pb2.FileDescriptorProto(name="legacy_mosaic.proto", syntax="proto3")
+        message = file.message_type.add(name="MosaicConfig")
+        ai_processor_pb2.MosaicConfig.DESCRIPTOR.CopyToProto(message)
+        self.assertEqual(message.field[2].name, "mask_margin")
+        self.assertEqual(message.field[2].type, descriptor_pb2.FieldDescriptorProto.TYPE_UINT32)
+        del message.field[2]
+        del message.oneof_decl[2]
+        pool = descriptor_pool.DescriptorPool()
+        pool.Add(file)
+        legacy_class = message_factory.GetMessageClass(pool.FindMessageTypeByName("MosaicConfig"))
+        current = ai_processor_pb2.MosaicConfig(blur_radius=12, pixel_size=2, mask_margin=0)
+        legacy = legacy_class.FromString(current.SerializeToString())
+        self.assertEqual((legacy.blur_radius, legacy.pixel_size), (12, 2))
+        legacy.DiscardUnknownFields()
+        read_back = ai_processor_pb2.MosaicConfig.FromString(legacy.SerializeToString())
+        self.assertFalse(read_back.HasField("mask_margin"))
+        self.assertEqual((read_back.blur_radius, read_back.pixel_size), (12, 2))
 
     def test_additive_response_fields_are_ignored_by_a_legacy_reader(self):
         legacy_class = _legacy_processed_video_chunk_class()

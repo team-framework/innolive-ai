@@ -599,6 +599,12 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             {"pixel_size": 9},
             {"pixel_size": 2.5},
             {"pixel_size": True},
+            {"mask_margin": -1},
+            {"mask_margin": 33},
+            {"mask_margin": 1.5},
+            {"mask_margin": True},
+            {"mask_margin": "8"},
+            {"mask_margin": float("nan")},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises((ValueError, TypeError)):
                 MosaicConfig(**kwargs)
@@ -617,7 +623,8 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
                 2,
                 MosaicConfig(blur_radius=32.0, pixel_size=4),
             ),
-            VideoFrame(_jpeg(3), 2, 3, MosaicConfig(pixel_size=1)),
+            VideoFrame(_jpeg(3), 2, 3, MosaicConfig(pixel_size=1, mask_margin=0)),
+            VideoFrame(_jpeg(4), 3, 4, MosaicConfig(mask_margin=32)),
         )
         async with (
             ClientLoopback() as loopback,
@@ -627,17 +634,23 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
                 result async for result in client.process_video(frames, session_id="client-session")
             ]
 
-        self.assertEqual(len(results), 3)
+        self.assertEqual(len(results), 4)
         received = loopback.servicer.requests
-        self.assertEqual(len(received), 3)
+        self.assertEqual(len(received), 4)
         self.assertFalse(received[0].HasField("mosaic_config"))
         self.assertTrue(received[1].HasField("mosaic_config"))
         self.assertAlmostEqual(received[1].mosaic_config.blur_radius, 32.0)
         self.assertEqual(received[1].mosaic_config.pixel_size, 4)
+        self.assertFalse(received[1].mosaic_config.HasField("mask_margin"))
         self.assertTrue(received[2].HasField("mosaic_config"))
         self.assertFalse(received[2].mosaic_config.HasField("blur_radius"))
         self.assertTrue(received[2].mosaic_config.HasField("pixel_size"))
         self.assertEqual(received[2].mosaic_config.pixel_size, 1)
+        self.assertTrue(received[2].mosaic_config.HasField("mask_margin"))
+        self.assertEqual(received[2].mosaic_config.mask_margin, 0)
+        self.assertFalse(received[3].mosaic_config.HasField("blur_radius"))
+        self.assertFalse(received[3].mosaic_config.HasField("pixel_size"))
+        self.assertEqual(received[3].mosaic_config.mask_margin, 32)
 
 
 if __name__ == "__main__":

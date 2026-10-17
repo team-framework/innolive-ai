@@ -522,6 +522,56 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(responses[0].data, responses[1].data)
         self.assertTrue(responses[1].timing.blur_encode_ms > 0)
 
+    async def test_mask_margin_changes_per_frame_and_omission_resets_jpeg_and_raw_defaults(self):
+        image = np.zeros((120, 160, 3), np.uint8)
+        image[:, ::2] = 255
+        for pix_fmt in ("", "yuv420p"):
+            with self.subTest(pix_fmt=pix_fmt):
+                data = (
+                    cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420).tobytes()
+                    if pix_fmt
+                    else _striped_jpeg(160, 120)
+                )
+                requests = []
+                for frame_id, margin in enumerate((None, 0, 8, 32, None)):
+                    request = _request(data=data, frame_id=frame_id)
+                    request.pix_fmt = pix_fmt
+                    request.width, request.height = 160, 120
+                    if margin is not None:
+                        request.mosaic_config.mask_margin = margin
+                    requests.append(request)
+                async with LoopbackServer(FaceRuntime()) as server:
+                    responses = await _collect(server.stub.ProcessVideo(_requests(*requests)))
+                self.assertTrue(all(r.status_message == "success" for r in responses))
+                self.assertEqual(responses[0].data, responses[2].data)
+                self.assertEqual(responses[0].data, responses[4].data)
+                self.assertEqual(len({r.data for r in responses[:4]}), 3)
+                # The renderer's margin must not change inference coordinates.
+                self.assertTrue(all(r.faces == responses[0].faces for r in responses))
+                if pix_fmt:
+                    self.assertTrue(all(len(r.data) == 160 * 120 * 3 // 2 for r in responses))
+
+    async def test_invalid_mask_margin_rejects_only_that_frame_before_inference(self):
+        runtime = FaceRuntime()
+        async with LoopbackServer(runtime) as server:
+            responses = await _collect(
+                server.stub.ProcessVideo(
+                    _requests(
+                        _request(mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=33)),
+                        _request(
+                            mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=2**32 - 1)
+                        ),
+                        _request(mosaic_config=ai_processor_pb2.MosaicConfig(mask_margin=0)),
+                    )
+                )
+            )
+        for response in responses[:2]:
+            self.assertEqual(response.error_code, "MOSAIC_CONFIG_INVALID")
+            self.assertIn("mask_margin", response.error_message)
+            self.assertEqual(response.data, b"")
+        self.assertEqual(responses[2].status_message, "success")
+        self.assertEqual(len(runtime.calls), 1)
+
     async def test_invalid_mosaic_config_fails_the_frame_without_pixels_and_keeps_stream(self):
         async with LoopbackServer(FaceRuntime()) as server:
             responses = await _collect(
@@ -556,7 +606,9 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         _request(
                             frame_id=1,
                             output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY,
-                            mosaic_config=ai_processor_pb2.MosaicConfig(blur_radius=100.0),
+                            mosaic_config=ai_processor_pb2.MosaicConfig(
+                                blur_radius=100.0, mask_margin=33
+                            ),
                         )
                     )
                 )
@@ -564,6 +616,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(responses[0].status_message, "success")
         self.assertEqual(responses[0].data, b"")
+        self.assertEqual(responses[0].timing.blur_encode_ms, 0)
 
     async def test_invalid_protected_mask_never_returns_source_pixels(self):
         async with LoopbackServer(InvalidMaskRuntime()) as server:
