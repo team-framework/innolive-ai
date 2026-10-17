@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
-from ultralytics.trackers.utils.stracks import parse_bboxes
-from ultralytics.utils import YAML, IterableSimpleNamespace
+from ultralytics.trackers.utils.stracks import multi_gmc, parse_bboxes
+from ultralytics.utils import LOGGER, YAML, IterableSimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "botsort.yaml"
@@ -18,6 +18,8 @@ CONTINUATION_CONFIDENCE = 0.05
 ACTIVATION_CONFIDENCE = 0.25
 MAX_MASK_HOLD_FRAMES = 1
 HOLD_CONFIDENCE_DECAY = 0.90
+# 검출 결과를 쓰는 GMC 방식. 이 방식은 검출 전에 미리 계산할 수 없다.
+DETECTION_DEPENDENT_GMC = frozenset({"orb", "sift"})
 
 
 @dataclass
@@ -51,6 +53,21 @@ class _ConnectionBOTSORT(BOTSORT):
             {"_local_count": 0},
         )
         super().__init__(args)
+        self._prepared_warp: np.ndarray | Exception | None = None
+
+    def _pre_first_associate(
+        self, strack_pool: list[BOTrack], unconfirmed: list[BOTrack], img: Any, results_high: Any
+    ) -> None:
+        """Use the GMC warp prepared for this frame, or compute it as the base tracker does."""
+        prepared, self._prepared_warp = self._prepared_warp, None
+        if prepared is None or img is None:
+            super()._pre_first_associate(strack_pool, unconfirmed, img, results_high)
+            return
+        if isinstance(prepared, Exception):
+            LOGGER.warning(f"GMC failed, falling back to identity: {prepared}")
+            prepared = np.eye(2, 3)
+        multi_gmc(strack_pool, prepared)
+        multi_gmc(unconfirmed, prepared)
 
     def reset_id(self) -> None:
         self._track_class.reset_id()
@@ -115,8 +132,31 @@ class StreamTracker:
     def frame_id(self) -> int:
         return self._tracker.frame_id
 
-    def update(self, boxes: Any, image: np.ndarray) -> np.ndarray:
-        return self._tracker.update(boxes, image)
+    @property
+    def motion_precomputable(self) -> bool:
+        """Whether the frame's GMC warp does not depend on detections and can run beside inference."""
+        gmc = getattr(self._tracker, "gmc", None)
+        return gmc is not None and gmc.method not in DETECTION_DEPENDENT_GMC
+
+    def estimate_motion(self, image: np.ndarray) -> np.ndarray | Exception:
+        """Compute this frame's GMC warp exactly as ``update`` would; pass it to the next ``update``.
+
+        Call once per frame in frame order. A failure is returned, not raised, so ``update`` keeps the
+        base tracker's identity fallback.
+        """
+        try:
+            return self._tracker.gmc.apply(image)
+        except Exception as error:
+            return error
+
+    def update(
+        self, boxes: Any, image: np.ndarray, *, motion: np.ndarray | Exception | None = None
+    ) -> np.ndarray:
+        self._tracker._prepared_warp = motion
+        try:
+            return self._tracker.update(boxes, image)
+        finally:
+            self._tracker._prepared_warp = None
 
     def stabilize(
         self,

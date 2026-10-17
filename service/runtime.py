@@ -10,7 +10,7 @@ import platform
 import threading
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -233,6 +233,9 @@ class RuntimeManager:
         self.ready = False
         self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
+        # GMC는 화면만 쓰므로 같은 프레임의 GPU 추론과 동시에 계산한다. 추론 줄이 한 번에 한 프레임만
+        # 처리하므로 스레드 하나로 충분하다.
+        self._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
         self._lane: asyncio.Lock | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
@@ -302,14 +305,24 @@ class RuntimeManager:
 
     def _infer_sync(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
         started = time.perf_counter()
+        motion = None
+        motion_executor = getattr(self, "_motion_executor", None)
+        if motion_executor is not None and getattr(tracker, "motion_precomputable", False):
+            motion = motion_executor.submit(tracker.estimate_motion, image)
         try:
             prediction = self._predict(image)
         except Exception as error:
+            if motion is not None:
+                # 스트림 정리 전에 이 프레임의 GMC가 끝나야 추적기 상태를 함께 쓰지 않는다.
+                wait([motion])
             raise InferenceFailure(f"{self.backend} inference failed") from error
         inferred_at = time.perf_counter()
         try:
             boxes = prediction.boxes.cpu().numpy()
-            tracks = tracker.update(boxes, image)
+            if motion is None:
+                tracks = tracker.update(boxes, image)
+            else:
+                tracks = tracker.update(boxes, image, motion=motion.result())
         except Exception as error:
             raise TrackingFailure("BoT-SORT update failed") from error
         tracked_at = time.perf_counter()
@@ -438,6 +451,8 @@ class RuntimeManager:
         self.ready = False
         self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self, "_motion_executor"):
+            self._motion_executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_model"):
             del self._model
         with self._guard:
