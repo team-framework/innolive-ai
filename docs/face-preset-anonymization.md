@@ -13,8 +13,9 @@ metadata와 identity 할당 결과를 확인할 수 있다.
 | `FACE_ANONYMIZATION_MODE_FACE_SWAP` (1) | `face_swap` | metadata 추출·프리셋 매칭 후 InSwapper-128 합성; 실패한 얼굴은 blur |
 
 모드는 한 `ProcessVideo` RPC 동안 고정한다. 바꾸려면 새 RPC를 연다. 기본
-`MosaicConfig.pixel_size`는 1이며 `blur_radius`는 24px이다. pixelation이 필요하면
-기존 `mosaic_config.pixel_size`로 2..8을 전달한다. 기존 field 번호와 RPC 경로는 유지한다.
+`MosaicConfig.pixel_size`는 2이며 `blur_radius`는 24px이다. 원본 해상도 순수 blur가
+필요하면 `mosaic_config.pixel_size`로 1을, 더 강한 pixelation은 3..8을 전달한다.
+기존 field 번호와 RPC 경로는 유지한다.
 `VIDEO_OUTPUT_MODE_MOSAIC_JPEG`라는 기존 이름도 유지하며 합성 모드에서는 합성된 JPEG를
 반환한다. `VIDEO_OUTPUT_MODE_METADATA_ONLY`에서는 선택한 experimental 모드의 metadata와
 매칭 결과만 반환하며 InSwapper를 실행하지 않는다. raw `yuv420p` 입출력도 지원한다.
