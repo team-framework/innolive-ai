@@ -90,6 +90,11 @@ Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 선택합니다. TensorRT를 선택한 뒤 검증에 실패하면 PyTorch로 fallback하지 않고 시작을
 중단합니다.
 
+블러 영상 합성은 모든 stream이 공유하는 thread pool에서 병렬로 처리합니다. 기본값은
+`--mosaic-workers 4`(`AI_MOSAIC_WORKERS`)와 `--mosaic-max-inflight 8`
+(`AI_MOSAIC_MAX_INFLIGHT`)이며, max-inflight는 workers 이상이어야 합니다. 얼굴 합성
+모드는 공유 model session을 쓰므로 별도 단일 thread에서 차례로 처리합니다.
+
 CPU 실행을 강제하려면 다음 command를 사용합니다.
 
 ```bash

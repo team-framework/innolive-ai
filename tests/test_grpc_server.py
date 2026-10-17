@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -313,6 +314,53 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=RuntimeConfig(engine=Path("unused.engine")),
                 max_long_edge=16,
             )
+
+    async def test_mosaic_pool_settings_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "mosaic_workers"):
+            GrpcServerSettings(
+                runtime=RuntimeConfig(engine=Path("unused.engine")), mosaic_workers=0
+            )
+        with self.assertRaisesRegex(ValueError, "mosaic_max_inflight"):
+            GrpcServerSettings(
+                runtime=RuntimeConfig(engine=Path("unused.engine")),
+                mosaic_workers=4,
+                mosaic_max_inflight=3,
+            )
+
+    async def test_blur_compositions_run_in_parallel_but_face_compositions_stay_serial(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            servicer = server.bundle.servicer
+
+            async def overlap(face_anonymization: bool) -> int:
+                release = threading.Event()
+                lock = threading.Lock()
+                running = peak = 0
+
+                def compose() -> bytes:
+                    nonlocal running, peak
+                    with lock:
+                        running += 1
+                        peak = max(peak, running)
+                    release.wait(1)
+                    with lock:
+                        running -= 1
+                    return b"done"
+
+                tasks = [
+                    asyncio.create_task(
+                        servicer._compose_frame(compose, face_anonymization=face_anonymization)
+                    )
+                    for _ in range(3)
+                ]
+                await asyncio.sleep(0.2)
+                release.set()
+                self.assertEqual(await asyncio.gather(*tasks), [b"done"] * 3)
+                return peak
+
+            # Blur-only frames from different streams overlap on the default 4-thread pool.
+            self.assertEqual(await overlap(face_anonymization=False), 3)
+            # Face anonymization shares model sessions, so it keeps one composition at a time.
+            self.assertEqual(await overlap(face_anonymization=True), 1)
 
     async def test_frame_limits_track_the_configured_long_edge(self):
         runtime = FakeRuntime()

@@ -88,7 +88,12 @@ DEFAULT_TRACKER = ROOT / "config" / "botsort.yaml"
 SERVICE_NAME = "AiProcessor"
 PROFILE = STANDARD_PROFILE
 MAX_SESSIONS = 1_024
-MOSAIC_MAX_INFLIGHT = 2
+# 블러 전용 합성(OpenCV·numpy, 입력만 사용)은 스트림 사이에서 병렬로 돌린다. 한 프레임에
+# 약 13 ms라 스레드 하나는 초당 약 75프레임(30 fps 스트림 2.5개)에서 포화한다(#46).
+DEFAULT_MOSAIC_WORKERS = 4
+DEFAULT_MOSAIC_MAX_INFLIGHT = 8
+# 얼굴 합성은 공유 모델 세션을 쓰므로 종전대로 한 스레드에서 차례로 처리한다.
+FACE_ANONYMIZATION_MAX_INFLIGHT = 2
 
 
 def _output_mode(value: int) -> int:
@@ -117,6 +122,8 @@ class GrpcServerSettings:
     max_long_edge: int = MAX_LONG_EDGE
     inference_timeout_seconds: float = 1.5
     shutdown_grace_seconds: float = 5.0
+    mosaic_workers: int = DEFAULT_MOSAIC_WORKERS
+    mosaic_max_inflight: int = DEFAULT_MOSAIC_MAX_INFLIGHT
     ssl_certfile: Path | None = None
     ssl_keyfile: Path | None = None
 
@@ -137,6 +144,10 @@ class GrpcServerSettings:
             raise ValueError("inference_timeout_seconds must be positive")
         if not math.isfinite(self.shutdown_grace_seconds) or self.shutdown_grace_seconds < 0:
             raise ValueError("shutdown_grace_seconds cannot be negative")
+        if self.mosaic_workers < 1:
+            raise ValueError("mosaic_workers must be at least one")
+        if self.mosaic_max_inflight < self.mosaic_workers:
+            raise ValueError("mosaic_max_inflight must be at least mosaic_workers")
         if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
             raise ValueError("ssl_certfile and ssl_keyfile must be provided together")
 
@@ -186,10 +197,15 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         )
         self._inference_tasks: set[asyncio.Task] = set()
         self._mosaic_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=settings.mosaic_workers,
             thread_name_prefix="frame-mosaic",
         )
-        self._mosaic_slots = asyncio.BoundedSemaphore(MOSAIC_MAX_INFLIGHT)
+        self._mosaic_slots = asyncio.BoundedSemaphore(settings.mosaic_max_inflight)
+        self._face_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="face-anonymization",
+        )
+        self._face_slots = asyncio.BoundedSemaphore(FACE_ANONYMIZATION_MAX_INFLIGHT)
         self._accepting = False
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
@@ -407,7 +423,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                         pixel_size=pixel_size,
                         max_bytes=self.settings.max_jpeg_bytes,
                     )
-                    processed_data = await self._compose_frame(compose)
+                    processed_data = await self._compose_frame(compose, face_anonymization=True)
                 elif any(
                     item.get("whitelisted") is not True or is_number_plate_object(item)
                     for item in objects
@@ -686,9 +702,15 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             active_stream_count=summary.active_stream_count,
         )
 
-    async def _compose_frame(self, compose: Callable[[], bytes]) -> bytes:
-        async with self._mosaic_slots:
-            future = asyncio.get_running_loop().run_in_executor(self._mosaic_executor, compose)
+    async def _compose_frame(
+        self, compose: Callable[[], bytes], *, face_anonymization: bool = False
+    ) -> bytes:
+        """Run one frame composition on the blur pool, or serially for face anonymization."""
+
+        slots = self._face_slots if face_anonymization else self._mosaic_slots
+        executor = self._face_executor if face_anonymization else self._mosaic_executor
+        async with slots:
+            future = asyncio.get_running_loop().run_in_executor(executor, compose)
             try:
                 return await asyncio.shield(future)
             except asyncio.CancelledError:
@@ -701,11 +723,12 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         tasks = tuple(self._inference_tasks)
         for task in tasks:
             await self._settle_inference(task)
-        await asyncio.to_thread(
-            self._mosaic_executor.shutdown,
-            wait=True,
-            cancel_futures=True,
-        )
+        for executor in (self._mosaic_executor, self._face_executor):
+            await asyncio.to_thread(
+                executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
 
     def set_accepting(self, accepting: bool) -> None:
         self._accepting = accepting
@@ -1112,6 +1135,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.getenv("GRPC_SHUTDOWN_GRACE", "5")),
     )
+    parser.add_argument(
+        "--mosaic-workers",
+        type=positive_int,
+        default=positive_int(os.getenv("AI_MOSAIC_WORKERS", str(DEFAULT_MOSAIC_WORKERS))),
+        help="Threads for blur-only frame composition shared by all streams.",
+    )
+    parser.add_argument(
+        "--mosaic-max-inflight",
+        type=positive_int,
+        default=positive_int(os.getenv("AI_MOSAIC_MAX_INFLIGHT", str(DEFAULT_MOSAIC_MAX_INFLIGHT))),
+        help="Blur-only compositions queued or running at once (at least --mosaic-workers).",
+    )
     experimental = FaceAnonymizationConfig()
     parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
     parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
@@ -1178,6 +1213,8 @@ def main() -> None:
         max_long_edge=arguments.max_long_edge,
         inference_timeout_seconds=arguments.inference_timeout,
         shutdown_grace_seconds=arguments.shutdown_grace,
+        mosaic_workers=arguments.mosaic_workers,
+        mosaic_max_inflight=arguments.mosaic_max_inflight,
         ssl_certfile=arguments.ssl_certfile,
         ssl_keyfile=arguments.ssl_keyfile,
     )
