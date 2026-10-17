@@ -145,6 +145,12 @@ class MosaicTests(unittest.TestCase):
                 [{"whitelisted": False, "mask_polygon": [[1, 1], [2, 2]]}],
             )
 
+    def test_bright_pixels_do_not_overflow_at_any_blend_weight(self):
+        image = np.full((32, 256, 3), 255, np.uint8)
+        mask = np.tile(np.arange(256, dtype=np.uint8), (32, 1))
+        output = mosaic._mosaic_masked_region(image, mask, 24.0, 2)
+        np.testing.assert_array_equal(output, image)
+
 
 class MosaicParamTests(unittest.TestCase):
     def setUp(self) -> None:

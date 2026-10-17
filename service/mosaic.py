@@ -104,15 +104,15 @@ def _mosaic_masked_region(
 ) -> np.ndarray:
     """Apply the protected-region transform to the smallest blur-safe crop."""
 
-    mask_rows, mask_columns = np.nonzero(blend_mask)
-    if not mask_rows.size:
+    x, y, width, height = cv2.boundingRect(blend_mask)
+    if width == 0 or height == 0:
         return image
 
     padding = math.ceil(blur_radius * 3)
-    top = max(0, int(mask_rows.min()) - padding)
-    bottom = min(image.shape[0], int(mask_rows.max()) + padding + 1)
-    left = max(0, int(mask_columns.min()) - padding)
-    right = min(image.shape[1], int(mask_columns.max()) + padding + 1)
+    top = max(0, y - padding)
+    bottom = min(image.shape[0], y + height + padding)
+    left = max(0, x - padding)
+    right = min(image.shape[1], x + width + padding)
     region = image[top:bottom, left:right]
     reduced_size = (
         max(1, math.ceil(region.shape[1] / pixel_size)),
@@ -126,10 +126,12 @@ def _mosaic_masked_region(
         interpolation=cv2.INTER_LINEAR,
     )
     output = image.copy()
-    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
+    # Complementary weights bound the rounded numerator to 255 * 255 + 127.
+    # uint16 preserves the exact result while halving blend-buffer bandwidth.
+    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint16)
     inverse_alpha = 255 - alpha
     output[top:bottom, left:right] = (
-        region.astype(np.uint32) * inverse_alpha + blurred.astype(np.uint32) * alpha + 127
+        region.astype(np.uint16) * inverse_alpha + blurred.astype(np.uint16) * alpha + 127
     ) // 255
     return output
 
