@@ -9,6 +9,9 @@ fuse_score: true
 
 # Camera motion compensation keeps IDs stable when the camera itself moves.
 gmc_method: sparseOptFlow
+# Frame downscale for motion compensation. It runs in the single inference lane every frame,
+# so 4 (ultralytics default is 2) quarters the optical-flow pixels.
+gmc_downscale: 4
 
 # ReID adds another model and synchronization point. Motion + IoU association is
 # faster for the short face occlusions handled by mask_hold_frames.

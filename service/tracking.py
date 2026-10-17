@@ -18,6 +18,11 @@ CONTINUATION_CONFIDENCE = 0.05
 ACTIVATION_CONFIDENCE = 0.25
 MAX_MASK_HOLD_FRAMES = 1
 HOLD_CONFIDENCE_DECAY = 0.90
+# 카메라 움직임 보정(GMC)을 계산할 프레임 축소 배율. 설정에 없으면 ultralytics 기본값 2를
+# 쓴다. 광류는 워커당 한 줄인 추론 줄 안에서 매 프레임 돌아서, 운영 설정은 4로 계산 픽셀을
+# 1/4로 줄인다(#48).
+DEFAULT_GMC_DOWNSCALE = 2
+MAX_GMC_DOWNSCALE = 8
 
 
 @dataclass
@@ -87,6 +92,7 @@ class StreamTracker:
         *,
         mask_hold_frames: int = MAX_MASK_HOLD_FRAMES,
         gmc_method: str | None = None,
+        gmc_downscale: int | None = None,
     ):
         config_path = config.expanduser().resolve()
         if not config_path.is_file():
@@ -106,8 +112,17 @@ class StreamTracker:
             values["gmc_method"] = gmc_method
         if mask_hold_frames < 0 or mask_hold_frames > MAX_MASK_HOLD_FRAMES:
             raise ValueError(f"mask_hold_frames must be in [0, {MAX_MASK_HOLD_FRAMES}]")
+        downscale = values.pop("gmc_downscale", DEFAULT_GMC_DOWNSCALE)
+        if gmc_downscale is not None:
+            downscale = gmc_downscale
+        if isinstance(downscale, bool) or not isinstance(downscale, int):
+            raise ValueError("gmc_downscale must be an integer")
+        if not 1 <= downscale <= MAX_GMC_DOWNSCALE:
+            raise ValueError(f"gmc_downscale must be in [1, {MAX_GMC_DOWNSCALE}]")
         self.config_path = config_path
         self._tracker = _ConnectionBOTSORT(IterableSimpleNamespace(**values))
+        # BOTSORT는 GMC를 축소 배율 기본값으로 만들고 설정으로 넘기지 않는다.
+        self._tracker.gmc.downscale = downscale
         self._masks: dict[int, _MaskState] = {}
         self._mask_hold_frames = mask_hold_frames
 
