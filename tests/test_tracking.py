@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 from ultralytics.engine.results import Boxes
@@ -8,8 +10,11 @@ from ultralytics.engine.results import Boxes
 from service.tracking import (
     ACTIVATION_CONFIDENCE,
     CONTINUATION_CONFIDENCE,
+    DEFAULT_CONFIG,
+    DEFAULT_GMC_DOWNSCALE,
     DETECTOR_CONFIDENCE,
     HOLD_CONFIDENCE_DECAY,
+    MAX_GMC_DOWNSCALE,
     MAX_MASK_HOLD_FRAMES,
     StreamTracker,
 )
@@ -27,6 +32,25 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(ACTIVATION_CONFIDENCE, 0.25)
         self.assertEqual(MAX_MASK_HOLD_FRAMES, 1)
         self.assertEqual(HOLD_CONFIDENCE_DECAY, 0.90)
+
+    def test_gmc_downscale_comes_from_config_and_can_be_overridden(self):
+        self.assertEqual(StreamTracker()._tracker.gmc.downscale, 4)
+        self.assertEqual(StreamTracker(gmc_downscale=2)._tracker.gmc.downscale, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "botsort.yaml"
+            config.write_text(
+                "".join(
+                    line
+                    for line in DEFAULT_CONFIG.read_text().splitlines(keepends=True)
+                    if not line.startswith("gmc_downscale:")
+                )
+            )
+            self.assertEqual(StreamTracker(config)._tracker.gmc.downscale, DEFAULT_GMC_DOWNSCALE)
+
+    def test_invalid_gmc_downscale_is_rejected(self):
+        for value in (0, MAX_GMC_DOWNSCALE + 1, True, "4", 2.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "gmc_downscale"):
+                StreamTracker(gmc_downscale=value)
 
     def test_each_connection_has_an_independent_id_counter(self):
         image = np.zeros((640, 640, 3), dtype=np.uint8)
