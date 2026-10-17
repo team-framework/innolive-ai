@@ -116,6 +116,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
         self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
         self.assertEqual(model.kwargs["classes"], [0, 1])
+        self.assertIs(model.kwargs["retina_masks"], False)
 
     def test_mask_pad_is_one_detector_mask_pixel_in_output_pixels(self):
         cases = {(1920, 1080): 3, (1080, 1920): 3, (1280, 720): 2, (640, 360): 1, (64, 64): 1}

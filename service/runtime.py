@@ -288,7 +288,10 @@ class RuntimeManager:
                 iou=0.70,
                 classes=list(EXPECTED_CLASS_NAMES),
                 max_det=MAX_DETECTIONS,
-                retina_masks=True,
+                # 마스크 윤곽을 640 기준 마스크에서 뽑는다. 원본 해상도 업샘플링은 FHD 프레임 시간의
+                # 절반 가까이를 쓰지만 윤곽은 어차피 64점으로 줄어든다. 줄어든 경계는
+                # detector_mask_pad만큼 보호 영역을 넓혀 보정한다.
+                retina_masks=False,
                 device=self.device,
                 verbose=False,
             )
