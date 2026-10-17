@@ -23,6 +23,7 @@ MAX_WINDOW = 5
 MAX_FRAME_ID = 2**32 - 1
 MAX_MOSAIC_BLUR_RADIUS = 64.0
 MAX_MOSAIC_PIXEL_SIZE = 8
+MAX_MOSAIC_MASK_MARGIN = 32
 
 
 class VideoClientError(RuntimeError):
@@ -59,11 +60,14 @@ class MosaicConfig:
 
     ``blur_radius`` is the Gaussian blur radius in pixels (larger = stronger
     blur) and ``pixel_size`` is the mosaic block size in pixels (1 disables
-    pixelation). Both may change from frame to frame on one open stream.
+    pixelation). ``mask_margin`` extends the protected polygon by 0..32 input
+    pixels with an outer fade (unset: 8). Zero keeps the full polygon protected.
+    All fields may change from frame to frame on one open stream.
     """
 
     blur_radius: float | None = None
     pixel_size: int | None = None
+    mask_margin: int | None = None
 
     def __post_init__(self) -> None:
         if self.blur_radius is not None:
@@ -85,6 +89,16 @@ class MosaicConfig:
             ):
                 raise ValueError(
                     f"MosaicConfig.pixel_size must be an integer in 1..{MAX_MOSAIC_PIXEL_SIZE}"
+                )
+        if self.mask_margin is not None:
+            margin = self.mask_margin
+            if (
+                isinstance(margin, bool)
+                or not isinstance(margin, int)
+                or not 0 <= margin <= MAX_MOSAIC_MASK_MARGIN
+            ):
+                raise ValueError(
+                    f"MosaicConfig.mask_margin must be an integer in 0..{MAX_MOSAIC_MASK_MARGIN}"
                 )
 
 
@@ -678,6 +692,8 @@ class VideoProcessorClient:
                         chunk.mosaic_config.blur_radius = config.blur_radius
                     if config.pixel_size is not None:
                         chunk.mosaic_config.pixel_size = config.pixel_size
+                    if config.mask_margin is not None:
+                        chunk.mosaic_config.mask_margin = config.mask_margin
                 await call.write(chunk)
             await call.done_writing()
         finally:

@@ -16,7 +16,9 @@ DEFAULT_BLUR_RADIUS = 24.0
 DEFAULT_PIXEL_SIZE = 2
 MAX_BLUR_RADIUS = 64.0
 MAX_PIXEL_SIZE = 8
-MASK_FEATHER_RADIUS = 8
+DEFAULT_MASK_MARGIN = 8
+MASK_FEATHER_RADIUS = DEFAULT_MASK_MARGIN  # Compatibility for existing compositor imports.
+MAX_MASK_MARGIN = 32
 MAX_MASK_POINTS = 64
 
 
@@ -39,12 +41,20 @@ def validate_mosaic_params(
     return radius, pixel_size
 
 
+def validate_mask_margin(value: Any) -> int:
+    """Reject invalid margins without shrinking the detected protected region."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_MASK_MARGIN:
+        raise ValueError(f"mask_margin must be an integer in 0..{MAX_MASK_MARGIN}")
+    return value
+
+
 def mosaic_jpeg(
     image: np.ndarray,
     objects: list[dict[str, Any]],
     *,
     blur_radius: float = DEFAULT_BLUR_RADIUS,
     pixel_size: int = DEFAULT_PIXEL_SIZE,
+    mask_margin: int = DEFAULT_MASK_MARGIN,
     max_bytes: int = MAX_JPEG_BYTES,
 ) -> bytes:
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -54,7 +64,9 @@ def mosaic_jpeg(
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
     mask = _protected_mask(image.shape[:2], objects)
-    output = _mosaic_masked_region(image, _feathered_mask(mask), blur_radius, pixel_size)
+    output = _mosaic_masked_region(
+        image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
+    )
 
     return _encode_jpeg(output, max_bytes)
 
@@ -65,6 +77,7 @@ def mosaic_yuv420p(
     *,
     blur_radius: float = DEFAULT_BLUR_RADIUS,
     pixel_size: int = DEFAULT_PIXEL_SIZE,
+    mask_margin: int = DEFAULT_MASK_MARGIN,
 ) -> bytes:
     """Compose the mosaic and return raw yuv420p bytes for the raw wire format."""
 
@@ -76,7 +89,9 @@ def mosaic_yuv420p(
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
     mask = _protected_mask(image.shape[:2], objects)
-    output = _mosaic_masked_region(image, _feathered_mask(mask), blur_radius, pixel_size)
+    output = _mosaic_masked_region(
+        image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
+    )
 
     return _encode_yuv420p(output)
 
@@ -164,24 +179,48 @@ def _protected_mask(
     return mask
 
 
-def _feathered_mask(mask: np.ndarray) -> np.ndarray:
+def _feathered_mask(mask: np.ndarray, mask_margin: int = DEFAULT_MASK_MARGIN) -> np.ndarray:
     """Extend the protected area and taper only its outer boundary.
 
     The source protected pixels always remain at full opacity.  The short outer
     taper blends the already-strongly blurred image into the scene instead of
-    leaving a conspicuous hard edge around the segmentation polygon.  Set
-    ``MASK_FEATHER_RADIUS`` to 0 to blur exactly the segmentation polygon.
+    leaving a conspicuous hard edge around the segmentation polygon. A zero
+    margin protects exactly that polygon; negative margins are never accepted.
     """
+    mask_margin = validate_mask_margin(mask_margin)
     if not np.any(mask):
         return mask
-    if MASK_FEATHER_RADIUS <= 0:
+    if mask_margin == 0:
         return (mask != 0).astype(np.uint8) * 255
 
-    kernel_size = MASK_FEATHER_RADIUS * 2 + 1
+    if mask_margin != DEFAULT_MASK_MARGIN:
+        # One distance transform keeps custom margins independent of kernel area.
+        # Restrict it to the protected bounds plus the requested outer band.
+        x, y, width, height = cv2.boundingRect(mask)
+        left, top = max(0, x - mask_margin), max(0, y - mask_margin)
+        right = min(mask.shape[1], x + width + mask_margin)
+        bottom = min(mask.shape[0], y + height + mask_margin)
+        distance = cv2.distanceTransform(
+            255 - mask[top:bottom, left:right], cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+        )
+        outside = distance > mask_margin
+        # Reuse the distance buffer rather than allocate full-frame float arrays.
+        np.subtract(mask_margin + 1, distance, out=distance)
+        distance *= 255.0 / mask_margin
+        np.clip(distance, 0.0, 255.0, out=distance)
+        np.rint(distance, out=distance)
+        alpha = distance.astype(np.uint8)
+        alpha[outside] = 0
+        feathered = np.zeros_like(mask)
+        feathered[top:bottom, left:right] = alpha
+        return feathered
+
+    # Preserve the old 8px morphology and rounding exactly for existing clients.
+    kernel_size = DEFAULT_MASK_MARGIN * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     expanded = cv2.dilate(mask, kernel)
     distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    alpha = np.minimum(distance / MASK_FEATHER_RADIUS, 1.0) * 255.0
+    alpha = np.minimum(distance / DEFAULT_MASK_MARGIN, 1.0) * 255.0
     feathered = np.rint(alpha).astype(np.uint8)
     feathered[mask != 0] = 255
     return feathered

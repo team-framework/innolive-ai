@@ -88,12 +88,14 @@ class FaceAnonymization(_message.Message):
     def __init__(self, attributes: _Optional[_Union[FaceAttributes, _Mapping]] = ..., identity_key: _Optional[str] = ..., preset_key: _Optional[str] = ..., status: _Optional[str] = ..., fallback_reason: _Optional[str] = ...) -> None: ...
 
 class MosaicConfig(_message.Message):
-    __slots__ = ("blur_radius", "pixel_size")
+    __slots__ = ("blur_radius", "pixel_size", "mask_margin")
     BLUR_RADIUS_FIELD_NUMBER: _ClassVar[int]
     PIXEL_SIZE_FIELD_NUMBER: _ClassVar[int]
+    MASK_MARGIN_FIELD_NUMBER: _ClassVar[int]
     blur_radius: float
     pixel_size: int
-    def __init__(self, blur_radius: _Optional[float] = ..., pixel_size: _Optional[int] = ...) -> None: ...
+    mask_margin: int
+    def __init__(self, blur_radius: _Optional[float] = ..., pixel_size: _Optional[int] = ..., mask_margin: _Optional[int] = ...) -> None: ...
 
 class ProcessedVideoChunk(_message.Message):
     __slots__ = ("data", "timestamp", "status_message", "faces", "width", "height", "frame_id", "processing_ms", "timing", "error_code", "error_message", "stats", "mosaic_jpeg")
