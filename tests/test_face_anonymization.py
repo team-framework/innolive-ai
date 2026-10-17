@@ -360,6 +360,36 @@ class AnonymizationTests(unittest.TestCase):
 
 
 class GrpcAnonymizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_mask_margin_reaches_metadata_and_swap_fallback_renderers(self):
+        for mode in (
+            messages.FACE_ANONYMIZATION_MODE_FACE_METADATA,
+            messages.FACE_ANONYMIZATION_MODE_FACE_SWAP,
+        ):
+            with self.subTest(mode=mode):
+                async with LoopbackServer(FaceRuntime()) as server:
+                    runtime = server.bundle.servicer.face_anonymization
+                    runtime.extractor = Mock(
+                        predict=Mock(return_value=[AttributePrediction(ATTRS, {})])
+                    )
+                    runtime.catalog = Mock(match=Mock(return_value=None))
+                    requests = []
+                    for margin in (0, 8, 64):
+                        request = _request(data=_striped_jpeg(160, 120))
+                        request.anonymization_mode = mode
+                        request.mosaic_config.mask_margin = margin
+                        requests.append(request)
+                    responses = await _collect(server.stub.ProcessVideo(_requests(*requests)))
+                for request, response in zip(requests, responses, strict=True):
+                    self.assertEqual(response.status_message, "success")
+                    self.assertEqual(response.faces[0].anonymization.status, "blur_fallback")
+                    image = cv2.imdecode(np.frombuffer(request.data, np.uint8), cv2.IMREAD_COLOR)
+                    objects = [{"mask_polygon": [[p.x, p.y] for p in response.faces[0].polygon]}]
+                    self.assertEqual(
+                        response.data,
+                        mosaic_jpeg(image, objects, mask_margin=request.mosaic_config.mask_margin),
+                    )
+                self.assertEqual(len({r.data for r in responses}), 3)
+
     async def test_refresh_uses_rpc_frame_sequence_and_cache_is_not_shared_between_rpcs(self):
         async with LoopbackServer(FaceRuntime()) as server:
             runtime = server.bundle.servicer.face_anonymization

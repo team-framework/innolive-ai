@@ -243,6 +243,12 @@ class MosaicTests(unittest.TestCase):
                 [{"whitelisted": False, "mask_polygon": [[1, 1], [2, 2]]}],
             )
 
+    def test_bright_pixels_do_not_overflow_at_any_blend_weight(self):
+        image = np.full((32, 256, 3), 255, np.uint8)
+        mask = np.tile(np.arange(256, dtype=np.uint8), (32, 1))
+        output = mosaic._mosaic_masked_region(image, mask, 24.0, 2)
+        np.testing.assert_array_equal(output, image)
+
 
 class MosaicParamTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -310,6 +316,74 @@ class MosaicParamTests(unittest.TestCase):
         for kwargs, expected in cases:
             with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, expected):
                 mosaic_jpeg(self.image, self.objects, **kwargs)
+
+
+class MaskMarginTests(unittest.TestCase):
+    def test_margin_preserves_the_polygon_and_controls_only_the_outer_band(self):
+        mask = np.zeros((768, 768), np.uint8)
+        mask[320:448, 320:448] = 255
+        for margin in (0, 1, 4, 8, 16, 32, 64):
+            with self.subTest(margin=margin):
+                result = _feathered_mask(mask, margin)
+                self.assertTrue(np.all(result[mask != 0] == 255))
+                rows, columns = np.nonzero(result)
+                self.assertEqual((rows.min(), columns.min()), (320 - margin, 320 - margin))
+                self.assertEqual((rows.max(), columns.max()), (447 + margin, 447 + margin))
+                if margin:
+                    band = result[384, 448 : 448 + margin].astype(int)
+                    self.assertTrue(np.all(np.diff(band) <= 0))
+                    self.assertGreater(band[-1], 0)
+                if margin > 1:
+                    self.assertLess(band[-1], 255)
+                if margin > 8:
+                    self.assertTrue(np.all(band[: margin - 8 + 1] == 255))
+                self.assertEqual(result[384, 448 + margin], 0)
+
+    def test_minimum_margin_still_blurs_the_entire_protected_region(self):
+        image = np.zeros((160, 160, 3), np.uint8)
+        image[:, ::2] = 255
+        mask = np.zeros(image.shape[:2], np.uint8)
+        mask[60:100, 60:100] = 255
+        output = mosaic._mosaic_masked_region(
+            image, _feathered_mask(mask, 0), mosaic.DEFAULT_BLUR_RADIUS, mosaic.DEFAULT_PIXEL_SIZE
+        )
+        np.testing.assert_array_equal(output[mask == 0], image[mask == 0])
+        self.assertLess(float(output[mask != 0].std()), 5)
+        self.assertGreater(float(image[mask != 0].std()), 100)
+
+    def test_edges_overlaps_empty_and_full_masks_keep_all_protected_pixels(self):
+        for shape in ((32, 32), (80, 160)):
+            for value in (0, 255):
+                mask = np.full(shape, value, np.uint8)
+                for margin in (0, 8, 64):
+                    np.testing.assert_array_equal(_feathered_mask(mask, margin), mask)
+            mask = np.zeros(shape, np.uint8)
+            cv2.fillPoly(mask, [np.array([[0, 0], [20, 0], [30, 20], [0, 30]])], 255)
+            mask[-20:, -20:] = 255
+            mask[:10, :10] = 255
+            for margin in (0, 4, 8, 64):
+                result = _feathered_mask(mask, margin)
+                self.assertEqual(result.shape, mask.shape)
+                self.assertTrue(np.all(result[mask != 0] == 255))
+
+    def test_jpeg_and_raw_defaults_match_explicit_legacy_margin(self):
+        image = np.random.default_rng(50).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+        objects = [{"mask_polygon": [[40, 30], [120, 30], [120, 90], [40, 90]]}]
+        for compose in (mosaic_jpeg, mosaic_yuv420p):
+            self.assertEqual(compose(image, objects), compose(image, objects, mask_margin=8))
+            self.assertNotEqual(
+                compose(image, objects, mask_margin=0), compose(image, objects, mask_margin=64)
+            )
+
+    def test_invalid_margin_is_rejected_even_without_protected_objects(self):
+        image = np.zeros((32, 32, 3), np.uint8)
+        for margin in (-1, 65, 256, 1.5, True, "8", float("nan"), float("inf")):
+            for compose in (mosaic_jpeg, mosaic_yuv420p):
+                with (
+                    self.subTest(margin=margin, compose=compose.__name__),
+                    self.assertRaisesRegex(ValueError, "mask_margin"),
+                ):
+                    compose(image, [], mask_margin=margin)
 
 
 class MosaicRawTests(unittest.TestCase):

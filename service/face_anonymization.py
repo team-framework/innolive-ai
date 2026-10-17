@@ -24,6 +24,7 @@ from service.face_presets import (
 )
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
 from service.mosaic import (
+    DEFAULT_MASK_MARGIN,
     _encode_jpeg,
     _encode_yuv420p,
     _feathered_mask,
@@ -111,6 +112,7 @@ class FaceAnonymizationRuntime:
         blur_radius: float,
         pixel_size: int,
         max_bytes: int,
+        mask_margin: int = DEFAULT_MASK_MARGIN,
     ) -> bytes:
         identities.expire(
             {int(item["track_id"]) for item in objects if item.get("track_id") is not None}, frame
@@ -207,5 +209,7 @@ class FaceAnonymizationRuntime:
         # Apply failed/held face and number-plate blur last so it takes precedence
         # over nearby successful swaps. Whitelist exclusions use the usual mask.
         mask = _protected_mask(image.shape[:2], remaining)
-        output = _mosaic_masked_region(output, _feathered_mask(mask), blur_radius, pixel_size)
+        output = _mosaic_masked_region(
+            output, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
+        )
         return _encode_yuv420p(output) if pix_fmt else _encode_jpeg(output, max_bytes)
