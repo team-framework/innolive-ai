@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from unittest.mock import patch
 
@@ -282,9 +283,8 @@ class GroupedComposeTests(unittest.TestCase):
                     mask = mosaic._protected_mask((height, width), objects, pad)
                 except ValueError:
                     continue
-                expected = _full_frame_mosaic(
-                    image, _feathered_mask(mask, margin), radius, pixel_size
-                )
+                cell = max(pixel_size, math.ceil(radius / mosaic.MAX_REDUCED_SIGMA))
+                expected = _full_frame_mosaic(image, _feathered_mask(mask, margin), radius, cell)
                 with self.subTest(
                     size=(height, width), radius=radius, pixel_size=pixel_size, margin=margin
                 ):
@@ -364,6 +364,77 @@ class GroupedComposeTests(unittest.TestCase):
                 np.testing.assert_array_equal(
                     together[1100:1560, 500:900], alone[1100:1560, 500:900]
                 )
+
+
+class ReductionCellTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.image = np.random.default_rng(65).integers(0, 256, (240, 320, 3), dtype=np.uint8)
+        self.objects = [
+            {"mask_polygon": _ellipse(80.3, 90.7, 40, 52)},
+            {"mask_polygon": _ellipse(300, 230, 30, 40)},
+        ]
+        self.alpha = _feathered_mask(mosaic._protected_mask(self.image.shape[:2], self.objects, 2))
+
+    def _compose(self, radius, pixel_size):
+        return mosaic._compose_protected(self.image, self.objects, radius, pixel_size, 8, 2)
+
+    def test_cap_matches_the_default_reduced_sigma(self):
+        self.assertEqual(
+            mosaic.MAX_REDUCED_SIGMA, mosaic.DEFAULT_BLUR_RADIUS / mosaic.DEFAULT_PIXEL_SIZE
+        )
+
+    def test_cell_grows_only_when_the_reduced_sigma_exceeds_the_cap(self):
+        cases = {
+            (24.0, 2): 2,
+            (0.5, 4): 4,
+            (12.0, 1): 1,
+            (12.5, 1): 2,
+            (24.0, 1): 2,
+            (36.0, 3): 3,
+            (36.5, 3): 4,
+            (64.0, 1): 6,
+            (64.0, 2): 6,
+            (64.0, 6): 6,
+            (64.0, 8): 8,
+        }
+        for (radius, pixel_size), cell in cases.items():
+            with self.subTest(radius=radius, pixel_size=pixel_size):
+                self.assertEqual(mosaic._reduction_cell(radius, pixel_size), cell)
+
+    def test_settings_within_the_cap_keep_the_requested_cell(self):
+        for pixel_size in range(1, mosaic.MAX_PIXEL_SIZE + 1):
+            limit = min(mosaic.MAX_BLUR_RADIUS, mosaic.MAX_REDUCED_SIGMA * pixel_size)
+            for radius in sorted({0.5, 4.0, limit / 2, limit - 0.25, limit}):
+                with self.subTest(radius=radius, pixel_size=pixel_size):
+                    np.testing.assert_array_equal(
+                        self._compose(radius, pixel_size),
+                        _full_frame_mosaic(self.image, self.alpha, radius, pixel_size),
+                    )
+
+    def test_large_radius_on_fine_cells_blurs_on_the_raised_cell(self):
+        for radius in (12.5, 24.0, 40.0, mosaic.MAX_BLUR_RADIUS):
+            for pixel_size in range(1, mosaic.MAX_PIXEL_SIZE + 1):
+                if radius <= mosaic.MAX_REDUCED_SIGMA * pixel_size:
+                    continue
+                cell = math.ceil(radius / mosaic.MAX_REDUCED_SIGMA)
+                with (
+                    self.subTest(radius=radius, pixel_size=pixel_size),
+                    patch("service.mosaic.cv2.GaussianBlur", wraps=cv2.GaussianBlur) as blur,
+                ):
+                    output = self._compose(radius, pixel_size)
+                    sigmas = {float(call.args[2]) for call in blur.call_args_list}
+                    self.assertEqual(sigmas, {radius / cell})
+                    self.assertLessEqual(radius / cell, mosaic.MAX_REDUCED_SIGMA)
+                    np.testing.assert_array_equal(
+                        output, _full_frame_mosaic(self.image, self.alpha, radius, cell)
+                    )
+
+    def test_raised_cell_stays_within_two_levels_of_the_requested_cell(self):
+        for radius, pixel_size in ((64.0, 1), (64.0, 2), (64.0, 4), (40.0, 1), (24.0, 1)):
+            with self.subTest(radius=radius, pixel_size=pixel_size):
+                requested = _full_frame_mosaic(self.image, self.alpha, radius, pixel_size)
+                difference = np.abs(self._compose(radius, pixel_size).astype(np.int16) - requested)
+                self.assertLessEqual(int(difference.max()), 2)
 
 
 class MosaicParamTests(unittest.TestCase):
