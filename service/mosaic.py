@@ -105,38 +105,111 @@ def _mosaic_masked_region(
     blur_radius: float,
     pixel_size: int,
 ) -> np.ndarray:
-    """Apply the protected-region transform to the smallest blur-safe crop."""
+    """Blend the frame-anchored blur into the protected bounds of one whole-frame mask."""
 
     mask_left, mask_top, mask_width, mask_height = cv2.boundingRect(blend_mask)
     if not mask_width:
         return image
+    alpha = blend_mask[mask_top : mask_top + mask_height, mask_left : mask_left + mask_width]
+    return _blend_layers(image, [(mask_left, mask_top, alpha)], blur_radius, pixel_size)
 
-    padding = math.ceil(blur_radius * 3)
-    top = max(0, mask_top - padding)
-    bottom = min(image.shape[0], mask_top + mask_height + padding)
-    left = max(0, mask_left - padding)
-    right = min(image.shape[1], mask_left + mask_width + padding)
-    region = image[top:bottom, left:right]
-    reduced_size = (
-        max(1, math.ceil(region.shape[1] / pixel_size)),
-        max(1, math.ceil(region.shape[0] / pixel_size)),
+
+def _blend_layers(
+    image: np.ndarray,
+    layers: list[tuple[int, int, np.ndarray]],
+    blur_radius: float,
+    pixel_size: int,
+) -> np.ndarray:
+    """Blend blurred pixels into each (left, top, alpha) layer; layers must not overlap."""
+
+    if not layers:
+        return image
+    height, width = image.shape[:2]
+    support = _blur_support(blur_radius, pixel_size)
+    boxes = [
+        (left, top, left + alpha.shape[1], top + alpha.shape[0]) for left, top, alpha in layers
+    ]
+    union = (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
     )
-    reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
+
+    def blur_area(box: tuple[int, int, int, int]) -> int:
+        left, top, right, bottom = box
+        return (min(width, right + support) - max(0, left - support)) * (
+            min(height, bottom + support) - max(0, top - support)
+        )
+
+    # 레이어별 블러 영역의 합이 전체를 한 번 블러하는 영역보다 크면(밀집한 얼굴) 한 번에 계산한다.
+    # 블러 값은 계산 영역과 무관하므로 어느 쪽이든 결과가 같다.
+    shared = None
+    if sum(blur_area(box) for box in boxes) >= blur_area(union):
+        shared = _frame_blur(image, union, blur_radius, pixel_size)
+
+    output = image.copy()
+    for (_, _, alpha), box in zip(layers, boxes, strict=True):
+        left, top, right, bottom = box
+        if shared is None:
+            blurred = _frame_blur(image, box, blur_radius, pixel_size)
+        else:
+            blurred = shared[top - union[1] : bottom - union[1], left - union[0] : right - union[0]]
+        # Complementary weights bound the rounded numerator to 255 * 255 + 127.
+        # uint16 preserves the exact result while halving blend-buffer bandwidth.
+        weight = alpha[:, :, None].astype(np.uint16)
+        output[top:bottom, left:right] = (
+            image[top:bottom, left:right].astype(np.uint16) * (255 - weight)
+            + blurred.astype(np.uint16) * weight
+            + 127
+        ) // 255
+    return output
+
+
+def _blur_support(blur_radius: float, pixel_size: int) -> int:
+    """Frame pixels on each side that can change one blurred pixel."""
+
+    # OpenCV 8비트 Gaussian 커널 반경은 ceil(3 * sigma) 이하다. 축소 셀과 선형 보간 이웃, 여유 한 셀을 더한다.
+    return pixel_size * (math.ceil(3 * blur_radius / pixel_size) + 3)
+
+
+def _frame_blur(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    blur_radius: float,
+    pixel_size: int,
+) -> np.ndarray:
+    """Return blurred pixels for ``box`` exactly as one whole-frame blur would produce them.
+
+    The reduction grid is anchored to frame coordinates and the crop keeps every source pixel
+    that the reduction, Gaussian, and interpolation can reach, so the values never depend on
+    where the crop starts. The frame's right and bottom edges are padded by replication to whole
+    reduction cells.
+    """
+
+    left, top, right, bottom = box
+    height, width = image.shape[:2]
+    support = _blur_support(blur_radius, pixel_size)
+    crop_top = max(0, top - support) // pixel_size * pixel_size
+    crop_left = max(0, left - support) // pixel_size * pixel_size
+    crop_bottom = min(height, -(-(bottom + support) // pixel_size) * pixel_size)
+    crop_right = min(width, -(-(right + support) // pixel_size) * pixel_size)
+    region = image[crop_top:crop_bottom, crop_left:crop_right]
+    pad_bottom, pad_right = -region.shape[0] % pixel_size, -region.shape[1] % pixel_size
+    if pad_bottom or pad_right:
+        region = cv2.copyMakeBorder(region, 0, pad_bottom, 0, pad_right, cv2.BORDER_REPLICATE)
+    reduced = cv2.resize(
+        region,
+        (region.shape[1] // pixel_size, region.shape[0] // pixel_size),
+        interpolation=cv2.INTER_AREA,
+    )
     reduced_sigma = blur_radius / pixel_size
     blurred = cv2.resize(
         cv2.GaussianBlur(reduced, (0, 0), reduced_sigma, reduced_sigma),
         (region.shape[1], region.shape[0]),
         interpolation=cv2.INTER_LINEAR,
     )
-    output = image.copy()
-    # Complementary weights bound the rounded numerator to 255 * 255 + 127.
-    # uint16 preserves the exact result while halving blend-buffer bandwidth.
-    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint16)
-    inverse_alpha = 255 - alpha
-    output[top:bottom, left:right] = (
-        region.astype(np.uint16) * inverse_alpha + blurred.astype(np.uint16) * alpha + 127
-    ) // 255
-    return output
+    return blurred[top - crop_top : bottom - crop_top, left - crop_left : right - crop_left]
 
 
 def _encode_yuv420p(image: np.ndarray) -> bytes:

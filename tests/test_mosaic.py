@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import unittest
 from unittest.mock import patch
 
@@ -35,36 +34,28 @@ def _full_frame_feathered_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def _full_frame_mosaic(image, blend_mask, blur_radius, pixel_size):
-    """Reference: the previous whole-frame protected-region bounds."""
-    rows, columns = np.nonzero(blend_mask)
-    if not rows.size:
+    """Reference: blur the whole frame on the frame-anchored grid, then blend every pixel."""
+    if not np.any(blend_mask):
         return image
-    padding = math.ceil(blur_radius * 3)
-    top = max(0, int(rows.min()) - padding)
-    bottom = min(image.shape[0], int(rows.max()) + padding + 1)
-    left = max(0, int(columns.min()) - padding)
-    right = min(image.shape[1], int(columns.max()) + padding + 1)
-    region = image[top:bottom, left:right]
+    height, width = image.shape[:2]
+    padded = cv2.copyMakeBorder(
+        image, 0, -height % pixel_size, 0, -width % pixel_size, cv2.BORDER_REPLICATE
+    )
     reduced = cv2.resize(
-        region,
-        (
-            max(1, math.ceil(region.shape[1] / pixel_size)),
-            max(1, math.ceil(region.shape[0] / pixel_size)),
-        ),
+        padded,
+        (padded.shape[1] // pixel_size, padded.shape[0] // pixel_size),
         interpolation=cv2.INTER_AREA,
     )
     sigma = blur_radius / pixel_size
     blurred = cv2.resize(
         cv2.GaussianBlur(reduced, (0, 0), sigma, sigma),
-        (region.shape[1], region.shape[0]),
+        (padded.shape[1], padded.shape[0]),
         interpolation=cv2.INTER_LINEAR,
-    )
-    output = image.copy()
-    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint32)
-    output[top:bottom, left:right] = (
-        region.astype(np.uint32) * (255 - alpha) + blurred.astype(np.uint32) * alpha + 127
-    ) // 255
-    return output
+    )[:height, :width]
+    alpha = blend_mask[:, :, None].astype(np.uint32)
+    return (
+        (image.astype(np.uint32) * (255 - alpha) + blurred.astype(np.uint32) * alpha + 127) // 255
+    ).astype(np.uint8)
 
 
 class MosaicTests(unittest.TestCase):
