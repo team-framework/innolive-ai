@@ -65,10 +65,7 @@ def mosaic_jpeg(
         raise ValueError(f"mosaic byte limit must be in 1..{MAX_JPEG_BYTES}")
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
-    mask = _protected_mask(image.shape[:2], objects, mask_pad)
-    output = _mosaic_masked_region(
-        image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
-    )
+    output = _compose_protected(image, objects, blur_radius, pixel_size, mask_margin, mask_pad)
 
     return _encode_jpeg(output, max_bytes)
 
@@ -91,12 +88,43 @@ def mosaic_yuv420p(
         raise ValueError("raw mosaic requires even dimensions")
     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
 
-    mask = _protected_mask(image.shape[:2], objects, mask_pad)
-    output = _mosaic_masked_region(
-        image, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
-    )
+    output = _compose_protected(image, objects, blur_radius, pixel_size, mask_margin, mask_pad)
 
     return _encode_yuv420p(output)
+
+
+def _compose_protected(
+    image: np.ndarray,
+    objects: list[dict[str, Any]],
+    blur_radius: float,
+    pixel_size: int,
+    mask_margin: int,
+    mask_pad: int,
+) -> np.ndarray:
+    """Blur every protected object, computing each group of nearby objects in its own crop.
+
+    The result equals one whole-frame mask and blur pass. Objects farther apart than their mask
+    reach cannot change each other's blend weights, and blurred pixels come from the
+    frame-anchored blur, so far-apart faces no longer pull the empty space between them into
+    the work area.
+    """
+    _validate_mask_pad(mask_pad)
+    height, width = image.shape[:2]
+    polygons = _protected_polygons(objects, width, height)
+    mask_margin = validate_mask_margin(mask_margin)
+    # 보호 픽셀에서 pad만큼 팽창하고 margin만큼 페더가 번지며, 페더 계산은 한 픽셀을 더 본다.
+    reach = mask_pad + mask_margin + 1
+    layers = []
+    for left, top, right, bottom, members in _group_polygons(polygons, reach, width, height):
+        offset = np.array((left, top), dtype=np.int32)
+        mask = _fill_polygons(
+            (bottom - top, right - left), [polygon - offset for polygon in members], mask_pad
+        )
+        alpha = _feathered_mask(mask, mask_margin)
+        x, y, alpha_width, alpha_height = cv2.boundingRect(alpha)
+        if alpha_width:
+            layers.append((left + x, top + y, alpha[y : y + alpha_height, x : x + alpha_width]))
+    return _blend_layers(image, layers, blur_radius, pixel_size)
 
 
 def _mosaic_masked_region(
@@ -105,38 +133,111 @@ def _mosaic_masked_region(
     blur_radius: float,
     pixel_size: int,
 ) -> np.ndarray:
-    """Apply the protected-region transform to the smallest blur-safe crop."""
+    """Blend the frame-anchored blur into the protected bounds of one whole-frame mask."""
 
     mask_left, mask_top, mask_width, mask_height = cv2.boundingRect(blend_mask)
     if not mask_width:
         return image
+    alpha = blend_mask[mask_top : mask_top + mask_height, mask_left : mask_left + mask_width]
+    return _blend_layers(image, [(mask_left, mask_top, alpha)], blur_radius, pixel_size)
 
-    padding = math.ceil(blur_radius * 3)
-    top = max(0, mask_top - padding)
-    bottom = min(image.shape[0], mask_top + mask_height + padding)
-    left = max(0, mask_left - padding)
-    right = min(image.shape[1], mask_left + mask_width + padding)
-    region = image[top:bottom, left:right]
-    reduced_size = (
-        max(1, math.ceil(region.shape[1] / pixel_size)),
-        max(1, math.ceil(region.shape[0] / pixel_size)),
+
+def _blend_layers(
+    image: np.ndarray,
+    layers: list[tuple[int, int, np.ndarray]],
+    blur_radius: float,
+    pixel_size: int,
+) -> np.ndarray:
+    """Blend blurred pixels into each (left, top, alpha) layer; layers must not overlap."""
+
+    if not layers:
+        return image
+    height, width = image.shape[:2]
+    support = _blur_support(blur_radius, pixel_size)
+    boxes = [
+        (left, top, left + alpha.shape[1], top + alpha.shape[0]) for left, top, alpha in layers
+    ]
+    union = (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
     )
-    reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
+
+    def blur_area(box: tuple[int, int, int, int]) -> int:
+        left, top, right, bottom = box
+        return (min(width, right + support) - max(0, left - support)) * (
+            min(height, bottom + support) - max(0, top - support)
+        )
+
+    # 레이어별 블러 영역의 합이 전체를 한 번 블러하는 영역보다 크면(밀집한 얼굴) 한 번에 계산한다.
+    # 블러 값은 계산 영역과 무관하므로 어느 쪽이든 결과가 같다.
+    shared = None
+    if sum(blur_area(box) for box in boxes) >= blur_area(union):
+        shared = _frame_blur(image, union, blur_radius, pixel_size)
+
+    output = image.copy()
+    for (_, _, alpha), box in zip(layers, boxes, strict=True):
+        left, top, right, bottom = box
+        if shared is None:
+            blurred = _frame_blur(image, box, blur_radius, pixel_size)
+        else:
+            blurred = shared[top - union[1] : bottom - union[1], left - union[0] : right - union[0]]
+        # Complementary weights bound the rounded numerator to 255 * 255 + 127.
+        # uint16 preserves the exact result while halving blend-buffer bandwidth.
+        weight = alpha[:, :, None].astype(np.uint16)
+        output[top:bottom, left:right] = (
+            image[top:bottom, left:right].astype(np.uint16) * (255 - weight)
+            + blurred.astype(np.uint16) * weight
+            + 127
+        ) // 255
+    return output
+
+
+def _blur_support(blur_radius: float, pixel_size: int) -> int:
+    """Frame pixels on each side that can change one blurred pixel."""
+
+    # OpenCV 8비트 Gaussian 커널 반경은 ceil(3 * sigma) 이하다. 축소 셀과 선형 보간 이웃, 여유 한 셀을 더한다.
+    return pixel_size * (math.ceil(3 * blur_radius / pixel_size) + 3)
+
+
+def _frame_blur(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    blur_radius: float,
+    pixel_size: int,
+) -> np.ndarray:
+    """Return blurred pixels for ``box`` exactly as one whole-frame blur would produce them.
+
+    The reduction grid is anchored to frame coordinates and the crop keeps every source pixel
+    that the reduction, Gaussian, and interpolation can reach, so the values never depend on
+    where the crop starts. The frame's right and bottom edges are padded by replication to whole
+    reduction cells.
+    """
+
+    left, top, right, bottom = box
+    height, width = image.shape[:2]
+    support = _blur_support(blur_radius, pixel_size)
+    crop_top = max(0, top - support) // pixel_size * pixel_size
+    crop_left = max(0, left - support) // pixel_size * pixel_size
+    crop_bottom = min(height, -(-(bottom + support) // pixel_size) * pixel_size)
+    crop_right = min(width, -(-(right + support) // pixel_size) * pixel_size)
+    region = image[crop_top:crop_bottom, crop_left:crop_right]
+    pad_bottom, pad_right = -region.shape[0] % pixel_size, -region.shape[1] % pixel_size
+    if pad_bottom or pad_right:
+        region = cv2.copyMakeBorder(region, 0, pad_bottom, 0, pad_right, cv2.BORDER_REPLICATE)
+    reduced = cv2.resize(
+        region,
+        (region.shape[1] // pixel_size, region.shape[0] // pixel_size),
+        interpolation=cv2.INTER_AREA,
+    )
     reduced_sigma = blur_radius / pixel_size
     blurred = cv2.resize(
         cv2.GaussianBlur(reduced, (0, 0), reduced_sigma, reduced_sigma),
         (region.shape[1], region.shape[0]),
         interpolation=cv2.INTER_LINEAR,
     )
-    output = image.copy()
-    # Complementary weights bound the rounded numerator to 255 * 255 + 127.
-    # uint16 preserves the exact result while halving blend-buffer bandwidth.
-    alpha = blend_mask[top:bottom, left:right, None].astype(np.uint16)
-    inverse_alpha = 255 - alpha
-    output[top:bottom, left:right] = (
-        region.astype(np.uint16) * inverse_alpha + blurred.astype(np.uint16) * alpha + 127
-    ) // 255
-    return output
+    return blurred[top - crop_top : bottom - crop_top, left - crop_left : right - crop_left]
 
 
 def _encode_yuv420p(image: np.ndarray) -> bytes:
@@ -176,14 +277,64 @@ def _protected_mask(
     pad: int = 0,
 ) -> np.ndarray:
     """Fill protected polygons, then widen them by ``pad`` fully opaque pixels."""
+    _validate_mask_pad(pad)
+    height, width = dimensions
+    return _fill_polygons(dimensions, _protected_polygons(objects, width, height), pad)
+
+
+def _validate_mask_pad(pad: Any) -> None:
     if isinstance(pad, bool) or not isinstance(pad, int) or not 0 <= pad <= MAX_MASK_PAD:
         raise ValueError(f"mask pad must be an integer in 0..{MAX_MASK_PAD}")
+
+
+def _protected_polygons(objects: list[dict[str, Any]], width: int, height: int) -> list[np.ndarray]:
+    """Validate the polygons that must be blurred; whitelisted faces are skipped, plates never."""
+    return [
+        _polygon(item.get("mask_polygon"), width, height)
+        for item in objects
+        if item.get("whitelisted") is not True or is_number_plate_object(item)
+    ]
+
+
+def _group_polygons(
+    polygons: list[np.ndarray], reach: int, width: int, height: int
+) -> list[tuple[int, int, int, int, list[np.ndarray]]]:
+    """Group polygons whose bounds widened by ``reach`` overlap; return each group's crop.
+
+    Crops of different groups never overlap, so no protected pixel of one group lies within
+    ``reach`` of another group.
+    """
+    groups: list[tuple[int, int, int, int, list[np.ndarray]]] = []
+    for polygon in polygons:
+        x, y, box_width, box_height = cv2.boundingRect(polygon)
+        left, top = max(0, x - reach), max(0, y - reach)
+        right, bottom = min(width, x + box_width + reach), min(height, y + box_height + reach)
+        members = [polygon]
+        # 합쳐서 커진 영역이 다른 그룹과 다시 겹칠 수 있으므로 겹치는 그룹이 없을 때까지 흡수한다.
+        merged = True
+        while merged:
+            merged = False
+            for index, (g_left, g_top, g_right, g_bottom, g_members) in enumerate(groups):
+                if left < g_right and g_left < right and top < g_bottom and g_top < bottom:
+                    del groups[index]
+                    left, top = min(left, g_left), min(top, g_top)
+                    right, bottom = max(right, g_right), max(bottom, g_bottom)
+                    members = g_members + members
+                    merged = True
+                    break
+        groups.append((left, top, right, bottom, members))
+    return groups
+
+
+def _fill_polygons(
+    dimensions: tuple[int, int],
+    polygons: list[np.ndarray],
+    pad: int,
+) -> np.ndarray:
+    """Fill validated polygons, then widen them by ``pad`` fully opaque pixels."""
     height, width = dimensions
     mask = np.zeros((height, width), dtype=np.uint8)
-    for item in objects:
-        if item.get("whitelisted") is True and not is_number_plate_object(item):
-            continue
-        polygon = _polygon(item.get("mask_polygon"), width, height)
+    for polygon in polygons:
         cv2.fillPoly(mask, [polygon], 255)
     if not pad:
         return mask

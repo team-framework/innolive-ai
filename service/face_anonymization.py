@@ -25,11 +25,9 @@ from service.face_presets import (
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
 from service.mosaic import (
     DEFAULT_MASK_MARGIN,
+    _compose_protected,
     _encode_jpeg,
     _encode_yuv420p,
-    _feathered_mask,
-    _mosaic_masked_region,
-    _protected_mask,
 )
 
 LOGGER = logging.getLogger("innolive.face_swap")
@@ -209,8 +207,7 @@ class FaceAnonymizationRuntime:
             return b""
         # Apply failed/held face and number-plate blur last so it takes precedence
         # over nearby successful swaps. Whitelist exclusions use the usual mask.
-        mask = _protected_mask(image.shape[:2], remaining, mask_pad)
-        output = _mosaic_masked_region(
-            output, _feathered_mask(mask, mask_margin), blur_radius, pixel_size
+        output = _compose_protected(
+            output, remaining, blur_radius, pixel_size, mask_margin, mask_pad
         )
         return _encode_yuv420p(output) if pix_fmt else _encode_jpeg(output, max_bytes)
