@@ -7,12 +7,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from service.runtime import (
     IMAGE_SIZE,
+    MAX_POLYGON_POINTS,
     RuntimeConfig,
     RuntimeManager,
+    _limit_polygon_points,
+    detector_mask_pad,
     select_runtime,
     validate_engine,
 )
@@ -115,6 +119,124 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
         self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
         self.assertEqual(model.kwargs["classes"], [0, 1])
+        self.assertIs(model.kwargs["retina_masks"], False)
+
+    def test_mask_pad_is_one_detector_mask_pixel_in_output_pixels(self):
+        cases = {(1920, 1080): 3, (1080, 1920): 3, (1280, 720): 2, (640, 360): 1, (64, 64): 1}
+        for (height, width), expected in cases.items():
+            with self.subTest(height=height, width=width):
+                self.assertEqual(detector_mask_pad(height, width), expected)
+        for height, width in ((0, 640), (640, 0)):
+            with self.subTest(height=height, width=width), self.assertRaises(ValueError):
+                detector_mask_pad(height, width)
+
+
+class _FakePrediction:
+    class boxes:
+        """Mimics the ultralytics ``prediction.boxes.cpu().numpy()`` chain."""
+
+        @staticmethod
+        def cpu():
+            return _FakePrediction.boxes
+
+        @staticmethod
+        def numpy():
+            return "boxes"
+
+
+class _MotionTracker:
+    motion_precomputable = True
+
+    def __init__(self):
+        self.events: list[str] = []
+        self.motion_thread: str | None = None
+        self.received = "unset"
+
+    def estimate_motion(self, image):
+        import threading
+        import time
+
+        self.motion_thread = threading.current_thread().name
+        time.sleep(0.05)
+        self.events.append("motion")
+        return "warp"
+
+    stop_after_update = False
+
+    def update(self, boxes, image, *, motion="unset"):
+        self.received = motion
+        if self.stop_after_update:
+            raise RuntimeError("stop after the tracker received the warp")
+        return np.zeros((0, 8), dtype=np.float32)
+
+
+class ParallelMotionTests(unittest.TestCase):
+    def _runtime(self, predict):
+        from concurrent.futures import ThreadPoolExecutor
+
+        runtime = RuntimeManager.__new__(RuntimeManager)
+        runtime.backend = "tensorrt"
+        runtime._predict = predict
+        runtime._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
+        self.addCleanup(runtime._motion_executor.shutdown, wait=True)
+        return runtime
+
+    def test_motion_runs_beside_inference_and_reaches_the_tracker(self):
+        from service.runtime import TrackingFailure
+
+        tracker = _MotionTracker()
+        tracker.stop_after_update = True
+
+        def predict(image):
+            tracker.events.append("predict")
+            return _FakePrediction()
+
+        runtime = self._runtime(predict)
+        with self.assertRaises(TrackingFailure):
+            runtime._infer_sync(np.zeros((8, 8, 3), dtype=np.uint8), tracker)
+        self.assertEqual(tracker.received, "warp")
+        self.assertTrue(tracker.motion_thread.startswith("b1-motion"))
+        self.assertEqual(tracker.events, ["predict", "motion"])
+
+    def test_inference_failure_waits_for_motion_before_raising(self):
+        from service.runtime import InferenceFailure
+
+        tracker = _MotionTracker()
+
+        def predict(image):
+            raise RuntimeError("engine")
+
+        runtime = self._runtime(predict)
+        with self.assertRaises(InferenceFailure):
+            runtime._infer_sync(np.zeros((8, 8, 3), dtype=np.uint8), tracker)
+        self.assertEqual(tracker.events, ["motion"])
+        self.assertEqual(tracker.received, "unset")
+
+
+class PolygonLimitTests(unittest.TestCase):
+    @staticmethod
+    def contour(mask: np.ndarray) -> np.ndarray:
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        return contours[0].reshape((-1, 2)).astype(np.float32)
+
+    def test_short_contour_is_kept_as_is(self):
+        polygon = np.asarray([[0, 0], [10, 0], [10, 10]], dtype=np.float32)
+        self.assertIs(_limit_polygon_points(polygon), polygon)
+
+    def test_mask_cut_by_frame_corner_keeps_the_corner(self):
+        height, width = 720, 1280
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.ellipse(mask, (1230, 690), (170, 230), 0, 0, 360, 1, -1)
+        contour = self.contour(mask)
+        self.assertGreater(len(contour), MAX_POLYGON_POINTS)
+
+        limited = _limit_polygon_points(contour)
+
+        self.assertLessEqual(len(limited), MAX_POLYGON_POINTS)
+        self.assertIn([width - 1, height - 1], limited.tolist())
+        covered = np.zeros_like(mask)
+        cv2.fillPoly(covered, [np.rint(limited).astype(np.int32)], 1)
+        self.assertGreaterEqual((mask & covered).sum() / mask.sum(), 0.99)
 
 
 if __name__ == "__main__":

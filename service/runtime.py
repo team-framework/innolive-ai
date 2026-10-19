@@ -6,11 +6,12 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import platform
 import threading
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,10 +36,24 @@ IMAGE_SIZE = 640
 STANDARD_PROFILE = "B1-640-Q90-W5"
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
+POLYGON_EPSILON_START = 0.5
+POLYGON_EPSILON_GROWTH = 1.25
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
 DEFAULT_ENGINE = ROOT / "models" / "best_b1.engine"
+
+
+def detector_mask_pad(height: int, width: int) -> int:
+    """Output pixels spanned by one detector mask pixel, used to widen protected regions.
+
+    Mask outlines come from the IMAGE_SIZE letterboxed mask, so their edges can sit up to one
+    mask pixel inside the face. 1080x1920 frames measured 1-3px shrinkage; padding by one mask
+    pixel covers it.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    return math.ceil(max(height, width) / IMAGE_SIZE)
 
 
 class InferenceFailure(RuntimeError):
@@ -233,6 +248,9 @@ class RuntimeManager:
         self.ready = False
         self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
+        # GMC는 화면만 쓰므로 같은 프레임의 GPU 추론과 동시에 계산한다. 추론 줄이 한 번에 한 프레임만
+        # 처리하므로 스레드 하나로 충분하다.
+        self._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
         self._lane: asyncio.Lock | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
@@ -272,7 +290,10 @@ class RuntimeManager:
                 iou=0.70,
                 classes=list(EXPECTED_CLASS_NAMES),
                 max_det=MAX_DETECTIONS,
-                retina_masks=True,
+                # 마스크 윤곽을 640 기준 마스크에서 뽑는다. 원본 해상도 업샘플링은 FHD 프레임 시간의
+                # 절반 가까이를 쓰지만 윤곽은 어차피 64점으로 줄어든다. 줄어든 경계는
+                # detector_mask_pad만큼 보호 영역을 넓혀 보정한다.
+                retina_masks=False,
                 device=self.device,
                 verbose=False,
             )
@@ -302,14 +323,24 @@ class RuntimeManager:
 
     def _infer_sync(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
         started = time.perf_counter()
+        motion = None
+        motion_executor = getattr(self, "_motion_executor", None)
+        if motion_executor is not None and getattr(tracker, "motion_precomputable", False):
+            motion = motion_executor.submit(tracker.estimate_motion, image)
         try:
             prediction = self._predict(image)
         except Exception as error:
+            if motion is not None:
+                # 스트림 정리 전에 이 프레임의 GMC가 끝나야 추적기 상태를 함께 쓰지 않는다.
+                wait([motion])
             raise InferenceFailure(f"{self.backend} inference failed") from error
         inferred_at = time.perf_counter()
         try:
             boxes = prediction.boxes.cpu().numpy()
-            tracks = tracker.update(boxes, image)
+            if motion is None:
+                tracks = tracker.update(boxes, image)
+            else:
+                tracks = tracker.update(boxes, image, motion=motion.result())
         except Exception as error:
             raise TrackingFailure("BoT-SORT update failed") from error
         tracked_at = time.perf_counter()
@@ -370,8 +401,7 @@ class RuntimeManager:
             if detection_index < len(polygons):
                 polygon = np.asarray(polygons[detection_index], dtype=np.float32)
                 if len(polygon):
-                    stride = max(1, int(np.ceil(len(polygon) / MAX_POLYGON_POINTS)))
-                    polygon = polygon[::stride][:MAX_POLYGON_POINTS]
+                    polygon = _limit_polygon_points(polygon)
                     points = [
                         [
                             round(float(np.clip(x, 0, width - 1)), 1),
@@ -438,10 +468,30 @@ class RuntimeManager:
         self.ready = False
         self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self, "_motion_executor"):
+            self._motion_executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_model"):
             del self._model
         with self._guard:
             type(self)._live_instances = max(0, type(self)._live_instances - 1)
+
+
+def _limit_polygon_points(polygon: np.ndarray) -> np.ndarray:
+    """Reduce a mask contour to the wire point limit without cutting off its corners.
+
+    Contours use CHAIN_APPROX_SIMPLE, so a straight run such as a frame edge is only its two
+    end points. Douglas-Peucker keeps those turning points and bounds the deviation by the
+    smallest epsilon that fits, where index sampling could drop a corner and cut across the mask.
+    """
+    if len(polygon) <= MAX_POLYGON_POINTS:
+        return polygon
+    contour = polygon.reshape((-1, 1, 2))
+    epsilon = POLYGON_EPSILON_START
+    while True:
+        simplified = cv2.approxPolyDP(contour, epsilon, True).reshape((-1, 2))
+        if len(simplified) <= MAX_POLYGON_POINTS:
+            return simplified
+        epsilon *= POLYGON_EPSILON_GROWTH
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:

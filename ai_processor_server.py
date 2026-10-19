@@ -50,9 +50,11 @@ from service.frame import (
 from service.grpc_config import listen_address, server_options
 from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
+    DEFAULT_MASK_MARGIN,
     DEFAULT_PIXEL_SIZE,
     mosaic_jpeg,
     mosaic_yuv420p,
+    validate_mask_margin,
     validate_mosaic_params,
 )
 from service.protocol import MAX_GRPC_RESPONSE_BYTES, MAX_JPEG_BYTES
@@ -79,6 +81,7 @@ from service.runtime import (
     RuntimeConfig,
     RuntimeManager,
     TrackingFailure,
+    detector_mask_pad,
 )
 from service.tracking import StreamTracker
 
@@ -323,6 +326,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
 
         blur_radius = DEFAULT_BLUR_RADIUS
         pixel_size = DEFAULT_PIXEL_SIZE
+        mask_margin = DEFAULT_MASK_MARGIN
         render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
         if render or stream.anonymization_mode != MODES["blur"]:
             config = request.mosaic_config
@@ -331,8 +335,11 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     blur_radius = float(config.blur_radius)
                 if config.HasField("pixel_size"):
                     pixel_size = int(config.pixel_size)
+                if config.HasField("mask_margin"):
+                    mask_margin = int(config.mask_margin)
                 try:
                     blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
+                    mask_margin = validate_mask_margin(mask_margin)
                 except ValueError as error:
                     return FrameOutcome(
                         self._error_response(
@@ -408,6 +415,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
         if render or stream.anonymization_mode != MODES["blur"]:
             mosaic_started = time.perf_counter()
+            mask_pad = detector_mask_pad(*image.shape[:2])
             try:
                 if stream.anonymization_mode != MODES["blur"]:
                     compose = partial(
@@ -421,6 +429,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                         pix_fmt=request.pix_fmt,
                         blur_radius=blur_radius,
                         pixel_size=pixel_size,
+                        mask_margin=mask_margin,
+                        mask_pad=mask_pad,
                         max_bytes=self.settings.max_jpeg_bytes,
                     )
                     processed_data = await self._compose_frame(compose, face_anonymization=True)
@@ -435,6 +445,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             objects,
                             blur_radius=blur_radius,
                             pixel_size=pixel_size,
+                            mask_margin=mask_margin,
+                            mask_pad=mask_pad,
                         )
                     else:
                         compose = partial(
@@ -443,6 +455,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                             objects,
                             blur_radius=blur_radius,
                             pixel_size=pixel_size,
+                            mask_margin=mask_margin,
+                            mask_pad=mask_pad,
                             max_bytes=self.settings.max_jpeg_bytes,
                         )
                     processed_data = await self._compose_frame(compose)

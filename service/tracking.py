@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
-from ultralytics.trackers.utils.stracks import parse_bboxes
-from ultralytics.utils import YAML, IterableSimpleNamespace
+from ultralytics.trackers.utils.stracks import multi_gmc, parse_bboxes
+from ultralytics.utils import LOGGER, YAML, IterableSimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "botsort.yaml"
@@ -18,6 +18,12 @@ CONTINUATION_CONFIDENCE = 0.05
 ACTIVATION_CONFIDENCE = 0.25
 MAX_MASK_HOLD_FRAMES = 1
 HOLD_CONFIDENCE_DECAY = 0.90
+# 검출 결과를 쓰는 GMC 방식. 이 방식은 검출 전에 미리 계산할 수 없다.
+DETECTION_DEPENDENT_GMC = frozenset({"orb", "sift"})
+# GMC 입력 장변 상한. ultralytics 기본 축소 배율 2는 720p를 640×360으로 계산하지만 FHD는 960×540으로
+# 2.25배를 계산한다(#62). 첫 프레임 장변으로 배율을 정해 FHD도 720p와 같은 640×360으로 계산한다.
+GMC_MAX_LONG_EDGE = 640
+GMC_MIN_DOWNSCALE = 2
 
 
 @dataclass
@@ -51,6 +57,21 @@ class _ConnectionBOTSORT(BOTSORT):
             {"_local_count": 0},
         )
         super().__init__(args)
+        self._prepared_warp: np.ndarray | Exception | None = None
+
+    def _pre_first_associate(
+        self, strack_pool: list[BOTrack], unconfirmed: list[BOTrack], img: Any, results_high: Any
+    ) -> None:
+        """Use the GMC warp prepared for this frame, or compute it as the base tracker does."""
+        prepared, self._prepared_warp = self._prepared_warp, None
+        if prepared is None or img is None:
+            super()._pre_first_associate(strack_pool, unconfirmed, img, results_high)
+            return
+        if isinstance(prepared, Exception):
+            LOGGER.warning(f"GMC failed, falling back to identity: {prepared}")
+            prepared = np.eye(2, 3)
+        multi_gmc(strack_pool, prepared)
+        multi_gmc(unconfirmed, prepared)
 
     def reset_id(self) -> None:
         self._track_class.reset_id()
@@ -110,13 +131,48 @@ class StreamTracker:
         self._tracker = _ConnectionBOTSORT(IterableSimpleNamespace(**values))
         self._masks: dict[int, _MaskState] = {}
         self._mask_hold_frames = mask_hold_frames
+        self._gmc_scaled = False
 
     @property
     def frame_id(self) -> int:
         return self._tracker.frame_id
 
-    def update(self, boxes: Any, image: np.ndarray) -> np.ndarray:
-        return self._tracker.update(boxes, image)
+    @property
+    def motion_precomputable(self) -> bool:
+        """Whether the frame's GMC warp does not depend on detections and can run beside inference."""
+        gmc = getattr(self._tracker, "gmc", None)
+        return gmc is not None and gmc.method not in DETECTION_DEPENDENT_GMC
+
+    def _fit_gmc_scale(self, image: np.ndarray | None) -> None:
+        """Fix the GMC downscale from the stream's first frame; later frames keep the same scale."""
+        gmc = getattr(self._tracker, "gmc", None)
+        if self._gmc_scaled or gmc is None or image is None:
+            return
+        long_edge = max(image.shape[:2])
+        gmc.downscale = max(GMC_MIN_DOWNSCALE, -(-long_edge // GMC_MAX_LONG_EDGE))
+        self._gmc_scaled = True
+
+    def estimate_motion(self, image: np.ndarray) -> np.ndarray | Exception:
+        """Compute this frame's GMC warp exactly as ``update`` would; pass it to the next ``update``.
+
+        Call once per frame in frame order. A failure is returned, not raised, so ``update`` keeps the
+        base tracker's identity fallback.
+        """
+        self._fit_gmc_scale(image)
+        try:
+            return self._tracker.gmc.apply(image)
+        except Exception as error:
+            return error
+
+    def update(
+        self, boxes: Any, image: np.ndarray, *, motion: np.ndarray | Exception | None = None
+    ) -> np.ndarray:
+        self._fit_gmc_scale(image)
+        self._tracker._prepared_warp = motion
+        try:
+            return self._tracker.update(boxes, image)
+        finally:
+            self._tracker._prepared_warp = None
 
     def stabilize(
         self,

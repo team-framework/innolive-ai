@@ -184,23 +184,55 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 - `CreateSession` · `ListSessions` · `DeleteSession`: in-memory session lifecycle 관리
 - Python client: `grpc_client.VideoProcessorClient`
 
-### 모자이크 강도 실시간 설정 (`MosaicConfig`)
+### 모자이크 강도·영역 실시간 설정 (`MosaicConfig`)
 
 `VIDEO_OUTPUT_MODE_MOSAIC_JPEG` 스트림에서 `VideoChunk.mosaic_config`로
-프레임 단위로 모자이크 강도를 지정할 수 있습니다. 지정하지 않으면 서버 기본값
-(`blur_radius 24`, `pixel_size 2`)을 사용하고, 스트림이 열린 상태에서도
-다음 프레임부터 원하는 값으로 바꿀 수 있습니다. 설정은 해당 `ProcessVideo`
-콜(스트림)에만 적용되며 다른 세션이나 다른 스트림에는 전파되지 않습니다.
+프레임 단위로 모자이크 강도와 영역을 지정할 수 있습니다. 지정하지 않으면 서버 기본값
+(`blur_radius 24`, `pixel_size 2`, `mask_margin 8`)을 사용하고, 스트림이 열린 상태에서도
+다음 프레임부터 원하는 값으로 바꿀 수 있습니다. 설정은 해당 프레임에만 적용됩니다.
+다음 프레임에서 생략하면 기본값으로 돌아가며 다른 세션이나 스트림에는 전파되지 않습니다.
 
 | 필드 | 타입 | 범위 | 의미 |
 | --- | --- | --- | --- |
 | `blur_radius` | `double` | `(0, 64]` | 가우시안 블러 반경(px). 클수록 더 흐림 |
 | `pixel_size` | `uint32` | `1..8` | 모자이크 블록 크기(px). `1`은 픽셀화 비활성(순수 블러) |
+| `mask_margin` | `uint32` | `0..64` | 입력 프레임 기준 윤곽선 바깥 확장 폭(px). 바깥 최대 8px만 부드럽게 전환 |
 
-두 필드 모두 `optional`이라 한쪽만 지정할 수 있으며 unset 필드는 서버 기본값을
+세 필드 모두 `optional`이라 필요한 값만 지정할 수 있으며 unset 필드는 서버 기본값을
 사용합니다. 범위를 벗어나면 해당 프레임만 `MOSAIC_CONFIG_INVALID` 에러를 받고
 스트림은 유지됩니다(에러 응답에는 픽셀이 포함되지 않습니다). Python client에서는
-`VideoFrame(mosaic=MosaicConfig(blur_radius=..., pixel_size=...))`으로 전달합니다.
+`VideoFrame(mosaic=MosaicConfig(blur_radius=..., pixel_size=..., mask_margin=...))`으로 전달합니다.
+
+`mask_margin=0`은 확장만 제거하며 검출 윤곽선 내부 전체에 블러를 유지합니다.
+`4`는 기본보다 좁게, `16`·`32`·`64`은 더 넓게 적용합니다. 큰 값에서는
+확장 영역에도 동일한 블러 강도를 적용하고 마지막 최대 8px만 부드럽게 전환하므로
+영역 크기의 차이가 뚜렷하게 나타납니다. 음수 축소는 허용하지 않으며
+유효한 값을 보정하거나 다른 값으로 대체하지 않습니다. 영역 하한은 검출 마스크의 보호를
+보장하는 것으로, 기존 `blur_radius`의 강도 계약이나 검출 정확도를 바꾸지는 않습니다.
+미지정 또는 명시적인 `8`은 기존 8px 경계 처리와 동일한 결과를 유지합니다.
+추가 값은 큰 팽창 커널 대신 거리 변환으로 처리하여 확장 폭에 따른 계산량 증가를 제한합니다.
+
+gRPC 요청의 `mosaic_config`에 다음과 같이 지정합니다. 정수 `0`은 생략과 구분됩니다.
+
+```json
+{
+  "output_mode": 2,
+  "mosaic_config": {
+    "mask_margin": 16
+  }
+}
+```
+
+새 필드는 `MosaicConfig`의 field 3에 추가되며 기존 번호·타입·응답은 유지됩니다.
+기존 클라이언트는 재생성 없이 기존 기본값으로 동작합니다. 새 필드를 사용하려면 서버를
+업데이트하고 클라이언트 protobuf 코드를 재생성해야 합니다. 구버전 서버는 새 필드를
+무시하고 기존 8px 영역을 사용하므로 서버부터 배포합니다.
+
+JPEG·raw yuv420p의 블러, 번호판, 얼굴 합성 실패 시 fallback에 동일하게 적용됩니다.
+성공한 face swap의 합성 영역과 응답 `faces[].polygon`·`bbox` 좌표는 변경하지 않습니다.
+`output_mode=1`과 기본 `anonymization_mode=0`인 메타데이터 전용 모드에서는 기존처럼
+`mosaic_config` 검증과 블러를 생략합니다. 클라이언트 블러에는 반환된 윤곽선과 클라이언트가
+보관한 영역·강도 설정을 사용합니다.
 
 브라우저 demo gateway는 `POST /api/infer-image?session_id=...`에 JPEG·PNG·WebP를 raw body로
 받습니다. 입력은 long edge 640 이하로 resize한 뒤 gRPC `ProcessVideo`에 전달하며, 응답에는
