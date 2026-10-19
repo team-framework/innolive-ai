@@ -34,6 +34,10 @@ def _full_frame_feathered_mask(mask: np.ndarray) -> np.ndarray:
     return feathered
 
 
+# 기본 설정(24, 2)이 실제로 블러를 계산하는 축소 격자. 축소 sigma 상한 때문에 2보다 크다(#67).
+DEFAULT_CELL = mosaic._reduction_cell(mosaic.DEFAULT_BLUR_RADIUS, mosaic.DEFAULT_PIXEL_SIZE)
+
+
 def _full_frame_mosaic(image, blend_mask, blur_radius, pixel_size):
     """Reference: blur the whole frame on the frame-anchored grid, then blend every pixel."""
     if not np.any(blend_mask):
@@ -212,7 +216,7 @@ class MosaicTests(unittest.TestCase):
         ):
             mask = mosaic._protected_mask(image.shape[:2], objects)
             expected = _full_frame_mosaic(
-                image, _full_frame_feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, 2
+                image, _full_frame_feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, DEFAULT_CELL
             )
             with self.subTest(objects=len(objects)):
                 self.assertEqual(mosaic_yuv420p(image, objects), mosaic._encode_yuv420p(expected))
@@ -302,7 +306,7 @@ class GroupedComposeTests(unittest.TestCase):
         ]
         mask = mosaic._protected_mask(image.shape[:2], objects, 3)
         expected = _full_frame_mosaic(
-            image, _feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, mosaic.DEFAULT_PIXEL_SIZE
+            image, _feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, DEFAULT_CELL
         )
         self.assertEqual(
             mosaic_yuv420p(image, objects, mask_pad=3), mosaic._encode_yuv420p(expected)
@@ -319,7 +323,7 @@ class GroupedComposeTests(unittest.TestCase):
             mosaic_yuv420p(image, objects, mask_pad=3)
 
         self.assertEqual(blur.call_count, 2)
-        pixel_size = mosaic.DEFAULT_PIXEL_SIZE
+        pixel_size = DEFAULT_CELL
         blurred_pixels = sum(
             call.args[0].shape[0] * call.args[0].shape[1] * pixel_size * pixel_size
             for call in blur.call_args_list
@@ -348,7 +352,7 @@ class GroupedComposeTests(unittest.TestCase):
         np.testing.assert_array_equal(
             output,
             _full_frame_mosaic(
-                image, _feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, mosaic.DEFAULT_PIXEL_SIZE
+                image, _feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, DEFAULT_CELL
             ),
         )
 
@@ -378,24 +382,23 @@ class ReductionCellTests(unittest.TestCase):
     def _compose(self, radius, pixel_size):
         return mosaic._compose_protected(self.image, self.objects, radius, pixel_size, 8, 2)
 
-    def test_cap_matches_the_default_reduced_sigma(self):
-        self.assertEqual(
-            mosaic.MAX_REDUCED_SIGMA, mosaic.DEFAULT_BLUR_RADIUS / mosaic.DEFAULT_PIXEL_SIZE
-        )
+    def test_default_settings_blur_on_a_4px_cell_at_the_cap(self):
+        self.assertEqual(DEFAULT_CELL, 4)
+        self.assertEqual(mosaic.DEFAULT_BLUR_RADIUS / DEFAULT_CELL, mosaic.MAX_REDUCED_SIGMA)
 
     def test_cell_grows_only_when_the_reduced_sigma_exceeds_the_cap(self):
         cases = {
-            (24.0, 2): 2,
+            (24.0, 2): 4,
             (0.5, 4): 4,
-            (12.0, 1): 1,
-            (12.5, 1): 2,
-            (24.0, 1): 2,
-            (36.0, 3): 3,
-            (36.5, 3): 4,
-            (64.0, 1): 6,
-            (64.0, 2): 6,
-            (64.0, 6): 6,
-            (64.0, 8): 8,
+            (6.0, 1): 1,
+            (6.5, 1): 2,
+            (12.0, 1): 2,
+            (24.0, 1): 4,
+            (18.0, 3): 3,
+            (18.5, 3): 4,
+            (48.0, 8): 8,
+            (64.0, 1): 11,
+            (64.0, 8): 11,
         }
         for (radius, pixel_size), cell in cases.items():
             with self.subTest(radius=radius, pixel_size=pixel_size):
@@ -480,11 +483,11 @@ class MosaicParamTests(unittest.TestCase):
 
     def test_pixel_size_one_keeps_pure_gaussian_blur(self):
         with patch("service.mosaic.cv2.GaussianBlur", wraps=cv2.GaussianBlur) as blur:
-            output = _decode(mosaic_jpeg(self.image, self.objects, blur_radius=12.0, pixel_size=1))
+            output = _decode(mosaic_jpeg(self.image, self.objects, blur_radius=6.0, pixel_size=1))
 
         self.assertEqual(blur.call_count, 1)
         args, _ = blur.call_args
-        self.assertAlmostEqual(float(args[2]), 12.0)
+        self.assertAlmostEqual(float(args[2]), 6.0)
         difference = np.abs(
             output[40:80, 40:120].astype(np.int16) - self.image[40:80, 40:120].astype(np.int16)
         )
