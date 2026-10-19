@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,6 +134,20 @@ class MetadataExtractor:
         # Head activation and preprocessing have no parameters in the state dict.
         self.mean = torch.tensor((0.485, 0.456, 0.406), device=self.device)[:, None, None]
         self.std = torch.tensor((0.229, 0.224, 0.225), device=self.device)[:, None, None]
+        # CUDA's first convolution plan for each batch size can take ~1s even
+        # with cudnn.benchmark=False. Pay this during lazy model initialization.
+        warmup = int(os.environ.get("FACE_METADATA_WARMUP_MAX_BATCH", "0"))
+        if not 0 <= warmup <= 8:
+            raise ValueError("FACE_METADATA_WARMUP_MAX_BATCH must be 0..8")
+        if self.device.type == "cuda" and warmup:
+            with torch.inference_mode():
+                for batch_size in range(1, warmup + 1):
+                    self.model(
+                        torch.zeros(
+                            (batch_size, 3, self.input_size, self.input_size), device=self.device
+                        ).contiguous(memory_format=torch.channels_last)
+                    )
+            torch.cuda.synchronize(self.device)
 
     def prepare_inputs(self, crops: list[np.ndarray]):
         """Convert BGR crops to the same normalized RGB tensor as training inference."""
