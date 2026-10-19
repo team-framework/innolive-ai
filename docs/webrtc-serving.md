@@ -46,6 +46,7 @@ API를 그대로 사용할 수 있다. `/`의 새 화면에서 카메라 또는 
 - 패킷 누락 시 기존 재정렬·NACK 처리를 유지하며 브라우저와 서버 양쪽 RTX 협상
 - NVENC의 비트레이트 변경은 기존 세션에서 처리해 CUDA encoder 재생성 중단 방지
 - 카메라의 불규칙한 타임스탬프는 90kHz 정밀도로 유지해 인접 프레임 병합 방지
+- `--face-swap-warmup` 사용 시 스트림을 받기 전에 모델을 예열하고 기존 객체를 GC 검사에서 제외해 전체 heap 검사에 따른 긴 프레임 방지
 
 `WEBRTC_ENCODER=auto`는 실제 NVENC 첫 프레임 인코딩을 검사한 뒤 선택한다. GPU 모델명이나
 FFmpeg 인코더 목록만으로 활성화하지 않는다. NVENC가 초기화되지 않으면 2개 스레드의
@@ -61,6 +62,25 @@ Baseline으로 연속 송신·중지·재시작을 검증했다.
 최종 Chrome 통계에서 송신 인코더는 OpenH264, 수신 디코더는 VideoToolbox로 확인했다.
 설정 근거: [aiortc API](https://aiortc.readthedocs.io/en/latest/api.html),
 [NVIDIA 저지연 인코딩 지침](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html#low-latency-transcoding).
+
+## 긴 프레임 진단
+
+stats data channel의 `stages_ms`에는 queue·decode·detect·tracking·runtime·render·serialize를
+전달한다. runtime은 detect·tracking을 포함하는 집계이므로 모든 값을 더하면 중복 계산된다.
+`media_timestamp`는 기존 gRPC timestamp이고 `gateway_monotonic_ms`는 결과를 받은
+게이트웨이의 시각이다. 브라우저 시계와 원점이 달라 두 시각을 직접 빼서 왕복 지연으로
+해석하면 안 된다. 연속 seq의 **서버 생성 간격과 브라우저 수신 간격**을 비교해 전송 중
+추가된 지연을 구분한다. 진단 필드만 추가하며 영상과 protobuf 계약은 바꾸지 않는다.
+
+CUDA 실행기의 `--face-swap-warmup` 경로는 준비된 모델·framework 객체를 `gc.freeze()`로
+보관한다. 자동 GC는 계속 켜져 있고 이후 만들어진 세션의 순환 참조는 정상 수거한다.
+종료 시에는 freeze를 해제한다. 스트림 처리 중 freeze하거나 전체 GC를 끄지 않는다.
+GPU source cache 교체 시 모델과 메모리 해제를 실제 CUDA 경로에서 별도로 검증했다.
+
+`scripts/benchmark_webrtc_browser.py`는 source/result frame ID와 250ms 간격의 Chrome
+RTP·ICE 통계, main-thread long task를 함께 저장한다. `freezeCount`는 Chrome 통계이며
+100ms 초과 표시 간격과 별도 지표다. 모델 처리 시간만으로 네트워크 FPS나 freeze를
+설명하지 않는다. 최신 실측은 [운영 경로 검증](mobilefaceswap-production-validation.md)을 따른다.
 
 ## 네트워크
 
