@@ -271,6 +271,8 @@ Go 서버의 요청 필드와 값별 동작은 [Go 연동 가이드](docs/go-fac
 
 Mac에서 `best.pt`를 유지하면서 **MobileFaceSwap 224**를 테스트하려면
 [실행 가이드](docs/mobilefaceswap-mac.md)의 `./scripts/run_mobilefaceswap.sh`를 사용합니다.
+RTX 3090의 CUDA FP16·TensorRT 실행과 HTTPS/systemd 구성은
+[CUDA 배포 가이드](docs/mobilefaceswap-cuda.md)를 참고합니다.
 
 ## 검증
 
