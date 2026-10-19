@@ -62,9 +62,8 @@ async def measure(args):
         context = await browser.new_context(
             permissions=["camera"], viewport={"width": 1440, "height": 1050}
         )
-        for target in args.url:
-            name, url = target.split("=", 1)
-            url = url.rstrip("/")
+
+        async def one(name, url, barrier):
             page = await context.new_page()
             sid = None
             try:
@@ -78,6 +77,7 @@ async def measure(args):
                     "document.querySelector('#status').textContent==='합성 중'", timeout=60000
                 )
                 await page.wait_for_timeout(args.warmup * 1000)
+                await barrier.wait()
                 await page.evaluate(OBSERVER)
                 before = await page.evaluate(
                     "async()=>Array.from((await __pcs[0].getStats()).values())"
@@ -127,10 +127,30 @@ async def measure(args):
                 (args.output / "result.json").write_text(
                     json.dumps(results, indent=2, ensure_ascii=False)
                 )
+                # Keep every fake camera alive until all concurrent measurements
+                # are collected; stopping one can interrupt Chrome's shared source.
+                await barrier.wait()
+            except BaseException:
+                await barrier.abort()
+                raise
             finally:
                 await page.close()
                 if sid:
                     await context.request.delete(url + "/api/sessions/" + sid, max_retries=2)
+
+        for target in args.url:
+            name, url = target.split("=", 1)
+            barrier = asyncio.Barrier(args.sessions)
+            await asyncio.gather(
+                *(
+                    one(
+                        name if args.sessions == 1 else f"{name}-s{index + 1}",
+                        url.rstrip("/"),
+                        barrier,
+                    )
+                    for index in range(args.sessions)
+                )
+            )
         await browser.close()
 
 
@@ -139,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--url", action="append", required=True, help="label=https://host:port")
     parser.add_argument("--fake-video", type=Path, required=True)
     parser.add_argument("--browser", type=Path, required=True)
+    parser.add_argument("--sessions", type=int, default=1, choices=range(1, 9))
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument("--warmup", type=float, default=5)
     parser.add_argument("--output", type=Path, default=Path("reports/webrtc/browser"))
