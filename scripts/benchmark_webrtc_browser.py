@@ -16,6 +16,9 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 HOOK = """window.__pcs=[];window.__reports=[];const P=RTCPeerConnection;
+window.__longTasks=[];
+new PerformanceObserver(list=>{for(const e of list.getEntries())
+ __longTasks.push({at:e.startTime,duration:e.duration})}).observe({type:'longtask',buffered:true});
 window.RTCPeerConnection=class extends P {
  constructor(...a){super(...a);__pcs.push(this)}
  createDataChannel(...a){const c=super.createDataChannel(...a);
@@ -26,12 +29,16 @@ OBSERVER = """() => {
  const c=document.createElement('canvas');c.width=256;c.height=16;
  const x=c.getContext('2d',{willReadFrequently:true});
  const seen=new Map(),rows=[];let lastSource=-1,lastResult=-1;
- window.measurement={rows,done:false,start:performance.now()};
+ window.measurement={rows,sourceRows:[],stats:[],done:false,start:performance.now()};
+ const sampleStats=async()=>{if(measurement.done)return;
+ const values=Array.from((await __pcs[0].getStats()).values()).filter(s=>
+ ['inbound-rtp','outbound-rtp','remote-inbound-rtp','candidate-pair'].includes(s.type));
+ measurement.stats.push({at:performance.now(),values});setTimeout(sampleStats,250);};sampleStats();
  const read=e=>{x.drawImage(e,0,0,256,16,0,0,256,16);const p=x.getImageData(0,0,256,16).data;let seq=0;
  for(let b=0;b<16;b++){let v=0;for(let y=4;y<12;y++)for(let px=b*16+4;px<b*16+12;px++)v+=p[(y*256+px)*4];
  if(v/64>128)seq|=1<<b;}return seq;};
  const tick=()=>{if(measurement.done)return;const now=performance.now();try{
- if(source.readyState>=2){const seq=read(source);if(seq!==lastSource){lastSource=seq;seen.set(seq,now);}}
+ if(source.readyState>=2){const seq=read(source);if(seq!==lastSource){lastSource=seq;seen.set(seq,now);measurement.sourceRows.push({seq,now});}}
  if(result.readyState>=2&&!result.hidden){const seq=read(result);if(seq!==lastResult&&seen.has(seq)){
  lastResult=seq;rows.push({seq,now,latency:now-seen.get(seq)});}}
  }catch{}requestAnimationFrame(tick);};tick();
@@ -108,6 +115,11 @@ async def measure(args):
                     "stats_after": after,
                     "samples": rows,
                     "reports": reports,
+                    "source_samples": await page.evaluate("measurement.sourceRows"),
+                    "stats_timeline": await page.evaluate("measurement.stats"),
+                    "long_tasks": await page.evaluate(
+                        "__longTasks.filter(r=>r.at>=measurement.start)"
+                    ),
                 }
                 for field in ("freezeCount", "totalFreezesDuration", "packetsLost"):
                     result[field] = sum(
@@ -119,7 +131,16 @@ async def measure(args):
                     {
                         k: v
                         for k, v in result.items()
-                        if k not in {"stats_before", "stats_after", "samples", "reports"}
+                        if k
+                        not in {
+                            "stats_before",
+                            "stats_after",
+                            "samples",
+                            "reports",
+                            "source_samples",
+                            "stats_timeline",
+                            "long_tasks",
+                        }
                     },
                     flush=True,
                 )
