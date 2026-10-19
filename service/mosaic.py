@@ -16,8 +16,9 @@ DEFAULT_BLUR_RADIUS = 24.0
 DEFAULT_PIXEL_SIZE = 2
 MAX_BLUR_RADIUS = 64.0
 MAX_PIXEL_SIZE = 8
-# 축소 이미지 Gaussian sigma 상한. 기본값(24 / 2)과 같아 sigma가 이 값 이하인 설정은 결과가 그대로다.
-MAX_REDUCED_SIGMA = 12.0
+# 축소 이미지 Gaussian sigma 상한. 비용은 축소 sigma에 비례하고, 같은 반경에서 격자를 키운 차이는
+# 블러 픽셀 1~2레벨이라 기본값(24, 2)도 격자 4·sigma 6으로 계산한다(#67). 이 값 이하인 설정은 결과가 그대로다.
+MAX_REDUCED_SIGMA = 6.0
 DEFAULT_MASK_MARGIN = 8
 MASK_FEATHER_RADIUS = DEFAULT_MASK_MARGIN  # Compatibility for existing compositor imports.
 MAX_MASK_MARGIN = 64
