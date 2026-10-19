@@ -1,5 +1,6 @@
 export function h264Codecs(capabilities) {
-  return capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264");
+  return capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264")
+    .sort((a, b) => Number(b.sdpFmtpLine?.includes("profile-level-id=42e0")) - Number(a.sdpFmtpLine?.includes("profile-level-id=42e0")));
 }
 
 export function resultIsStale(lastFrameAt, now, timeout = 2000) {
@@ -154,6 +155,8 @@ export class WebRtcDemo {
     };
     pc.ontrack = (event) => {
       if (generation !== this.generation || event.track.kind !== "video") return;
+      // This is a latency preference; the browser still adapts to network jitter.
+      if ("jitterBufferTarget" in event.receiver) event.receiver.jitterBufferTarget = 0;
       this.el.result.srcObject = new MediaStream([event.track]);
       this.watchFrames(generation);
       this.el.result.play().catch((error) => { if (generation === this.generation) this.fail(error.message); });

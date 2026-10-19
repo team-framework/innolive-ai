@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { h264Codecs, resultIsStale, waitForIce, WebRtcDemo } from "../web/webrtc.js";
 
 assert.equal(h264Codecs({ codecs: [{mimeType:"video/VP8"}, {mimeType:"video/H264"}] }).length, 1);
+assert.equal(h264Codecs({codecs:[
+  {mimeType:"video/H264",sdpFmtpLine:"profile-level-id=42001f"},
+  {mimeType:"video/H264",sdpFmtpLine:"profile-level-id=42e01f"},
+]})[0].sdpFmtpLine, "profile-level-id=42e01f");
 assert.equal(resultIsStale(null, 10000), false);
 assert.equal(resultIsStale(1000, 3001), true);
 
