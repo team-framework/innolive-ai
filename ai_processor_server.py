@@ -83,6 +83,7 @@ from service.runtime import (
     TrackingFailure,
     detector_mask_pad,
 )
+from service.startup_gc import StartupGc
 from service.tracking import StreamTracker
 
 LOGGER = logging.getLogger("innolive.grpc")
@@ -976,6 +977,7 @@ async def serve(settings: GrpcServerSettings) -> None:
     runtime = None
     adaface = None
     bundle = None
+    startup_gc = StartupGc()
     try:
         runtime = await asyncio.to_thread(RuntimeManager, settings.runtime)
         tracker_probe = await asyncio.to_thread(
@@ -1005,6 +1007,10 @@ async def serve(settings: GrpcServerSettings) -> None:
             await asyncio.get_running_loop().run_in_executor(
                 bundle.servicer._face_executor, bundle.servicer.face_anonymization.warmup
             )
+            # A generation-2 scan of the imported frameworks and warmed models
+            # otherwise stalls an in-flight response despite no garbage to free.
+            # Streams are not admitted yet; their later cycles remain collectable.
+            startup_gc.freeze()
         await bundle.set_serving(True)
         await bundle.server.start()
         LOGGER.info(
@@ -1024,6 +1030,7 @@ async def serve(settings: GrpcServerSettings) -> None:
             )
         await bundle.server.wait_for_termination()
     finally:
+        startup_gc.close()
         if bundle is not None:
             bundle.servicer.set_accepting(False)
             await bundle.health_servicer.enter_graceful_shutdown()
