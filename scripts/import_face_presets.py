@@ -106,10 +106,20 @@ def dataset_catalog(source: Path, *, progress: Callable[[int, int], None] | None
             item["exp"],
         )
     )
+    source_metadata = {}
+    if (source / "codebook.json").is_file():
+        codebook = json.loads((source / "codebook.json").read_text(encoding="utf-8"))
+        for key in ("dataset", "generator"):
+            if key in codebook:
+                value = codebook[key]
+                if not isinstance(value, str) or not value.strip() or len(value) > 128:
+                    raise ValueError(f"invalid dataset provenance: {key}")
+                source_metadata[key] = value
     return {
         "schema_version": 1,
         "provenance": {
             "dataset": "synthetic_faces",
+            **source_metadata,
             "dataset_manifest_sha256": digest(manifest),
             "image_count": len(entries),
             "identity_count": len(entries) // 14,
