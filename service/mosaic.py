@@ -16,6 +16,8 @@ DEFAULT_BLUR_RADIUS = 24.0
 DEFAULT_PIXEL_SIZE = 2
 MAX_BLUR_RADIUS = 64.0
 MAX_PIXEL_SIZE = 8
+# 축소 이미지 Gaussian sigma 상한. 기본값(24 / 2)과 같아 sigma가 이 값 이하인 설정은 결과가 그대로다.
+MAX_REDUCED_SIGMA = 12.0
 DEFAULT_MASK_MARGIN = 8
 MASK_FEATHER_RADIUS = DEFAULT_MASK_MARGIN  # Compatibility for existing compositor imports.
 MAX_MASK_MARGIN = 64
@@ -153,7 +155,8 @@ def _blend_layers(
     if not layers:
         return image
     height, width = image.shape[:2]
-    support = _blur_support(blur_radius, pixel_size)
+    cell = _reduction_cell(blur_radius, pixel_size)
+    support = _blur_support(blur_radius, cell)
     boxes = [
         (left, top, left + alpha.shape[1], top + alpha.shape[0]) for left, top, alpha in layers
     ]
@@ -174,13 +177,13 @@ def _blend_layers(
     # 블러 값은 계산 영역과 무관하므로 어느 쪽이든 결과가 같다.
     shared = None
     if sum(blur_area(box) for box in boxes) >= blur_area(union):
-        shared = _frame_blur(image, union, blur_radius, pixel_size)
+        shared = _frame_blur(image, union, blur_radius, cell)
 
     output = image.copy()
     for (_, _, alpha), box in zip(layers, boxes, strict=True):
         left, top, right, bottom = box
         if shared is None:
-            blurred = _frame_blur(image, box, blur_radius, pixel_size)
+            blurred = _frame_blur(image, box, blur_radius, cell)
         else:
             blurred = shared[top - union[1] : bottom - union[1], left - union[0] : right - union[0]]
         # Complementary weights bound the rounded numerator to 255 * 255 + 127.
@@ -192,6 +195,16 @@ def _blend_layers(
             + 127
         ) // 255
     return output
+
+
+def _reduction_cell(blur_radius: float, pixel_size: int) -> int:
+    """Return the reduction cell size, raised so the reduced sigma stays within the cap.
+
+    Gaussian cost grows with the reduced sigma, while a coarser cell under the same radius changes
+    the blurred pixels by only a level or two, so large radii on fine cells use a coarser cell.
+    """
+
+    return max(pixel_size, math.ceil(blur_radius / MAX_REDUCED_SIGMA))
 
 
 def _blur_support(blur_radius: float, pixel_size: int) -> int:
