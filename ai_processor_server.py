@@ -97,6 +97,10 @@ DEFAULT_MOSAIC_WORKERS = 4
 DEFAULT_MOSAIC_MAX_INFLIGHT = 8
 # 얼굴 합성은 공유 모델 세션을 쓰므로 종전대로 한 스레드에서 차례로 처리한다.
 FACE_ANONYMIZATION_MAX_INFLIGHT = 2
+# 한 스트림에서 동시에 처리하는 프레임 수(#69). 1은 요청 하나를 끝낸 뒤 다음 요청을 읽는 종전
+# 처리이고, 2 이상은 앞 프레임의 블러 합성과 다음 프레임의 디코드·추론·추적을 겹쳐 실행한다.
+DEFAULT_STREAM_PIPELINE_DEPTH = 1
+MAX_STREAM_PIPELINE_DEPTH = 4
 
 
 def _output_mode(value: int) -> int:
@@ -127,6 +131,7 @@ class GrpcServerSettings:
     shutdown_grace_seconds: float = 5.0
     mosaic_workers: int = DEFAULT_MOSAIC_WORKERS
     mosaic_max_inflight: int = DEFAULT_MOSAIC_MAX_INFLIGHT
+    stream_pipeline_depth: int = DEFAULT_STREAM_PIPELINE_DEPTH
     ssl_certfile: Path | None = None
     ssl_keyfile: Path | None = None
 
@@ -151,6 +156,8 @@ class GrpcServerSettings:
             raise ValueError("mosaic_workers must be at least one")
         if self.mosaic_max_inflight < self.mosaic_workers:
             raise ValueError("mosaic_max_inflight must be at least mosaic_workers")
+        if not 1 <= self.stream_pipeline_depth <= MAX_STREAM_PIPELINE_DEPTH:
+            raise ValueError(f"stream_pipeline_depth must be in 1..{MAX_STREAM_PIPELINE_DEPTH}")
         if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
             raise ValueError("ssl_certfile and ssl_keyfile must be provided together")
 
@@ -160,6 +167,124 @@ class FrameOutcome:
     response: Any
     fatal: bool = False
     pending_inference: asyncio.Task | None = None
+
+
+@dataclass(slots=True)
+class PreparedFrame:
+    """A frame past its order-dependent stage (decode, inference, tracking, recognition)."""
+
+    request: Any
+    stream: StreamState
+    frame_sequence: int
+    image: np.ndarray
+    result: dict[str, Any]
+    objects: list[dict[str, Any]]
+    received_at: float
+    decoded_at: float
+    blur_radius: float
+    pixel_size: int
+    mask_margin: int
+
+
+class _StreamAbort(Exception):
+    def __init__(self, code: grpc.StatusCode, details: str) -> None:
+        super().__init__(details)
+        self.code = code
+        self.details = details
+
+
+class _DeferredAbortContext:
+    """Turn ``abort`` into an exception so the RPC aborts only after earlier responses are sent."""
+
+    async def abort(self, code: grpc.StatusCode, details: str = "") -> None:
+        raise _StreamAbort(code, details)
+
+
+class _PipelinedOutcomes:
+    """Prepare later frames while earlier frames compose; return outcomes in request order (#69).
+
+    A frame takes a slot when it is read and gives it back once its response is returned, so at
+    most ``stream_pipeline_depth`` frames are between the two. Preparation (decode, inference,
+    tracking, recognition) stays in request order because the tracker and recognition state are
+    per stream. Face anonymization composes with per-stream identity state, so those streams
+    still finish one frame before preparing the next.
+    """
+
+    def __init__(self, server: Any, request_iterator: Any, context: Any, tracker: Any) -> None:
+        self._server = server
+        self._requests = request_iterator
+        self._context = context
+        self._tracker = tracker
+        self._slots = asyncio.Semaphore(server.settings.stream_pipeline_depth)
+        self._outcomes: asyncio.Queue[asyncio.Future | None] = asyncio.Queue()
+        self._reader: asyncio.Task | None = None
+        self._holding_slot = False
+        self._abort: _StreamAbort | None = None
+        self.stream: StreamState | None = None
+
+    def __aiter__(self) -> _PipelinedOutcomes:
+        return self
+
+    async def __anext__(self) -> FrameOutcome:
+        if self._reader is None:
+            self._reader = asyncio.create_task(self._read(), name="grpc-pipeline-reader")
+        if self._holding_slot:
+            # The previous response has been handed to gRPC; its frame no longer counts.
+            self._holding_slot = False
+            self._slots.release()
+        item = await self._outcomes.get()
+        if item is None:
+            await self._reader  # Re-raise a failure from the reading side.
+            if self._abort is not None:
+                await self._context.abort(self._abort.code, self._abort.details)
+            raise StopAsyncIteration
+        outcome = await item
+        self._holding_slot = True
+        return outcome
+
+    async def _read(self) -> None:
+        frame_sequence = 0
+        deferred = _DeferredAbortContext()
+        try:
+            async for request in self._requests:
+                await self._slots.acquire()
+                self.stream = await self._server._accept_request(request, self.stream, deferred)
+                frame_sequence += 1
+                try:
+                    prepared = await self._server._prepare_request(
+                        request, self._tracker, self.stream, frame_sequence
+                    )
+                except SessionLimitError as error:
+                    await deferred.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+                if isinstance(prepared, FrameOutcome):
+                    done = asyncio.get_running_loop().create_future()
+                    done.set_result(prepared)
+                    self._outcomes.put_nowait(done)
+                    if prepared.fatal:
+                        return
+                    continue
+                task = asyncio.create_task(
+                    self._server._finish_request(prepared),
+                    name=f"grpc-finish-{request.frame_id}",
+                )
+                self._outcomes.put_nowait(task)
+                if self.stream.anonymization_mode != MODES["blur"]:
+                    await asyncio.wait({task})
+        except _StreamAbort as abort:
+            self._abort = abort
+        finally:
+            self._outcomes.put_nowait(None)
+
+    async def aclose(self) -> None:
+        """Stop reading and settle every queued composition before the stream state is released."""
+
+        if self._reader is not None:
+            self._reader.cancel()
+            await asyncio.gather(self._reader, return_exceptions=True)
+        while not self._outcomes.empty():
+            item = self._outcomes.get_nowait()
+            if item is not None:
+                await asyncio.gather(item, return_exceptions=True)
 
 
 @dataclass(slots=True)
@@ -234,48 +359,23 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     "tracker initialization failed",
                 )
 
+            if self.settings.stream_pipeline_depth > 1:
+                pipeline = self._pipelined_outcomes(request_iterator, context, tracker)
+                try:
+                    async for outcome in pipeline:
+                        stream = pipeline.stream
+                        pending_inference = outcome.pending_inference
+                        yield outcome.response
+                        if outcome.fatal:
+                            return
+                        pending_inference = None
+                finally:
+                    await pipeline.aclose()
+                    stream = pipeline.stream
+                return
+
             async for request in request_iterator:
-                try:
-                    request_session_id = validate_session_id(request.session_id)
-                except ValueError as error:
-                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-                try:
-                    output_mode = _output_mode(request.output_mode)
-                except ValueError as error:
-                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-                if request.anonymization_mode not in MODES.values():
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT, "unsupported anonymization_mode"
-                    )
-                if stream is None:
-                    stream = StreamState(
-                        session_id=request_session_id,
-                        output_mode=output_mode,
-                        anonymization_mode=request.anonymization_mode,
-                        identities=StreamFaceIdentities(
-                            retention_frames=self.settings.face_anonymization.retention_frames
-                        ),
-                        recognition=StreamRecognition(
-                            self.adaface,
-                            self.settings.recognition,
-                            owner=request_session_id,
-                        ),
-                    )
-                elif request_session_id != stream.session_id:
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        "session_id cannot change within a ProcessVideo stream",
-                    )
-                elif output_mode != stream.output_mode:
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        "output_mode cannot change within a ProcessVideo stream",
-                    )
-                if request.anonymization_mode != stream.anonymization_mode:
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        "anonymization_mode cannot change within a ProcessVideo stream",
-                    )
+                stream = await self._accept_request(request, stream, context)
                 frame_sequence += 1
                 try:
                     outcome = await self._process_request(
@@ -306,6 +406,57 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     LOGGER.exception("tracker reset failed")
             self.active_streams = max(0, self.active_streams - 1)
 
+    async def _accept_request(
+        self, request: Any, stream: StreamState | None, context: Any
+    ) -> StreamState:
+        """Validate one request against the stream contract; abort the RPC on a violation."""
+
+        try:
+            request_session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        try:
+            output_mode = _output_mode(request.output_mode)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        if request.anonymization_mode not in MODES.values():
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unsupported anonymization_mode")
+        if stream is None:
+            stream = StreamState(
+                session_id=request_session_id,
+                output_mode=output_mode,
+                anonymization_mode=request.anonymization_mode,
+                identities=StreamFaceIdentities(
+                    retention_frames=self.settings.face_anonymization.retention_frames
+                ),
+                recognition=StreamRecognition(
+                    self.adaface,
+                    self.settings.recognition,
+                    owner=request_session_id,
+                ),
+            )
+        elif request_session_id != stream.session_id:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "session_id cannot change within a ProcessVideo stream",
+            )
+        elif output_mode != stream.output_mode:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "output_mode cannot change within a ProcessVideo stream",
+            )
+        if request.anonymization_mode != stream.anonymization_mode:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "anonymization_mode cannot change within a ProcessVideo stream",
+            )
+        return stream
+
+    def _pipelined_outcomes(
+        self, request_iterator: Any, context: Any, tracker: Any
+    ) -> _PipelinedOutcomes:
+        return _PipelinedOutcomes(self, request_iterator, context, tracker)
+
     async def _process_request(
         self,
         request: Any,
@@ -313,6 +464,20 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         stream: StreamState,
         frame_sequence: int,
     ) -> FrameOutcome:
+        prepared = await self._prepare_request(request, tracker, stream, frame_sequence)
+        if isinstance(prepared, FrameOutcome):
+            return prepared
+        return await self._finish_request(prepared)
+
+    async def _prepare_request(
+        self,
+        request: Any,
+        tracker: Any,
+        stream: StreamState,
+        frame_sequence: int,
+    ) -> FrameOutcome | PreparedFrame:
+        """Run the order-dependent stage: decode, inference, tracking and recognition."""
+
         received_at = time.perf_counter()
         if request.batch_size not in (0, 1):
             return FrameOutcome(
@@ -410,6 +575,28 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 fatal=True,
             )
 
+        return PreparedFrame(
+            request=request,
+            stream=stream,
+            frame_sequence=frame_sequence,
+            image=image,
+            result=result,
+            objects=objects,
+            received_at=received_at,
+            decoded_at=decoded_at,
+            blur_radius=blur_radius,
+            pixel_size=pixel_size,
+            mask_margin=mask_margin,
+        )
+
+    async def _finish_request(self, prepared: PreparedFrame) -> FrameOutcome:
+        """Compose the protected frame and serialize the response; reads no tracker state."""
+
+        request, stream, image = prepared.request, prepared.stream, prepared.image
+        objects, result, received_at = prepared.objects, prepared.result, prepared.received_at
+        blur_radius, pixel_size = prepared.blur_radius, prepared.pixel_size
+        mask_margin, frame_sequence = prepared.mask_margin, prepared.frame_sequence
+        decoded_at = prepared.decoded_at
         processed_data = b""
         blur_encode_ms = 0.0
         render = stream.output_mode == messages.VIDEO_OUTPUT_MODE_MOSAIC_JPEG
@@ -1162,6 +1349,14 @@ def parse_args() -> argparse.Namespace:
         help="Blur-only compositions queued or running at once (at least --mosaic-workers).",
     )
     experimental = FaceAnonymizationConfig()
+    parser.add_argument(
+        "--stream-pipeline-depth",
+        type=positive_int,
+        default=positive_int(
+            os.getenv("AI_STREAM_PIPELINE_DEPTH", str(DEFAULT_STREAM_PIPELINE_DEPTH))
+        ),
+        help="Frames one stream processes at once; 2+ overlaps composition with the next frame.",
+    )
     parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
     parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
     parser.add_argument("--face-swap-model", type=Path, default=experimental.swapper_model)
@@ -1229,6 +1424,7 @@ def main() -> None:
         shutdown_grace_seconds=arguments.shutdown_grace,
         mosaic_workers=arguments.mosaic_workers,
         mosaic_max_inflight=arguments.mosaic_max_inflight,
+        stream_pipeline_depth=arguments.stream_pipeline_depth,
         ssl_certfile=arguments.ssl_certfile,
         ssl_keyfile=arguments.ssl_keyfile,
     )
