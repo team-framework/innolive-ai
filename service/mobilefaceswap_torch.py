@@ -241,14 +241,25 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
         self.device = torch.device(provider)
         self.dtype = torch.float16 if precision == "fp16" else torch.float32
         self.torch_sources: OrderedDict[tuple[Path, str | None], nn.Module] = OrderedDict()
+        self.source_cache_size = int(os.environ.get("MOBILEFACESWAP_SOURCE_CACHE_SIZE", "16"))
+        if not 1 <= self.source_cache_size <= 128:
+            raise ValueError("MOBILEFACESWAP_SOURCE_CACHE_SIZE must be 1..128")
+        self.require_cache = os.environ.get("MOBILEFACESWAP_REQUIRE_CACHE") == "1"
         cache_dir = os.environ.get("MOBILEFACESWAP_CACHE_DIR")
         self.disk_cache = ConditionedModelCache(Path(cache_dir), model_dir) if cache_dir else None
+        if self.require_cache and self.disk_cache is None:
+            raise ValueError("MOBILEFACESWAP_REQUIRE_CACHE requires MOBILEFACESWAP_CACHE_DIR")
+        self.transfer_buffers = None
 
     def torch_source_model(self, preset: FacePreset) -> nn.Module:
         key = (preset.image, preset.sha256)
         if key not in self.torch_sources:
             model = self.disk_cache.load(preset) if self.disk_cache else None
             if model is None:
+                if getattr(self, "require_cache", False):
+                    raise RuntimeError(
+                        "preset cache unavailable; run prepare_mobilefaceswap_cache.py"
+                    )
                 model = from_paddle(self.source_model(preset))
                 if self.disk_cache:
                     try:
@@ -259,10 +270,28 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
             if getattr(self, "cuda_graphs", False):
                 model = CudaGraphModel(model, self.device, self.dtype)
             self.torch_sources[key] = model
-            if len(self.torch_sources) > 16:
+            if len(self.torch_sources) > getattr(self, "source_cache_size", 16):
                 self.torch_sources.popitem(last=False)
         self.torch_sources.move_to_end(key)
         return self.torch_sources[key]
+
+    def warmup(self, presets):
+        if self.require_cache:
+            missing = [
+                preset.key
+                for preset in presets
+                if not (self.disk_cache.directory / f"{self.disk_cache.key(preset)}.pt").is_file()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"{len(missing)} preset caches missing; run prepare_mobilefaceswap_cache.py"
+                )
+        neutral = [
+            p for p in presets if p.attributes.exp == "none" and p.attributes.glasses == "off"
+        ]
+        for preset in neutral[: self.source_cache_size]:
+            self.render_crop(np.zeros((224, 224, 3), np.uint8), preset)
+        LOGGER.info("MobileFaceSwap warmup complete: %d source models", len(self.torch_sources))
 
     def render_crop(self, crop: np.ndarray, preset: FacePreset) -> tuple[np.ndarray, np.ndarray]:
         model = self.torch_source_model(preset)
@@ -273,3 +302,53 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
             generated, mask = model(values)
             # CPU copies synchronize the GPU before paste-back and timing completion.
             return generated.float().cpu().numpy(), mask.float().cpu().numpy()
+
+    def render_crops(self, crops, presets):
+        if self.device.type != "cuda" or len(crops) <= 1:
+            return super().render_crops(crops, presets)
+        # Different source identities have different weights: keep their forward
+        # passes separate, but transfer crops/results together and wait once per
+        # bounded chunk. Copy each graph output before replay can overwrite it.
+        if self.transfer_buffers is None:
+            self.transfer_buffers = (
+                torch.empty((8, 3, 224, 224), dtype=torch.float32, pin_memory=True),
+                torch.empty((8, 3, 224, 224), dtype=self.dtype, device=self.device).contiguous(
+                    memory_format=torch.channels_last
+                ),
+                torch.empty((8, 4, 224, 224), dtype=torch.float32, device=self.device),
+                torch.empty((8, 4, 224, 224), dtype=torch.float32, pin_memory=True),
+            )
+        host_input, device_input, device_output, host_output = self.transfer_buffers
+        results = []
+        for start in range(0, len(crops), 8):
+            chunk = crops[start : start + 8]
+            models = []
+            for preset in presets[start : start + len(chunk)]:
+                try:
+                    models.append(self.torch_source_model(preset))
+                except Exception as error:
+                    models.append(error)
+            with torch.inference_mode():
+                for index, crop in enumerate(chunk):
+                    np.copyto(host_input[index].numpy(), image_tensor(crop)[0])
+                device_input[: len(chunk)].copy_(host_input[: len(chunk)], non_blocking=True)
+                errors = []
+                for index, model in enumerate(models):
+                    try:
+                        if isinstance(model, Exception):
+                            raise model
+                        generated, mask = model(device_input[index : index + 1])
+                        device_output[index : index + 1, :3].copy_(generated)
+                        device_output[index : index + 1, 3:].copy_(mask)
+                        errors.append(None)
+                    except Exception as error:
+                        errors.append(error)
+                host_output[: len(chunk)].copy_(device_output[: len(chunk)], non_blocking=True)
+                torch.cuda.current_stream(self.device).synchronize()
+                # Detach from reusable pinned buffers before the next chunk/frame.
+                values = host_output[: len(chunk)].numpy().copy()
+                results.extend(
+                    error if error is not None else (values[i : i + 1, :3], values[i : i + 1, 3:])
+                    for i, error in enumerate(errors)
+                )
+        return results

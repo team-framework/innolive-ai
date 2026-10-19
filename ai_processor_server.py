@@ -1001,6 +1001,10 @@ async def serve(settings: GrpcServerSettings) -> None:
             sessions=sessions,
             adaface=adaface,
         )
+        if settings.face_anonymization.warmup:
+            await asyncio.get_running_loop().run_in_executor(
+                bundle.servicer._face_executor, bundle.servicer.face_anonymization.warmup
+            )
         await bundle.set_serving(True)
         await bundle.server.start()
         LOGGER.info(
@@ -1176,6 +1180,11 @@ def parse_args() -> argparse.Namespace:
         "--face-metadata-device", default="cpu", help="torch device: cpu, mps, cuda:0"
     )
     parser.add_argument("--face-swap-provider", choices=("cpu", "mps", "cuda"), default="cpu")
+    parser.add_argument(
+        "--face-swap-warmup",
+        action="store_true",
+        help="Load face metadata/renderer and warm source models before reporting SERVING.",
+    )
     parser.add_argument("--face-identity-retention-frames", type=positive_int, default=30)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
@@ -1209,6 +1218,7 @@ def main() -> None:
             metadata_device=arguments.face_metadata_device,
             swap_provider=arguments.face_swap_provider,
             retention_frames=arguments.face_identity_retention_frames,
+            warmup=arguments.face_swap_warmup,
         ),
         adaface=AdaFaceConfig(
             architecture=arguments.adaface_architecture,

@@ -8,6 +8,7 @@ Paddle and ONNX Runtime are optional and imported only during renderer loading.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -20,6 +21,7 @@ from service.face_presets import FacePreset
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "mobilefaceswap"
 SIZE = 224
+LOGGER = logging.getLogger("innolive.mobilefaceswap")
 # Full affine least-squares alignment, as used by the original MobileFaceSwap demo.
 REFERENCE = (
     np.array(
@@ -61,7 +63,7 @@ def source_tensor(aligned: np.ndarray) -> np.ndarray:
     return (values - mean) / std
 
 
-def paste_back(image, generated, mask, matrix, polygon):
+def paste_back(image, generated, mask, matrix, polygon, *, inplace=False):
     if generated.shape != (1, 3, SIZE, SIZE) or mask.shape != (1, 1, SIZE, SIZE):
         raise ValueError("invalid MobileFaceSwap output shapes")
     if not np.isfinite(generated).all() or not np.isfinite(mask).all():
@@ -97,10 +99,13 @@ def paste_back(image, generated, mask, matrix, polygon):
     if not np.any(alpha > 0.5):
         raise ValueError("MobileFaceSwap output does not overlap the tracked face mask")
     alpha = alpha[:, :, None]
-    output = image.copy()
-    output[top:bottom, left:right] = np.clip(
-        mapped * alpha + image[top:bottom, left:right] * (1 - alpha), 0, 255
-    ).astype(np.uint8)
+    # Finish validation and allocation before touching the destination. A failed
+    # face must leave the input intact so the caller can apply its blur fallback.
+    blended = np.clip(mapped * alpha + image[top:bottom, left:right] * (1 - alpha), 0, 255).astype(
+        np.uint8
+    )
+    output = image if inplace else image.copy()
+    output[top:bottom, left:right] = blended
     return output
 
 
@@ -438,3 +443,49 @@ class MobileFaceSwapRenderer:
         with self.paddle.no_grad():
             generated, mask = model(self.paddle.to_tensor(image_tensor(crop)))
         return generated.numpy(), mask.numpy()
+
+    def render_crops(self, crops, presets):
+        """Return one output or exception per face, preserving independent fallback."""
+        results = []
+        for crop, preset in zip(crops, presets, strict=True):
+            try:
+                results.append(self.render_crop(crop, preset))
+            except Exception as error:
+                results.append(error)
+        return results
+
+    def swap_many(self, output, jobs, *, target):
+        """Compose into the caller-owned frame; never read previously swapped crops.
+
+        Landmark/conditioning failures are isolated per face. Validated results
+        are applied in track order, preserving overlapping-face composition.
+        """
+        errors = [None] * len(jobs)
+        prepared, crops, presets = [], [], []
+        try:
+            target.prime([item["bbox"] for item, _ in jobs])
+        except Exception:
+            # A batch detector failure can still be served by individual ROIs.
+            LOGGER.warning("SCRFD batch failed; retrying individual faces", exc_info=True)
+        for index, (item, preset) in enumerate(jobs):
+            try:
+                matrix = alignment(target.landmarks(item["bbox"]))
+                crops.append(cv2.warpAffine(target.image, matrix, (SIZE, SIZE)))
+                presets.append(preset)
+                prepared.append((index, matrix))
+            except Exception as error:
+                errors[index] = error
+        results = self.render_crops(crops, presets)
+        if len(results) != len(prepared):
+            raise ValueError("MobileFaceSwap render batch count mismatch")
+        for (index, matrix), result in zip(prepared, results, strict=True):
+            try:
+                if isinstance(result, Exception):
+                    raise result
+                generated, mask = result
+                paste_back(
+                    output, generated, mask, matrix, jobs[index][0]["mask_polygon"], inplace=True
+                )
+            except Exception as error:
+                errors[index] = error
+        return errors

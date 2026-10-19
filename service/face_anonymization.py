@@ -48,6 +48,7 @@ class FaceAnonymizationConfig:
     swap_backend: str = "inswapper"
     mobilefaceswap_dir: Path = DEFAULT_MODEL_DIR
     mobilefaceswap_precision: str = "fp32"
+    warmup: bool = False
 
     def __post_init__(self) -> None:
         if self.swap_backend not in {"inswapper", "mobilefaceswap"}:
@@ -76,6 +77,14 @@ class FaceAnonymizationRuntime:
         self.renderer: Any | None = None
         self.load_error: str | None = None
         self.renderer_error: str | None = None
+
+    def warmup(self) -> None:
+        """Explicit serving startup; default blur-only servers remain lazy."""
+        self._metadata()
+        self._renderer()
+        prepare = getattr(self.renderer, "warmup", None)
+        if prepare is not None:
+            prepare(list(self.catalog.presets.values()))
 
     def _metadata(self) -> None:
         if self.load_error:
@@ -206,7 +215,7 @@ class FaceAnonymizationRuntime:
                 track_id = eligible[index].get("track_id")
                 if track_id is not None:
                     identities.cache_metadata(int(track_id), prediction, frame)
-        swap_frame = None
+        mobile_jobs = []
         for item, prediction in zip(eligible, predictions, strict=True):
             if prediction is None:
                 continue
@@ -229,21 +238,12 @@ class FaceAnonymizationRuntime:
             if self.renderer_error:
                 info["reason"] = "swapper_unavailable"
                 continue
+            if self.config.swap_backend == "mobilefaceswap":
+                mobile_jobs.append((item, preset))
+                continue
             try:
                 self._renderer()
-                if self.config.swap_backend == "mobilefaceswap":
-                    if swap_frame is None:
-                        swap_frame = self.renderer.prepare_frame(image)
-                        swap_frame.prime(
-                            [
-                                entry["bbox"]
-                                for entry, pred in zip(eligible, predictions, strict=True)
-                                if pred is not None and entry.get("track_id") is not None
-                            ]
-                        )
-                    candidate = self.renderer.swap(output.copy(), item, preset, target=swap_frame)
-                else:
-                    candidate = self.renderer.swap(output.copy(), item, preset)
+                candidate = self.renderer.swap(output.copy(), item, preset)
                 if candidate.shape != image.shape or candidate.dtype != np.uint8:
                     raise ValueError("invalid rendered frame")
                 output = candidate
@@ -252,6 +252,27 @@ class FaceAnonymizationRuntime:
             except Exception:
                 info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
                 LOGGER.warning("track %s swap failed; applying blur", track_id, exc_info=True)
+        if mobile_jobs:
+            try:
+                self._renderer()
+                errors = self.renderer.swap_many(
+                    output, mobile_jobs, target=self.renderer.prepare_frame(image)
+                )
+                if len(errors) != len(mobile_jobs):
+                    raise ValueError("MobileFaceSwap result count mismatch")
+            except Exception as error:
+                errors = [error] * len(mobile_jobs)
+                LOGGER.warning("MobileFaceSwap frame failed; applying blur", exc_info=True)
+            swapped = set()
+            for (item, _), error in zip(mobile_jobs, errors, strict=True):
+                info = item["anonymization"]
+                if error is None:
+                    info.update(status="swapped", reason="")
+                    swapped.add(id(item))
+                else:
+                    info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
+                    LOGGER.warning("track %s swap failed: %s", item["track_id"], error)
+            remaining = [item for item in remaining if id(item) not in swapped]
         if not render:
             return b""
         # Apply failed/held face and number-plate blur last so it takes precedence

@@ -12,6 +12,8 @@ export AI_ENGINE="${AI_ENGINE:-$PROJECT_ROOT/models/best_b1.engine}"
 export MOBILEFACESWAP_CUDA_GRAPHS="${MOBILEFACESWAP_CUDA_GRAPHS:-1}"
 export MOBILEFACESWAP_PRECISION="${MOBILEFACESWAP_PRECISION:-fp16}"
 export MOBILEFACESWAP_CACHE_DIR="${MOBILEFACESWAP_CACHE_DIR:-$PROJECT_ROOT/.runtime/mobilefaceswap-cache}"
+export MOBILEFACESWAP_REQUIRE_CACHE="${MOBILEFACESWAP_REQUIRE_CACHE:-1}"
+export MOBILEFACESWAP_SOURCE_CACHE_SIZE="${MOBILEFACESWAP_SOURCE_CACHE_SIZE:-64}"
 export FACE_METADATA_WARMUP_MAX_BATCH="${FACE_METADATA_WARMUP_MAX_BATCH:-8}"
 
 # Rebooting into an updated kernel module automatically stops selecting old
@@ -66,7 +68,7 @@ fi
 "$PYTHON" -u ai_processor_server.py --host 127.0.0.1 --port "$GRPC_PORT" \
   --backend "$AI_BACKEND" --engine "$AI_ENGINE" --model models/best.pt --device 0 \
   --face-metadata-device cuda:0 --face-swap-backend mobilefaceswap --face-swap-provider cuda \
-  --mobilefaceswap-precision "$MOBILEFACESWAP_PRECISION" &
+  --mobilefaceswap-precision "$MOBILEFACESWAP_PRECISION" --face-swap-warmup &
 GRPC_PID=$!
 WEB_PID=""
 cleanup() {

@@ -5,6 +5,7 @@ from collections import OrderedDict
 from pathlib import Path
 from unittest.mock import Mock
 
+import numpy as np
 import torch
 
 from service.face_metadata import FaceAttributes
@@ -75,9 +76,65 @@ class ConditionedCacheTests(unittest.TestCase):
         with self.assertLogs("innolive.mobilefaceswap", level="WARNING"):
             self.assertIsNone(self.cache.load(self.preset))
 
+    def test_required_cache_never_conditions_on_the_request_path(self):
+        renderer = object.__new__(TorchMobileFaceSwapRenderer)
+        renderer.disk_cache = self.cache
+        renderer.torch_sources = OrderedDict()
+        renderer.require_cache = True
+        renderer.source_model = Mock(side_effect=AssertionError("must not condition"))
+        with self.assertRaisesRegex(RuntimeError, "preset cache unavailable"):
+            renderer.torch_source_model(self.preset)
+        renderer.source_model.assert_not_called()
+
+    def test_warmup_rejects_missing_cache_before_loading_sources(self):
+        renderer = object.__new__(TorchMobileFaceSwapRenderer)
+        renderer.disk_cache = self.cache
+        renderer.require_cache = True
+        renderer.render_crop = Mock()
+        with self.assertRaisesRegex(RuntimeError, "preset caches missing"):
+            renderer.warmup([self.preset])
+        renderer.render_crop.assert_not_called()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class CudaGraphTests(unittest.TestCase):
+    def test_bounded_transfers_match_serial_outputs_and_do_not_alias_graphs(self):
+        torch.manual_seed(12)
+        models = [
+            fuse_model(MobileFaceSwapUNet().eval())
+            .cuda()
+            .half()
+            .requires_grad_(False)
+            .to(memory_format=torch.channels_last)
+            for _ in range(2)
+        ]
+        graphs = [CudaGraphModel(m, torch.device("cuda"), torch.float16) for m in models]
+        renderer = object.__new__(TorchMobileFaceSwapRenderer)
+        renderer.device, renderer.dtype = torch.device("cuda"), torch.float16
+        renderer.transfer_buffers = None
+
+        def select(index):
+            if index == -1:
+                raise ValueError("bad preset")
+            return graphs[index]
+
+        renderer.torch_source_model = select
+        rng = np.random.default_rng(14)
+        crops = [rng.integers(0, 256, (224, 224, 3), dtype=np.uint8) for _ in range(10)]
+        presets = [0, 1, 0, -1, 1, 0, 1, 0, 1, 0]
+        expected = [
+            renderer.render_crop(crop, preset) if preset != -1 else None
+            for crop, preset in zip(crops, presets, strict=True)
+        ]
+        actual = renderer.render_crops(crops, presets)
+        renderer.render_crops(crops[::-1], [1] * 10)
+        for a, b in zip(expected, actual, strict=True):
+            if a is None:
+                self.assertIsInstance(b, ValueError)
+            else:
+                for generated, batched in zip(a, b, strict=True):
+                    np.testing.assert_array_equal(generated, batched)
+
     def test_graph_preserves_output_and_isolates_source_models(self):
         torch.manual_seed(41)
         models = [

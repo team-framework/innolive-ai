@@ -212,6 +212,48 @@ class MobileFaceSwapTests(unittest.TestCase):
 
 
 class MobileFaceSwapBatchTests(unittest.TestCase):
+    def test_inplace_paste_matches_copy_path_and_failure_does_not_mutate(self):
+        rng = np.random.default_rng(7)
+        image = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
+        generated = rng.random((1, 3, 224, 224), dtype=np.float32)
+        mask = np.ones((1, 1, 224, 224), np.float32)
+        matrix = np.array([[1, 0, -80], [0, 1, -50]], np.float32)
+        polygon = [[90, 60], [250, 60], [250, 210], [90, 210]]
+        expected = paste_back(image, generated, mask, matrix, polygon)
+        actual = image.copy()
+        self.assertIs(paste_back(actual, generated, mask, matrix, polygon, inplace=True), actual)
+        np.testing.assert_array_equal(actual, expected)
+        for invalid in (mask * 0, mask * np.nan):
+            before = actual.copy()
+            with self.assertRaises(ValueError):
+                paste_back(actual, generated, invalid, matrix, polygon, inplace=True)
+            np.testing.assert_array_equal(actual, before)
+
+    def test_batch_isolates_bad_face_and_retains_original_crops(self):
+        original = np.full((224, 224, 3), 25, np.uint8)
+        output = original.copy()
+        target = Mock(image=original)
+        target.landmarks.side_effect = [REFERENCE, ValueError("no landmarks"), REFERENCE]
+        renderer = MobileFaceSwapRenderer.__new__(MobileFaceSwapRenderer)
+        renderer.render_crops = Mock(
+            return_value=[
+                (np.ones((1, 3, 224, 224)), np.ones((1, 1, 224, 224))),
+                (np.ones((1, 3, 224, 224)), np.zeros((1, 1, 224, 224))),
+            ]
+        )
+        item = {
+            "bbox": [70, 70, 150, 150],
+            "mask_polygon": [[70, 70], [150, 70], [150, 150], [70, 150]],
+        }
+        errors = renderer.swap_many(output, [(item, Mock()) for _ in range(3)], target=target)
+        self.assertIsNone(errors[0])
+        self.assertTrue(all(isinstance(e, ValueError) for e in errors[1:]))
+        self.assertTrue(np.all(output[100, 100] >= 254))
+        np.testing.assert_array_equal(output[:70], original[:70])
+        for crop in renderer.render_crops.call_args.args[0]:
+            np.testing.assert_array_equal(crop, original)
+        np.testing.assert_array_equal(original, np.full_like(original, 25))
+
     def test_batch_restores_spatial_batch_anchor_order_and_roi_scale(self):
         detector = ScrfdLandmarks.__new__(ScrfdLandmarks)
         detector.max_batch = 2
