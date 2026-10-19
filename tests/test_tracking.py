@@ -129,6 +129,37 @@ class PrecomputedMotionTests(unittest.TestCase):
             tracker.update(detections, image)
         self.assertEqual(apply.call_count, 1)
 
+    def test_gmc_downscale_follows_the_first_frame_long_edge(self):
+        for (height, width), expected in (
+            ((480, 640), 2),
+            ((720, 1280), 2),
+            ((1080, 1920), 3),
+            ((1920, 1080), 3),
+        ):
+            with self.subTest(size=(width, height)):
+                image = np.zeros((height, width, 3), dtype=np.uint8)
+                precomputed, sequential = StreamTracker(), StreamTracker()
+                precomputed.estimate_motion(image)
+                sequential.update(boxes(), image)
+                self.assertEqual(precomputed._tracker.gmc.downscale, expected)
+                self.assertEqual(sequential._tracker.gmc.downscale, expected)
+                # 스트림 중간 프레임은 첫 프레임 배율을 유지한다.
+                precomputed.estimate_motion(np.zeros((360, 640, 3), dtype=np.uint8))
+                self.assertEqual(precomputed._tracker.gmc.downscale, expected)
+
+    def test_fhd_gmc_restores_full_resolution_translation(self):
+        texture = cv2.GaussianBlur(
+            np.random.default_rng(7).integers(0, 256, (1200, 2040), dtype=np.uint8), (0, 0), 2
+        )
+        tracker = StreamTracker()
+        first = cv2.cvtColor(texture[60:1140, 60:1980], cv2.COLOR_GRAY2BGR)
+        second = cv2.cvtColor(texture[51:1131, 72:1992], cv2.COLOR_GRAY2BGR)
+        tracker.estimate_motion(first)
+        warp = tracker.estimate_motion(second)
+        self.assertEqual(tracker._tracker.gmc.downscale, 3)
+        self.assertIsInstance(warp, np.ndarray)
+        np.testing.assert_allclose(warp[:, 2], (-12, 9), atol=1.5)
+
 
 if __name__ == "__main__":
     unittest.main()
