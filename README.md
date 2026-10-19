@@ -95,6 +95,12 @@ Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 (`AI_MOSAIC_MAX_INFLIGHT`)이며, max-inflight는 workers 이상이어야 합니다. 얼굴 합성
 모드는 공유 model session을 쓰므로 별도 단일 thread에서 차례로 처리합니다.
 
+한 stream 안의 프레임은 기본적으로 요청 하나를 끝낸 뒤 다음 요청을 읽습니다.
+`--stream-pipeline-depth 2`(`AI_STREAM_PIPELINE_DEPTH`, 1..4, 기본 1)이면 앞 프레임의
+블러 합성과 다음 프레임의 decode·추론·추적을 겹쳐 실행하고, 응답은 요청 순서대로 보냅니다.
+client가 앞 응답을 기다리지 않고 다음 요청을 보낼 때 효과가 있으며, 얼굴 합성 모드는 종전처럼
+한 프레임씩 처리합니다.
+
 CPU 실행을 강제하려면 다음 command를 사용합니다.
 
 ```bash
