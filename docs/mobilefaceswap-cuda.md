@@ -49,6 +49,10 @@ FP32이며 `--mobilefaceswap-precision fp16`은 MobileFaceSwap CUDA에서만 허
 기본 gRPC는 `127.0.0.1:50061`, 웹은 `0.0.0.0:8443`이다. `GRPC_PORT`, `WEB_HOST`,
 `WEB_PORT`, `TARGET_FPS` 환경변수로 변경한다. 웹 입력 상한은 30 FPS이며 실측 FPS와 다르다.
 CUDA launcher의 기본 웹 화면은 [WebRTC H.264 전송](webrtc-serving.md)을 사용한다.
+새 프리셋의 첫 준비 비용을 줄이려면 실행 전
+`.venv/bin/python scripts/prepare_mobilefaceswap_cache.py --workers 4`로 캐시를 만든다.
+`MOBILEFACESWAP_CACHE_DIR` 기본값은 `.runtime/mobilefaceswap-cache`이며 생성된 가중치는
+Git에서 제외한다. NVENC 드라이버 버전 불일치의 서비스 한정 복구는 WebRTC 가이드를 따른다.
 JPEG 비교 화면은 `/jpeg`이며, 이 경로의 `CLIENT_WINDOW=2`는 원격 왕복 대기를 겹친다.
 1~5 사이에서 조정할 수 있으며 값이 커지면 대기 중인 프레임도 늘어난다.
 `WEBRTC_ENABLED=0`이면 기존 JPEG 화면을 기본으로 사용한다. 기본 blur 5 / Mac 합성 1
