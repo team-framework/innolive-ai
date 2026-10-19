@@ -32,6 +32,8 @@ if not catalog.presets or any(not p.image.is_file() for p in catalog.presets.val
     raise SystemExit("Install the preset images referenced by config/face_presets.json")
 for key in ("GRPC_PORT", "WEB_PORT"):
     with socket.socket() as sock:
+        # A stopped server can leave TIME_WAIT sockets without an active listener.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", int(os.environ[key])))
 print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 PY
@@ -55,7 +57,8 @@ cleanup() {
   wait "$GRPC_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT
+trap 'exit 0' TERM
 
 "$PYTHON" - <<'PY'
 import asyncio
