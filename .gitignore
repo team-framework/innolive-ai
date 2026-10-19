@@ -86,3 +86,6 @@ Thumbs.db
 
 # Local benchmark reports and measurement logs.
 /reports/
+
+# Host-specific deployment configuration, certificates and private keys.
+/.runtime/

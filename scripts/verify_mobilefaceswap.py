@@ -110,41 +110,63 @@ def verify(args):
         np.max(np.abs(output.astype(int) - reference_output.astype(int)))
     )
     torch_times = []
+    mean_errors = {}
     if args.torch_provider:
         import torch
 
         from service.mobilefaceswap_torch import from_paddle
 
-        model = from_paddle(local_model).to(args.torch_provider, memory_format=torch.channels_last)
+        if args.torch_precision == "fp16" and args.torch_provider != "cuda":
+            raise ValueError("fp16 validation requires CUDA")
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        dtype = torch.float16 if args.torch_precision == "fp16" else torch.float32
+        model = from_paddle(local_model).to(
+            args.torch_provider, dtype=dtype, memory_format=torch.channels_last
+        )
         values = torch.from_numpy(image_tensor(crops[1])).to(
-            args.torch_provider, memory_format=torch.channels_last
+            args.torch_provider, dtype=dtype, memory_format=torch.channels_last
         )
         with torch.inference_mode():
             for index in range(18):
                 started = time.perf_counter()
                 generated, mask = model(values)
-                generated, mask = generated.cpu().numpy(), mask.cpu().numpy()
+                generated, mask = generated.float().cpu().numpy(), mask.float().cpu().numpy()
                 if index >= 3:
                     torch_times.append((time.perf_counter() - started) * 1000)
         errors["torch_generated"] = float(np.max(np.abs(generated - actual.numpy())))
         errors["torch_mask"] = float(np.max(np.abs(mask - expected_mask.numpy())))
+        mean_errors["torch_generated"] = float(np.mean(np.abs(generated - actual.numpy())))
+        mean_errors["torch_mask"] = float(np.mean(np.abs(mask - expected_mask.numpy())))
     report = {
         "paddle_version": paddle.__version__,
         "provider": "cpu",
         "source": str(args.source),
         "target": str(args.target),
         "max_abs_errors": errors,
+        "mean_abs_errors": mean_errors,
         "generator_only_ms": times,
         "torch_provider": args.torch_provider,
+        "torch_precision": args.torch_precision,
         "torch_generator_only_ms": torch_times,
         "best_pt_sha256": hashlib.sha256((ROOT / "models/best.pt").read_bytes()).hexdigest(),
         "upstream": str(args.upstream),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.output_dir / "generated.jpg"), output)
+    if args.torch_provider:
+        cv2.imwrite(
+            str(args.output_dir / "torch-generated.jpg"),
+            paste_back(image, generated, mask, matrices[1], polygon),
+        )
     (args.output_dir / "parity.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    if any(value > (1 if name == "paste_back_uint8" else 1e-4) for name, value in errors.items()):
+    limits = {"paste_back_uint8": 1}
+    if args.torch_precision == "fp16":
+        limits.update(torch_generated=0.01, torch_mask=0.01)
+    if any(value > limits.get(name, 1e-4) for name, value in errors.items()) or any(
+        value > 5e-4 for value in mean_errors.values()
+    ):
         raise SystemExit("MobileFaceSwap upstream parity failed")
 
 
@@ -155,5 +177,6 @@ if __name__ == "__main__":
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--torch-provider", choices=("mps", "cuda"))
+    parser.add_argument("--torch-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "reports/mobilefaceswap/parity")
     verify(parser.parse_args())

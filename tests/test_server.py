@@ -277,6 +277,7 @@ def app(
     *,
     max_jpeg_bytes: int = 4096,
     anonymization_mode: str = "blur",
+    target_fps: int | None = None,
 ):
     fake = client or FakeGrpcClient()
     application = create_app(
@@ -285,6 +286,7 @@ def app(
             grpc_target="test-grpc:50051",
             max_jpeg_bytes=max_jpeg_bytes,
             anonymization_mode=anonymization_mode,
+            target_fps=target_fps,
         ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
@@ -292,6 +294,20 @@ def app(
 
 
 class GrpcDemoGatewayTests(unittest.TestCase):
+    def test_cuda_demo_can_raise_input_fps_without_changing_mode_defaults(self):
+        for mode, override, expected in (
+            ("blur", None, 30),
+            ("face_swap", None, 10),
+            ("face_swap", 30, 30),
+        ):
+            application, _ = app(anonymization_mode=mode, target_fps=override)
+            with TestClient(application) as client:
+                profile = client.get("/healthz").json()["serving_profile"]
+            self.assertEqual(profile["target_fps"], expected)
+        for invalid in (0, -1, 241):
+            with self.assertRaisesRegex(ValueError, "target_fps"):
+                ServerSettings(target_fps=invalid)
+
     def test_face_swap_gateway_sends_mode_and_shows_processed_image(self):
         application, fake = app(anonymization_mode="face_swap")
         with TestClient(application) as client:

@@ -78,10 +78,13 @@ class ServerSettings:
     grpc_health_timeout_seconds: float = 2.0
     max_jpeg_bytes: int = MAX_JPEG_BYTES
     anonymization_mode: str = "blur"
+    target_fps: int | None = None
 
     def __post_init__(self) -> None:
         if self.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
             raise ValueError("invalid anonymization_mode")
+        if self.target_fps is not None and not 1 <= self.target_fps <= 240:
+            raise ValueError("target_fps must be in 1..240")
         target = self.grpc_target.strip()
         validate_session_id(self.session_id)
         if not target:
@@ -491,7 +494,8 @@ class GrpcDemoGateway:
                 "client_window": REQUEST_WINDOW
                 if self.settings.anonymization_mode == "blur"
                 else 1,
-                "target_fps": TARGET_FPS if self.settings.anonymization_mode == "blur" else 10,
+                "target_fps": self.settings.target_fps
+                or (TARGET_FPS if self.settings.anonymization_mode == "blur" else 10),
                 "frame_timeout_ms": 1500 if self.settings.anonymization_mode == "blur" else 60_000,
             },
             "enrollment_content_types": ["image/jpeg", "image/png", "image/webp"],
@@ -835,6 +839,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--grpc-target", default="127.0.0.1:50051")
     parser.add_argument(
+        "--target-fps", type=int, help="browser input FPS limit (default: mode preset)"
+    )
+    parser.add_argument(
         "--anonymization-mode", choices=("blur", "face_swap", "face_metadata"), default="blur"
     )
     parser.add_argument("--session-id", default="demo-session")
@@ -858,6 +865,7 @@ def main() -> None:
         raise SystemExit("--ssl-certfile and --ssl-keyfile must be supplied together")
     settings = ServerSettings(
         anonymization_mode=args.anonymization_mode,
+        target_fps=args.target_fps,
         session_id=args.session_id,
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,

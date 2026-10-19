@@ -106,9 +106,11 @@ def from_paddle(source, *, fuse: bool = True) -> MobileFaceSwapUNet:
 class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
     """Per-frame synthesis on MPS/CUDA; first-use source conditioning on Paddle CPU."""
 
-    def __init__(self, model_dir: Path, provider: str):
+    def __init__(self, model_dir: Path, provider: str, *, precision: str = "fp32"):
         if provider not in {"mps", "cuda"}:
             raise ValueError("torch MobileFaceSwap provider must be mps or cuda")
+        if precision not in {"fp32", "fp16"} or (precision == "fp16" and provider != "cuda"):
+            raise ValueError("MobileFaceSwap fp16 is supported only on CUDA")
         if provider == "mps" and not torch.backends.mps.is_available():
             raise RuntimeError("PyTorch MPS is unavailable")
         if provider == "cuda" and not torch.cuda.is_available():
@@ -117,6 +119,7 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
             model_dir, "cpu", landmarks_provider="coreml" if provider == "mps" else "cuda"
         )
         self.device = torch.device(provider)
+        self.dtype = torch.float16 if precision == "fp16" else torch.float32
         self.torch_sources: OrderedDict[tuple[Path, str | None], nn.Module] = OrderedDict()
 
     def torch_source_model(self, preset: FacePreset) -> nn.Module:
@@ -124,7 +127,7 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
         if key not in self.torch_sources:
             source = self.source_model(preset)
             self.torch_sources[key] = from_paddle(source).to(
-                self.device, memory_format=torch.channels_last
+                self.device, dtype=self.dtype, memory_format=torch.channels_last
             )
             if len(self.torch_sources) > 16:
                 self.torch_sources.popitem(last=False)
@@ -135,8 +138,8 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
         model = self.torch_source_model(preset)
         with torch.inference_mode():
             values = torch.from_numpy(image_tensor(crop)).to(
-                self.device, memory_format=torch.channels_last
+                self.device, dtype=self.dtype, memory_format=torch.channels_last
             )
             generated, mask = model(values)
             # CPU copies synchronize the GPU before paste-back and timing completion.
-            return generated.cpu().numpy(), mask.cpu().numpy()
+            return generated.float().cpu().numpy(), mask.float().cpu().numpy()

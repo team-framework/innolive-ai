@@ -120,6 +120,10 @@ class ScrfdLandmarks:
                 ),
             )
         elif provider == "cuda":
+            # Use the CUDA/cuDNN libraries supplied by the matching PyTorch wheel.
+            # CUDA wheels are a separate install from the Mac/CPU ORT dependency.
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls()
             providers.insert(0, names[provider])
         self.session = ort.InferenceSession(str(path), sess_options=options, providers=providers)
         if names[provider] not in self.session.get_providers():

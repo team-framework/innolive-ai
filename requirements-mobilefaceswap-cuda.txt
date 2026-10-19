@@ -1,0 +1,5 @@
+# Linux x86_64 / Python 3.12. Install in a dedicated environment, without CPU onnxruntime.
+-r requirements.txt
+paddlepaddle==3.3.1
+# CUDA 13 / cuDNN 9, matching the torch 2.13 PyPI CUDA wheel.
+onnxruntime-gpu==1.30.0

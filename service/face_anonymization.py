@@ -47,6 +47,7 @@ class FaceAnonymizationConfig:
     retention_frames: int = 30
     swap_backend: str = "inswapper"
     mobilefaceswap_dir: Path = DEFAULT_MODEL_DIR
+    mobilefaceswap_precision: str = "fp32"
 
     def __post_init__(self) -> None:
         if self.swap_backend not in {"inswapper", "mobilefaceswap"}:
@@ -55,6 +56,12 @@ class FaceAnonymizationConfig:
             raise ValueError("swap_provider must be cpu, mps or cuda")
         if self.swap_backend == "inswapper" and self.swap_provider == "mps":
             raise ValueError("InSwapper supports cpu or cuda; mps requires MobileFaceSwap")
+        if self.mobilefaceswap_precision not in {"fp32", "fp16"}:
+            raise ValueError("mobilefaceswap_precision must be fp32 or fp16")
+        if self.mobilefaceswap_precision == "fp16" and (
+            self.swap_backend != "mobilefaceswap" or self.swap_provider != "cuda"
+        ):
+            raise ValueError("MobileFaceSwap fp16 requires the mobilefaceswap CUDA backend")
         if self.retention_frames < 1:
             raise ValueError("identity retention must be positive")
 
@@ -102,7 +109,9 @@ class FaceAnonymizationRuntime:
                     from service.mobilefaceswap_torch import TorchMobileFaceSwapRenderer
 
                     self.renderer = TorchMobileFaceSwapRenderer(
-                        self.config.mobilefaceswap_dir, self.config.swap_provider
+                        self.config.mobilefaceswap_dir,
+                        self.config.swap_provider,
+                        precision=self.config.mobilefaceswap_precision,
                     )
             else:
                 self.renderer = InSwapperRenderer(

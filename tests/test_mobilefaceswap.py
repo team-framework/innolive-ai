@@ -105,6 +105,24 @@ class MobileFaceSwapTests(unittest.TestCase):
                 load_weights(model, Path("weights.pdparams"), paddle)
         model.set_state_dict.assert_not_called()
 
+    def test_fp16_is_explicit_and_requires_mobilefaceswap_cuda(self):
+        self.assertEqual(FaceAnonymizationConfig().mobilefaceswap_precision, "fp32")
+        for backend, provider in (
+            ("inswapper", "cuda"),
+            ("mobilefaceswap", "cpu"),
+            ("mobilefaceswap", "mps"),
+        ):
+            with self.assertRaisesRegex(ValueError, "fp16 requires"):
+                FaceAnonymizationConfig(
+                    swap_backend=backend, swap_provider=provider, mobilefaceswap_precision="fp16"
+                )
+        config = FaceAnonymizationConfig(
+            swap_backend="mobilefaceswap", swap_provider="cuda", mobilefaceswap_precision="fp16"
+        )
+        with patch("service.mobilefaceswap_torch.TorchMobileFaceSwapRenderer") as renderer:
+            FaceAnonymizationRuntime(config)._renderer()
+            renderer.assert_called_once_with(config.mobilefaceswap_dir, "cuda", precision="fp16")
+
     def test_source_hash_failure_prevents_detection_and_model_build(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.png"

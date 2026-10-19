@@ -1166,6 +1166,7 @@ def parse_args() -> argparse.Namespace:
         "--face-swap-backend", choices=("inswapper", "mobilefaceswap"), default="inswapper"
     )
     parser.add_argument("--mobilefaceswap-dir", type=Path, default=experimental.mobilefaceswap_dir)
+    parser.add_argument("--mobilefaceswap-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
     parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
     parser.add_argument("--face-swap-model", type=Path, default=experimental.swapper_model)
@@ -1199,6 +1200,7 @@ def main() -> None:
         face_anonymization=FaceAnonymizationConfig(
             swap_backend=arguments.face_swap_backend,
             mobilefaceswap_dir=arguments.mobilefaceswap_dir,
+            mobilefaceswap_precision=arguments.mobilefaceswap_precision,
             metadata_model=arguments.face_metadata_model,
             preset_manifest=arguments.face_preset_manifest,
             swapper_model=arguments.face_swap_model,
