@@ -249,8 +249,10 @@ class LoopbackServer:
         adaface: FakeAdaFace | None = None,
         max_sessions: int = 1_024,
         max_long_edge: int = MAX_LONG_EDGE,
+        stream_pipeline_depth: int = 1,
     ):
         self.runtime = runtime
+        self.stream_pipeline_depth = stream_pipeline_depth
         self.inference_timeout_seconds = inference_timeout_seconds
         self.adaface = adaface
         self.max_long_edge = max_long_edge
@@ -275,6 +277,7 @@ class LoopbackServer:
             inference_timeout_seconds=self.inference_timeout_seconds,
             shutdown_grace_seconds=0,
             max_long_edge=self.max_long_edge,
+            stream_pipeline_depth=self.stream_pipeline_depth,
         )
         self.bundle = build_grpc_server(
             settings,
@@ -1170,6 +1173,98 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await call.read(), grpc.aio.EOF)
             await _wait_until(lambda: server.bundle.servicer.active_streams == 0)
             self.assertTrue(server.trackers[0].reset_after_inference)
+
+
+def _raw_frames(count: int, width: int = 64, height: int = 36) -> list[Any]:
+    rng = np.random.default_rng(69)
+    frames = []
+    for frame_id in range(1, count + 1):
+        image = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+        frames.append(
+            ai_processor_pb2.VideoChunk(
+                data=cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420).tobytes(),
+                timestamp=frame_id,
+                frame_id=frame_id,
+                batch_size=1,
+                session_id="session-a",
+                output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
+                width=width,
+                height=height,
+                pix_fmt="yuv420p",
+            )
+        )
+    return frames
+
+
+class RecordingFaceRuntime(FaceRuntime):
+    """Signals when a given frame's inference starts, from any thread."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started: dict[int, threading.Event] = {}
+
+    def started_event(self, frame: int) -> threading.Event:
+        return self.started.setdefault(frame, threading.Event())
+
+    async def infer(self, image: np.ndarray, tracker: FakeTracker) -> dict[str, Any]:
+        self.started_event(tracker.frame_id + 1).set()
+        return await super().infer(image, tracker)
+
+
+class StreamPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, depth: int, frames: list[Any], runtime: FakeRuntime | None = None):
+        server = LoopbackServer(runtime or FaceRuntime(), stream_pipeline_depth=depth)
+        async with server:
+            responses = await _collect(server.stub.ProcessVideo(_requests(*frames)))
+        return responses, server
+
+    async def test_pipelined_responses_match_sequential_in_request_order(self):
+        frames = _raw_frames(8)
+        sequential, _ = await self._run(1, frames)
+        pipelined, server = await self._run(2, frames)
+
+        self.assertEqual([r.frame_id for r in pipelined], list(range(1, 9)))
+        self.assertEqual([r.status_message for r in pipelined], ["success"] * 8)
+        self.assertEqual([r.data for r in pipelined], [r.data for r in sequential])
+        self.assertEqual(server.trackers[0].frame_id, 8)
+        self.assertTrue(server.trackers[0].reset_called)
+
+    async def test_next_frame_is_prepared_while_the_previous_frame_composes(self):
+        for depth, expected in ((2, True), (1, False)):
+            runtime = RecordingFaceRuntime()
+            overlapped: list[bool] = []
+
+            def compose(*args: Any, **kwargs: Any) -> bytes:
+                if not overlapped:
+                    # Frame 1 composes until frame 2's inference starts, or gives up.
+                    overlapped.append(runtime.started_event(2).wait(timeout=0.3 if depth == 1 else 2))
+                return mosaic_yuv420p(*args, **kwargs)
+
+            with self.subTest(depth=depth), patch("ai_processor_server.mosaic_yuv420p", compose):
+                responses, _ = await self._run(depth, _raw_frames(3), runtime)
+                self.assertEqual([r.frame_id for r in responses], [1, 2, 3])
+                self.assertEqual(overlapped, [expected])
+
+    async def test_pipelined_abort_returns_earlier_frames_first(self):
+        frames = _raw_frames(2)
+        frames[1].session_id = "session-b"
+        server = LoopbackServer(FaceRuntime(), stream_pipeline_depth=2)
+        received = []
+        async with server:
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                async for response in server.stub.ProcessVideo(_requests(*frames)):
+                    received.append(response.frame_id)
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(received, [1])
+        self.assertTrue(server.trackers[0].reset_called)
+
+    def test_pipeline_depth_is_bounded(self):
+        for depth in (0, 5):
+            with self.subTest(depth=depth), self.assertRaises(ValueError):
+                GrpcServerSettings(
+                    runtime=RuntimeConfig(engine=Path("unused.engine")),
+                    stream_pipeline_depth=depth,
+                )
 
 
 if __name__ == "__main__":
