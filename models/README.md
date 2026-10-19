@@ -69,3 +69,9 @@ See [the preset pipeline guide](../docs/face-preset-anonymization.md) for artifa
 optional ONNX dependencies, the manifest, and the actual gRPC test client.
 For official download commands and preset installation, see
 [the model download guide](../docs/face-swap-model-download.md).
+## MobileFaceSwap 224 (Mac 테스트)
+
+`mobilefaceswap/MobileFaceSwap_224.pdparams`, `mobilefaceswap/arcface.pdparams`,
+`mobilefaceswap/landmarks/scrfd_10g_bnkps.onnx`를 로컬에 두면 기존 `best.pt`를 유지한 채
+`./scripts/run_mobilefaceswap.sh`로 테스트할 수 있다.
+설치·실행·검증 범위는 [Mac 테스트 가이드](../docs/mobilefaceswap-mac.md)를 참고한다.

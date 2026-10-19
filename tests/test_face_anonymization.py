@@ -201,6 +201,25 @@ class AnonymizationTests(unittest.TestCase):
         self.assertEqual(self.runtime.extractor.predict.call_count, 3)
         self.assertEqual(self.runtime.renderer.swap.call_count, 61)
 
+    def test_mobilefaceswap_shares_original_frame_only_within_one_process_call(self):
+        self.presets()
+        self.runtime.config = FaceAnonymizationConfig(swap_backend="mobilefaceswap")
+        self.runtime.extractor.predict.return_value *= 2
+        renderer = self.runtime.renderer = Mock()
+        renderer.prepare_frame.side_effect = [object(), object()]
+        renderer.swap.side_effect = lambda image, *_, **__: np.full_like(image, 80)
+        objects = [face(1), face(2)]
+        self.process(objects)
+        renderer.prepare_frame.assert_called_once()
+        self.assertIs(renderer.prepare_frame.call_args.args[0], self.image)
+        first, second = renderer.swap.call_args_list
+        self.assertIs(first.kwargs["target"], second.kwargs["target"])
+        np.testing.assert_array_equal(first.args[0], self.image)
+        np.testing.assert_array_equal(second.args[0], np.full_like(self.image, 80))
+        self.process([face(1)], frame=2)
+        self.assertEqual(renderer.prepare_frame.call_count, 2)
+        self.assertIsNot(first.kwargs["target"], renderer.swap.call_args.kwargs["target"])
+
     def test_tracks_refresh_on_independent_schedules_and_batch_only_due_faces(self):
         self.process([face(1)], mode=2)
         self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]

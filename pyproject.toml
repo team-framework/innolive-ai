@@ -1,6 +1,7 @@
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["service/_vendor"]
 exclude = ["protos/ai_processor_pb2.py", "protos/ai_processor_pb2_grpc.py", "protos/ai_processor_pb2.pyi"]
 
 [tool.ruff.lint]

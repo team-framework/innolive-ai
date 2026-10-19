@@ -23,6 +23,7 @@ from service.face_presets import (
     StreamFaceIdentities,
 )
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
+from service.mobilefaceswap import DEFAULT_MODEL_DIR
 from service.mosaic import (
     _encode_jpeg,
     _encode_yuv420p,
@@ -45,10 +46,16 @@ class FaceAnonymizationConfig:
     metadata_device: str = "cpu"
     swap_provider: str = "cpu"
     retention_frames: int = 30
+    swap_backend: str = "inswapper"
+    mobilefaceswap_dir: Path = DEFAULT_MODEL_DIR
 
     def __post_init__(self) -> None:
-        if self.swap_provider not in {"cpu", "cuda"}:
-            raise ValueError("swap_provider must be cpu or cuda")
+        if self.swap_backend not in {"inswapper", "mobilefaceswap"}:
+            raise ValueError("swap_backend must be inswapper or mobilefaceswap")
+        if self.swap_provider not in {"cpu", "mps", "cuda"}:
+            raise ValueError("swap_provider must be cpu, mps or cuda")
+        if self.swap_backend == "inswapper" and self.swap_provider == "mps":
+            raise ValueError("InSwapper supports cpu or cuda; mps requires MobileFaceSwap")
         if self.retention_frames < 1:
             raise ValueError("identity retention must be positive")
 
@@ -87,15 +94,35 @@ class FaceAnonymizationRuntime:
         if self.renderer is not None:
             return
         try:
-            self.renderer = InSwapperRenderer(
-                self.config.swapper_model,
-                self.config.arcface_model,
-                self.config.yunet_model,
+            if self.config.swap_backend == "mobilefaceswap":
+                if self.config.swap_provider == "cpu":
+                    from service.mobilefaceswap import MobileFaceSwapRenderer
+
+                    self.renderer = MobileFaceSwapRenderer(self.config.mobilefaceswap_dir, "cpu")
+                else:
+                    from service.mobilefaceswap_torch import TorchMobileFaceSwapRenderer
+
+                    self.renderer = TorchMobileFaceSwapRenderer(
+                        self.config.mobilefaceswap_dir, self.config.swap_provider
+                    )
+            else:
+                self.renderer = InSwapperRenderer(
+                    self.config.swapper_model,
+                    self.config.arcface_model,
+                    self.config.yunet_model,
+                    self.config.swap_provider,
+                )
+            LOGGER.info(
+                "face swap renderer ready: backend=%s provider=%s",
+                self.config.swap_backend,
                 self.config.swap_provider,
             )
         except Exception:
             self.renderer_error = "swapper_unavailable"
-            LOGGER.exception("experimental InSwapper unavailable; restart after fixing artifacts")
+            LOGGER.exception(
+                "experimental %s unavailable; restart after fixing artifacts",
+                self.config.swap_backend,
+            )
             raise
 
     def process(
@@ -169,6 +196,7 @@ class FaceAnonymizationRuntime:
                 track_id = eligible[index].get("track_id")
                 if track_id is not None:
                     identities.cache_metadata(int(track_id), prediction, frame)
+        swap_frame = None
         for item, prediction in zip(eligible, predictions, strict=True):
             if prediction is None:
                 continue
@@ -193,7 +221,12 @@ class FaceAnonymizationRuntime:
                 continue
             try:
                 self._renderer()
-                candidate = self.renderer.swap(output.copy(), item, preset)
+                if self.config.swap_backend == "mobilefaceswap":
+                    if swap_frame is None:
+                        swap_frame = self.renderer.prepare_frame(image)
+                    candidate = self.renderer.swap(output.copy(), item, preset, target=swap_frame)
+                else:
+                    candidate = self.renderer.swap(output.copy(), item, preset)
                 if candidate.shape != image.shape or candidate.dtype != np.uint8:
                     raise ValueError("invalid rendered frame")
                 output = candidate

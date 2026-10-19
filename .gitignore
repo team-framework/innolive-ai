@@ -77,6 +77,7 @@ Thumbs.db
 /models/*.ckpt
 /models/*.onnx
 /models/face_swap/
+/models/mobilefaceswap/
 /face_swap_lab_output/
 
 # Synthetic preset image assets and test-client recordings.

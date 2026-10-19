@@ -627,6 +627,10 @@ export function negotiateServerProfile(health, preferred = PROFILE) {
     240,
     violations,
   );
+  const timeoutMs = finiteRange(
+    profile.frame_timeout_ms ?? preferred.timeoutMs,
+    "frame_timeout_ms", 1, 120000, violations,
+  );
   const maxStreams = profile.max_streams === undefined || Number(profile.max_streams) === 0
     ? null
     : positiveInteger(profile.max_streams, "max_streams", violations);
@@ -644,7 +648,7 @@ export function negotiateServerProfile(health, preferred = PROFILE) {
     jpegQuality: Math.min(preferred.jpegQuality, jpegQuality / 100),
     targetFps: Math.min(preferred.targetFps, targetFps),
     requestWindow: Math.min(preferred.requestWindow, requestWindow),
-    timeoutMs: preferred.timeoutMs,
+    timeoutMs,
     upscaleSmallInputs: preferred.upscaleSmallInputs,
     maxStreams,
   });

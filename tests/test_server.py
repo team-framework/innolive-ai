@@ -272,13 +272,19 @@ class FakeGrpcClient:
         )
 
 
-def app(client: FakeGrpcClient | None = None, *, max_jpeg_bytes: int = 4096):
+def app(
+    client: FakeGrpcClient | None = None,
+    *,
+    max_jpeg_bytes: int = 4096,
+    anonymization_mode: str = "blur",
+):
     fake = client or FakeGrpcClient()
     application = create_app(
         ServerSettings(
             session_id="demo-session",
             grpc_target="test-grpc:50051",
             max_jpeg_bytes=max_jpeg_bytes,
+            anonymization_mode=anonymization_mode,
         ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
@@ -286,6 +292,37 @@ def app(client: FakeGrpcClient | None = None, *, max_jpeg_bytes: int = 4096):
 
 
 class GrpcDemoGatewayTests(unittest.TestCase):
+    def test_face_swap_gateway_sends_mode_and_shows_processed_image(self):
+        application, fake = app(anonymization_mode="face_swap")
+        with TestClient(application) as client:
+            health = client.get("/healthz").json()
+            response = client.post("/api/infer-image?session_id=swap-test", content=jpeg())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake.received[0].anonymization_mode, "face_swap")
+        self.assertEqual(health["serving_profile"]["client_window"], 1)
+        self.assertEqual(health["serving_profile"]["frame_timeout_ms"], 60000)
+        payload = response.json()
+        result = cv2.imdecode(
+            np.frombuffer(base64.b64decode(payload["visualization"]["jpeg_base64"]), np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        # The fake's processed pixels are 192; the uploaded source pixels were zero.
+        self.assertGreater(float(result[20:, 45:].mean()), 150)
+
+    def test_face_swap_websocket_sends_mode(self):
+        application, fake = app(anonymization_mode="face_swap")
+        with TestClient(application) as client, client.websocket_connect("/ws") as websocket:
+            websocket.send_bytes(encode_request(1, jpeg()))
+            result, _ = decode_result(websocket.receive_bytes())
+        self.assertEqual(result["type"], "result")
+        self.assertEqual(fake.received[0].anonymization_mode, "face_swap")
+
+    def test_face_swap_image_rejects_missing_processed_pixels(self):
+        application, _ = app(FakeGrpcClient(mode="missing_data"), anonymization_mode="face_swap")
+        with TestClient(application) as client:
+            result = client.post("/api/infer-image?session_id=swap-test", content=jpeg())
+        self.assertNotEqual(result.status_code, 200)
+
     def test_browser_gateway_no_longer_requires_a_manual_session_argument(self):
         with patch("sys.argv", ["server.py", "--host", "127.0.0.1", "--port", "8002"]):
             arguments = parse_args()

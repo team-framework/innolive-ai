@@ -77,8 +77,11 @@ class ServerSettings:
     grpc_connect_timeout_seconds: float = 10.0
     grpc_health_timeout_seconds: float = 2.0
     max_jpeg_bytes: int = MAX_JPEG_BYTES
+    anonymization_mode: str = "blur"
 
     def __post_init__(self) -> None:
+        if self.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
+            raise ValueError("invalid anonymization_mode")
         target = self.grpc_target.strip()
         validate_session_id(self.session_id)
         if not target:
@@ -314,13 +317,25 @@ class GrpcDemoGateway:
                 )
 
             result = None
-            async with aclosing(
-                client.process_jpegs(
-                    [model_input_jpeg],
+            if self.settings.anonymization_mode == "blur":
+                stream = client.process_jpegs([model_input_jpeg], session_id=session_id, window=1)
+            else:
+
+                async def image_frames():
+                    yield VideoFrame(
+                        model_input_jpeg,
+                        time.perf_counter_ns(),
+                        1,
+                        anonymization_mode=self.settings.anonymization_mode,
+                    )
+
+                stream = client.process_video(
+                    image_frames(),
                     session_id=session_id,
                     window=1,
+                    raise_frame_errors=True,
                 )
-            ) as results:
+            async with aclosing(stream) as results:
                 async for item in results:
                     result = item
                     break
@@ -335,7 +350,14 @@ class GrpcDemoGateway:
                     "gRPC image result dimensions do not match the resized model input"
                 )
             objects = [_face_object(face) for face in response.faces]
-            visualization = annotate_detections(model_input, objects)
+            visualization_input = model_input
+            if self.settings.anonymization_mode != "blur":
+                visualization_input = decode_image(
+                    result.processed_jpeg, FrameLimits(max_jpeg_bytes=self.settings.max_jpeg_bytes)
+                )
+                if visualization_input.shape != model_input.shape:
+                    raise VideoClientError("invalid anonymized image dimensions")
+            visualization = annotate_detections(visualization_input, objects)
             visualization_jpeg = encode_jpeg(visualization, JPEG_QUALITY)
         except PayloadTooLarge as error:
             return _api_error(413, "PAYLOAD_TOO_LARGE", str(error))
@@ -363,6 +385,7 @@ class GrpcDemoGateway:
                     "jpeg_base64": base64.b64encode(visualization_jpeg).decode("ascii"),
                 },
                 "objects": objects,
+                "anonymization_mode": self.settings.anonymization_mode,
                 "elapsed_ms": round((time.perf_counter() - started) * 1_000, 2),
             },
             headers={"Cache-Control": "no-store"},
@@ -451,6 +474,7 @@ class GrpcDemoGateway:
     def _health_payload(self, serving: bool) -> dict[str, Any]:
         return {
             "status": "ok" if serving else "not_ready",
+            "anonymization_mode": self.settings.anonymization_mode,
             "profile": PROFILE,
             "protocol": {"name": "ILF1", "version": VERSION},
             "transport_path": ["browser-websocket", "grpc-bidi-ProcessVideo"],
@@ -464,8 +488,11 @@ class GrpcDemoGateway:
                 "image_size": IMAGE_SIZE,
                 "max_long_edge": IMAGE_SIZE,
                 "jpeg_quality": JPEG_QUALITY,
-                "client_window": REQUEST_WINDOW,
-                "target_fps": TARGET_FPS,
+                "client_window": REQUEST_WINDOW
+                if self.settings.anonymization_mode == "blur"
+                else 1,
+                "target_fps": TARGET_FPS if self.settings.anonymization_mode == "blur" else 10,
+                "frame_timeout_ms": 1500 if self.settings.anonymization_mode == "blur" else 60_000,
             },
             "enrollment_content_types": ["image/jpeg", "image/png", "image/webp"],
             "active_streams": self.active_streams,
@@ -580,6 +607,7 @@ class GrpcWebSocketSession:
             data=jpeg,
             timestamp=time.perf_counter_ns(),
             frame_id=sequence,
+            anonymization_mode=self.settings.anonymization_mode,
         )
 
     async def _frame_source(self) -> AsyncIterator[VideoFrame]:
@@ -719,6 +747,14 @@ def _face_object(face: Any) -> dict[str, Any]:
     }
     if face.HasField("track_id"):
         item["track_id"] = int(face.track_id)
+    if face.HasField("anonymization"):
+        info = face.anonymization
+        item["anonymization"] = {
+            "status": info.status,
+            "fallback_reason": info.fallback_reason,
+            "identity_key": info.identity_key,
+            "preset_key": info.preset_key,
+        }
     return item
 
 
@@ -798,6 +834,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--grpc-target", default="127.0.0.1:50051")
+    parser.add_argument(
+        "--anonymization-mode", choices=("blur", "face_swap", "face_metadata"), default="blur"
+    )
     parser.add_argument("--session-id", default="demo-session")
     parser.add_argument("--grpc-connect-timeout", type=float, default=10.0)
     parser.add_argument("--grpc-health-timeout", type=float, default=2.0)
@@ -818,6 +857,7 @@ def main() -> None:
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         raise SystemExit("--ssl-certfile and --ssl-keyfile must be supplied together")
     settings = ServerSettings(
+        anonymization_mode=args.anonymization_mode,
         session_id=args.session_id,
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,

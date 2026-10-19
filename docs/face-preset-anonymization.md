@@ -4,6 +4,9 @@
 얼굴에 metadata 추출과 프리셋 매칭을 연결한다. 프리셋이 아직 없는 상태에서도
 metadata와 identity 할당 결과를 확인할 수 있다.
 
+기본 renderer는 InSwapper-128이다. `--face-swap-backend mobilefaceswap`으로
+MobileFaceSwap 224를 선택하는 Mac 테스트 경로는 [별도 가이드](mobilefaceswap-mac.md)를 참고한다.
+
 ## 요청 모드
 
 | `VideoChunk.anonymization_mode` | Python `VideoFrame.anonymization_mode` / 클라이언트 `--mode` | 동작 |

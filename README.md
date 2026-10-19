@@ -237,6 +237,9 @@ importer로 설치합니다. `FACE_ANONYMIZATION_MODE_FACE_METADATA`로 속성�
 Go 서버의 요청 필드와 값별 동작은 [Go 연동 가이드](docs/go-face-swap-grpc.md),
 모델 다운로드와 프리셋 설치는 [모델 준비 가이드](docs/face-swap-model-download.md)를 참고합니다.
 
+Mac에서 `best.pt`를 유지하면서 **MobileFaceSwap 224**를 테스트하려면
+[실행 가이드](docs/mobilefaceswap-mac.md)의 `./scripts/run_mobilefaceswap.sh`를 사용합니다.
+
 ## 검증
 
 ```bash
