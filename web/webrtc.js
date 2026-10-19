@@ -1,6 +1,8 @@
 export function h264Codecs(capabilities) {
-  return capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264")
+  const video = capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264")
     .sort((a, b) => Number(b.sdpFmtpLine?.includes("profile-level-id=42e0")) - Number(a.sdpFmtpLine?.includes("profile-level-id=42e0")));
+  // Keep retransmission codecs so packet loss can recover without a new keyframe.
+  return video.length ? [...video, ...capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/rtx")] : [];
 }
 
 export function resultIsStale(lastFrameAt, now, timeout = 2000) {

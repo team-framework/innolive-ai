@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, Response
 from grpc_client import VideoClientError, VideoFrame, VideoRpcError
 from service.recognition import validate_session_id
 from service.webrtc_encoder import configure_encoder
+from service.webrtc_transport import configure_receiver
 
 LOGGER = logging.getLogger("innolive.webrtc")
 VIDEO_TIME_BASE = Fraction(1, 90_000)
@@ -115,11 +116,13 @@ class ProcessedVideoTrack(MediaStreamTrack):
             self.slot.close()
 
     async def _frames(self):
-        seq, pts, last = 0, -1, 0.0
+        seq, pts, deadline = 0, -1, time.monotonic()
         while not self.closed:
-            await asyncio.sleep(max(0, last + 1 / self.fps - time.monotonic()))
+            await asyncio.sleep(max(0, deadline - time.monotonic()))
             frame = await asyncio.wait_for(self.slot.get(), 15)
-            last = time.monotonic()
+            # Keep the camera cadence after a late packet; resetting the entire
+            # interval on each arrival accumulates jitter and drops healthy frames.
+            deadline = max(deadline + 1 / self.fps, time.monotonic())
             seq += 1
             request = await asyncio.to_thread(pack_frame, frame, seq, pts, self.mode)
             pts = request.timestamp
@@ -140,6 +143,11 @@ class ProcessedVideoTrack(MediaStreamTrack):
                     "type": "frame",
                     "seq": response.frame_id,
                     "server_ms": round(response.timing.server_total_ms, 2),
+                    "stages_ms": {
+                        "queue": round(response.timing.queue_ms, 2),
+                        "detect": round(response.timing.inference_ms, 2),
+                        "render": round(response.timing.blur_encode_ms, 2),
+                    },
                     "received": self.slot.received,
                     "processed": self.processed,
                     "dropped": self.slot.dropped,
@@ -286,9 +294,10 @@ class WebRtcGateway:
                 codecs = [
                     c
                     for c in RTCRtpSender.getCapabilities("video").codecs
-                    if c.mimeType.lower() == "video/h264"
+                    if c.mimeType.lower() in {"video/h264", "video/rtx"}
                 ]
                 transceivers[0].setCodecPreferences(codecs)
+                configure_receiver(transceivers[0].receiver)
                 await pc.setLocalDescription(await pc.createAnswer())
             return JSONResponse(
                 {

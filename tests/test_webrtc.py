@@ -1,4 +1,5 @@
 import asyncio
+import os
 import unittest
 from fractions import Fraction
 from types import SimpleNamespace
@@ -9,10 +10,14 @@ import numpy as np
 try:
     import av
     from aiortc import MediaStreamTrack
+    from aiortc.codecs.h264 import H264Decoder, H264PayloadDescriptor
+    from aiortc.jitterbuffer import JitterFrame
     from aiortc.mediastreams import MediaStreamError
+    from aiortc.rtp import RtpPacket
 
     from service.webrtc import LatestFrameSlot, ProcessedVideoTrack, WebRtcGateway, pack_frame
     from service.webrtc_encoder import RealtimeH264Encoder, configure_encoder
+    from service.webrtc_transport import MarkerJitterBuffer
 except ImportError as error:
     raise unittest.SkipTest("install requirements-webrtc.txt for WebRTC tests") from error
 
@@ -118,6 +123,99 @@ class WebRtcTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(packets)
             self.assertEqual(timestamp, i * 3000)
         self.assertEqual(encoder.codec.max_b_frames, 0)
+        encoder.target_bitrate = 700_000
+        encoder.encode(self.frame(64, 64, 9000), False)
+        self.assertEqual(encoder.codec.thread_count, 2)
+
+    def test_irregular_camera_timestamps_are_not_quantized_together(self):
+        encoder = RealtimeH264Encoder("libx264")
+        for pts in (0, 1400, 3100, 4600, 8000):
+            packets, timestamp = encoder.encode(self.frame(64, 64, pts), pts == 0)
+            self.assertTrue(packets)
+            self.assertEqual(timestamp, pts)
+
+    def test_marked_frames_do_not_wait_for_the_next_timestamp(self):
+        buffer = MarkerJitterBuffer(capacity=128, is_video=True)
+        packet = RtpPacket(sequence_number=65535, timestamp=100, marker=1)
+        packet._data = b"first"
+        pli, frame = buffer.add(packet)
+        self.assertFalse(pli)
+        self.assertEqual((frame.data, frame.timestamp), (b"first", 100))
+        packet = RtpPacket(sequence_number=0, timestamp=200, marker=1)
+        packet._data = b"second"
+        self.assertEqual(buffer.add(packet)[1].data, b"second")
+
+    def test_marker_never_flushes_a_frame_with_missing_packets(self):
+        buffer = MarkerJitterBuffer(capacity=128, is_video=True)
+        packets = []
+        for seq in range(10, 13):
+            packet = RtpPacket(sequence_number=seq, timestamp=100, marker=int(seq == 12))
+            packet._data = bytes([seq])
+            packets.append(packet)
+        self.assertIsNone(buffer.add(packets[0])[1])
+        self.assertIsNone(buffer.add(packets[2])[1])
+        self.assertEqual(buffer.add(packets[1])[1].data, bytes([10, 11, 12]))
+        self.assertIsNone(buffer.add(packets[1])[1])
+
+    def test_rtp_payloads_fit_tunnel_mtu_after_encoder_configuration(self):
+        configure_encoder("x264")
+        encoder = RealtimeH264Encoder("libx264")
+        pixels = np.random.default_rng(1).integers(0, 256, (480, 640, 3), dtype=np.uint8)
+        frame = av.VideoFrame.from_ndarray(pixels, format="bgr24")
+        frame.pts, frame.time_base = 0, Fraction(1, 90_000)
+        packets, _ = encoder.encode(frame, force_keyframe=True)
+        self.assertGreater(len(packets), 1)
+        self.assertLessEqual(max(map(len, packets)), 1150)
+
+    @unittest.skipUnless(os.environ.get("INNOLIVE_TEST_NVENC") == "1", "requires NVIDIA NVENC")
+    def test_nvenc_bitrate_changes_keep_session_and_return_decodable_frames(self):
+        configure_encoder("nvenc")
+        encoder, decoder = RealtimeH264Encoder("h264_nvenc"), H264Decoder()
+        context = None
+        for i, bitrate in enumerate((1_500_000, 800_000, 2_500_000, 500_000, 1_500_000)):
+            encoder.target_bitrate = bitrate
+            pts = (0, 1400, 3100, 4600, 8000)[i]
+            packets, timestamp = encoder.encode(self.frame(640, 480, pts), i == 0)
+            self.assertTrue(packets)
+            self.assertEqual(timestamp, pts)
+            if context is None:
+                context = encoder.codec
+            self.assertIs(encoder.codec, context)
+            annex_b = b"".join(H264PayloadDescriptor.parse(p)[1] for p in packets)
+            decoded = decoder.decode(JitterFrame(annex_b, timestamp))
+            self.assertEqual(len(decoded), 1)
+            self.assertEqual((decoded[0].width, decoded[0].height), (640, 480))
+
+    async def test_late_arrival_does_not_shift_every_following_frame_deadline(self):
+        source, client = Source(), Client()
+        track = ProcessedVideoTrack(
+            source, client, "test", "face_swap", lambda _: None, lambda: None
+        )
+        clock, sleeps = [0.0], []
+
+        async def sleep(delay):
+            sleeps.append(delay)
+            clock[0] += delay
+
+        async def delayed_get(awaitable, timeout):
+            result = await asyncio.wait_for(awaitable, timeout)
+            if len(sleeps) == 1:
+                clock[0] += 0.010  # First packet arrives 10ms after its deadline.
+            return result
+
+        iterator = track._frames()
+        timing = SimpleNamespace(sleep=sleep, wait_for=delayed_get, to_thread=asyncio.to_thread)
+        with (
+            patch("service.webrtc.time", SimpleNamespace(monotonic=lambda: clock[0])),
+            patch("service.webrtc.asyncio", timing),
+        ):
+            track.slot.put(self.frame())
+            await anext(iterator)
+            track.slot.put(self.frame(pts=6000))
+            await anext(iterator)
+        self.assertAlmostEqual(sleeps[1], 1 / 30 - 0.010)
+        await iterator.aclose()
+        await track.close()
 
     def test_auto_encoder_requires_a_successful_probe_and_explicit_nvenc_fails(self):
         def probe(name):

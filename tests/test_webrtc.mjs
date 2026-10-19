@@ -6,6 +6,8 @@ assert.equal(h264Codecs({codecs:[
   {mimeType:"video/H264",sdpFmtpLine:"profile-level-id=42001f"},
   {mimeType:"video/H264",sdpFmtpLine:"profile-level-id=42e01f"},
 ]})[0].sdpFmtpLine, "profile-level-id=42e01f");
+assert.deepEqual(h264Codecs({codecs:[{mimeType:"video/rtx"},{mimeType:"video/H264"}]}).map(c=>c.mimeType), ["video/H264", "video/rtx"]);
+assert.deepEqual(h264Codecs({codecs:[{mimeType:"video/VP8"},{mimeType:"video/rtx"}]}), []);
 assert.equal(resultIsStale(null, 10000), false);
 assert.equal(resultIsStale(1000, 3001), true);
 
