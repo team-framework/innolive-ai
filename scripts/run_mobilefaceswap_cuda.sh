@@ -10,6 +10,19 @@ export WEB_PORT="${WEB_PORT:-8443}"
 export AI_BACKEND="${AI_BACKEND:-tensorrt}"
 export AI_ENGINE="${AI_ENGINE:-$PROJECT_ROOT/models/best_b1.engine}"
 export MOBILEFACESWAP_PRECISION="${MOBILEFACESWAP_PRECISION:-fp16}"
+export MOBILEFACESWAP_CACHE_DIR="${MOBILEFACESWAP_CACHE_DIR:-$PROJECT_ROOT/.runtime/mobilefaceswap-cache}"
+export FACE_METADATA_WARMUP_MAX_BATCH="${FACE_METADATA_WARMUP_MAX_BATCH:-8}"
+
+# Rebooting into an updated kernel module automatically stops selecting old
+# userspace libraries. Other services and the system driver installation are untouched.
+if [[ -r /sys/module/nvidia/version ]]; then
+  NVIDIA_LOADED_VERSION="$(cat /sys/module/nvidia/version)"
+  NVIDIA_LOCAL_LIBS="${NVIDIA_USERSPACE_ROOT:-$PROJECT_ROOT/.runtime/nvidia}/$NVIDIA_LOADED_VERSION/usr/lib/x86_64-linux-gnu"
+  if [[ -f "$NVIDIA_LOCAL_LIBS/libnvidia-encode.so.$NVIDIA_LOADED_VERSION" ]]; then
+    export LD_LIBRARY_PATH="$NVIDIA_LOCAL_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "Service-local NVIDIA libraries: $NVIDIA_LOADED_VERSION"
+  fi
+fi
 
 "$PYTHON" - <<'PY'
 import os
