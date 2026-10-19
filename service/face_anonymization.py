@@ -234,6 +234,13 @@ class FaceAnonymizationRuntime:
                 if self.config.swap_backend == "mobilefaceswap":
                     if swap_frame is None:
                         swap_frame = self.renderer.prepare_frame(image)
+                        swap_frame.prime(
+                            [
+                                entry["bbox"]
+                                for entry, pred in zip(eligible, predictions, strict=True)
+                                if pred is not None and entry.get("track_id") is not None
+                            ]
+                        )
                     candidate = self.renderer.swap(output.copy(), item, preset, target=swap_frame)
                 else:
                     candidate = self.renderer.swap(output.copy(), item, preset)

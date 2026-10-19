@@ -9,6 +9,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from service.cuda_capture import CUDA_CAPTURE_LOCK
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_METADATA_MODEL = ROOT / "models" / "face_metadata_extracter.pt"
 CLASSES = {
@@ -147,7 +149,8 @@ class MetadataExtractor:
                             (batch_size, 3, self.input_size, self.input_size), device=self.device
                         ).contiguous(memory_format=torch.channels_last)
                     )
-            torch.cuda.synchronize(self.device)
+            with CUDA_CAPTURE_LOCK:
+                torch.cuda.synchronize(self.device)
 
     def prepare_inputs(self, crops: list[np.ndarray]):
         """Convert BGR crops to the same normalized RGB tensor as training inference."""

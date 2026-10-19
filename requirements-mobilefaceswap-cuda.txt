@@ -4,3 +4,5 @@
 paddlepaddle==3.3.1
 # CUDA 13 / cuDNN 9, matching the torch 2.13 PyPI CUDA wheel.
 onnxruntime-gpu==1.30.0
+# Optional SCRFD FP16 engine builder (engines remain outside Git).
+onnxconverter-common==1.16.0

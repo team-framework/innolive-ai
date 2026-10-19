@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from service.cuda_capture import CUDA_CAPTURE_LOCK
 from service.face_presets import FacePreset
 from service.mobilefaceswap import MobileFaceSwapRenderer, image_tensor
 
@@ -179,6 +180,46 @@ def from_paddle(source, *, fuse: bool = True) -> MobileFaceSwapUNet:
     return model
 
 
+class CudaGraphModel(nn.Module):
+    """One fixed crop and one identity; owned by the bounded source-model cache.
+
+    The face executor serializes calls. Each identity has separate weights, input,
+    output and graph storage, so replay never mixes different source identities.
+    """
+
+    def __init__(self, model, device, dtype):
+        super().__init__()
+        with CUDA_CAPTURE_LOCK:
+            self._capture(model, device, dtype)
+
+    def _capture(self, model, device, dtype):
+        self.model = model
+        self.values = torch.zeros((1, 3, 224, 224), device=device, dtype=dtype).contiguous(
+            memory_format=torch.channels_last
+        )
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            for _ in range(3):
+                model(self.values)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with (
+            torch.inference_mode(),
+            torch.cuda.graph(self.graph, stream=stream, capture_error_mode="thread_local"),
+        ):
+            generated, mask = model(self.values)
+            self.outputs = generated.float(), mask.float()
+        torch.cuda.current_stream(device).wait_stream(stream)
+
+    def forward(self, values):
+        if values.shape != self.values.shape:
+            raise ValueError("CUDA graph expects one 224px face crop")
+        self.values.copy_(values)
+        self.graph.replay()
+        return self.outputs
+
+
 class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
     """Per-frame synthesis on MPS/CUDA; first-use source conditioning on Paddle CPU."""
 
@@ -193,6 +234,9 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
             raise RuntimeError("PyTorch CUDA is unavailable")
         super().__init__(
             model_dir, "cpu", landmarks_provider="coreml" if provider == "mps" else "cuda"
+        )
+        self.cuda_graphs = (
+            provider == "cuda" and os.environ.get("MOBILEFACESWAP_CUDA_GRAPHS") == "1"
         )
         self.device = torch.device(provider)
         self.dtype = torch.float16 if precision == "fp16" else torch.float32
@@ -211,9 +255,10 @@ class TorchMobileFaceSwapRenderer(MobileFaceSwapRenderer):
                         self.disk_cache.save(preset, model)
                     except OSError:
                         LOGGER.warning("Could not save conditioned model cache", exc_info=True)
-            self.torch_sources[key] = model.to(
-                self.device, dtype=self.dtype, memory_format=torch.channels_last
-            )
+            model = model.to(self.device, dtype=self.dtype, memory_format=torch.channels_last)
+            if getattr(self, "cuda_graphs", False):
+                model = CudaGraphModel(model, self.device, self.dtype)
+            self.torch_sources[key] = model
             if len(self.torch_sources) > 16:
                 self.torch_sources.popitem(last=False)
         self.torch_sources.move_to_end(key)

@@ -207,7 +207,7 @@ class AnonymizationTests(unittest.TestCase):
         self.runtime.config = FaceAnonymizationConfig(swap_backend="mobilefaceswap")
         self.runtime.extractor.predict.return_value *= 2
         renderer = self.runtime.renderer = Mock()
-        renderer.prepare_frame.side_effect = [object(), object()]
+        renderer.prepare_frame.side_effect = [Mock(), Mock()]
         renderer.swap.side_effect = lambda image, *_, **__: np.full_like(image, 80)
         objects = [face(1), face(2)]
         self.process(objects)

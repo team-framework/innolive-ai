@@ -209,3 +209,76 @@ class MobileFaceSwapTests(unittest.TestCase):
         output = renderer.swap(composed, item, Mock(), target=target)
         np.testing.assert_array_equal(renderer.render_crop.call_args.args[0], original)
         np.testing.assert_array_equal(output[:70], composed[:70])
+
+
+class MobileFaceSwapBatchTests(unittest.TestCase):
+    def test_batch_restores_spatial_batch_anchor_order_and_roi_scale(self):
+        detector = ScrfdLandmarks.__new__(ScrfdLandmarks)
+        detector.max_batch = 2
+        detector.centers = [np.array([[8, 8], [8, 8]]) for _ in range(3)]
+        scores = np.array([[[[0.9], [0]], [[0.8], [0]]]], np.float32).reshape(-1, 1)
+        empty = np.zeros_like(scores)
+        # HWNC: spatial index, batch index, two anchors, output channels.
+        distance = np.array([[[[1] * 4] * 2, [[2] * 4] * 2]], np.float32).reshape(-1, 4)
+        offsets = np.array([[[[1] * 10] * 2, [[3] * 10] * 2]], np.float32).reshape(-1, 10)
+        detector.session = Mock()
+        detector.session.run_batch.return_value = (
+            [scores, empty, empty] + [distance] * 3 + [offsets] * 3
+        )
+        results = detector.detect_many(
+            [np.zeros((320, 320, 3), np.uint8), np.zeros((160, 160, 3), np.uint8)]
+        )
+        np.testing.assert_allclose(results[0][1], np.full((1, 5, 2), 16))
+        np.testing.assert_allclose(results[1][1], np.full((1, 5, 2), 16))
+        np.testing.assert_allclose(results[0][0][0, :4], [0, 0, 16, 16])
+        np.testing.assert_allclose(results[1][0][0, :4], [-4, -4, 12, 12])
+        self.assertEqual(detector.session.run_batch.call_count, 1)
+
+    def test_prime_keeps_tracks_separate_and_retries_missing_landmarks(self):
+        detector = Mock(max_batch=8)
+        empty = (np.empty((0, 5), np.float32), np.empty((0, 5, 2), np.float32))
+        detector.detect_many.return_value = [
+            (np.array([[18, 18, 78, 78, 0.9]], np.float32), (REFERENCE / 3)[None]),
+            empty,
+        ]
+        detector.detect.return_value = (
+            np.array([[150, 80, 210, 140, 0.9]], np.float32),
+            REFERENCE[None],
+        )
+        frame = MobileFaceSwapFrame(np.zeros((224, 224, 3), np.uint8), detector)
+        frame.prime([[80, 80, 140, 140], [150, 80, 210, 140]])
+        np.testing.assert_allclose(frame.landmarks([80, 80, 140, 140]), REFERENCE / 3 + [62, 62])
+        detector.detect.assert_not_called()
+        np.testing.assert_allclose(frame.landmarks([150, 80, 210, 140]), REFERENCE)
+        detector.detect.assert_called_once()
+        self.assertEqual(detector.detect.call_args.kwargs, {"input_size": 640})
+        self.assertFalse(MobileFaceSwapFrame(frame.image, detector).roi_points)
+
+    def test_roi_paste_handles_clipped_and_overlapping_faces(self):
+        image = np.full((240, 320, 3), 32, np.uint8)
+        original = image.copy()
+        generated = np.ones((1, 3, 224, 224), np.float32)
+        mask = np.ones((1, 1, 224, 224), np.float32)
+        matrix = np.array([[1, 0, 40], [0, 1, 20]], np.float32)
+        polygon = [[-20, -10], [80, -10], [80, 100], [-20, 100]]
+        result = paste_back(image, generated, mask, matrix, polygon)
+        np.testing.assert_array_equal(image, original)
+        np.testing.assert_array_equal(result[:, 81:], image[:, 81:])
+        np.testing.assert_array_equal(result[101:], image[101:])
+        self.assertEqual(int(result[40, 40, 0]), 255)
+        with self.assertRaises(ValueError):
+            paste_back(image, generated, mask, matrix, [[400, 400], [500, 400], [500, 500]])
+
+    def test_source_conditioning_keeps_original_onnx_detector(self):
+        renderer = MobileFaceSwapRenderer.__new__(MobileFaceSwapRenderer)
+        renderer.detector = Mock(accelerated=True)
+        renderer.conditioning_detector = None
+        renderer.landmarks_path = Path("original.onnx")
+        renderer.landmarks_provider = "cuda"
+        image = np.zeros((224, 224, 3), np.uint8)
+        with patch("service.mobilefaceswap.ScrfdLandmarks") as detector:
+            renderer.source_landmarks(image)
+            renderer.source_landmarks(image)
+            detector.assert_called_once_with(Path("original.onnx"), "cuda", allow_tensorrt=False)
+            self.assertEqual(detector.return_value.detect.call_count, 2)
+            renderer.detector.detect.assert_not_called()
