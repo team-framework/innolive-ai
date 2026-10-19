@@ -156,7 +156,7 @@ export class WebRtcDemo {
       if (generation !== this.generation || event.track.kind !== "video") return;
       this.el.result.srcObject = new MediaStream([event.track]);
       this.watchFrames(generation);
-      this.el.result.play().catch((error) => this.fail(error.message));
+      this.el.result.play().catch((error) => { if (generation === this.generation) this.fail(error.message); });
     };
     const track = stream.getVideoTracks()[0];
     if (!track) throw new Error("영상 트랙을 읽을 수 없습니다.");
@@ -188,6 +188,15 @@ export class WebRtcDemo {
   watchFrames(generation) {
     const video = this.el.result;
     this.frameTimes = [];
+    // Reveal only a decoded remote frame. A display:none video can otherwise
+    // wait forever for its first compositor/requestVideoFrameCallback event.
+    video.onloadeddata = () => {
+      if (generation !== this.generation || !video.videoWidth) return;
+      this.lastFrameAt = performance.now();
+      video.hidden = false;
+      this.el.placeholder.hidden = true;
+      this.status("합성 중", true);
+    };
     const arrived = (now) => {
       if (generation !== this.generation) return;
       this.lastFrameAt = now;
@@ -199,7 +208,6 @@ export class WebRtcDemo {
       if (video.requestVideoFrameCallback) this.callbackId = video.requestVideoFrameCallback(arrived);
     };
     if (video.requestVideoFrameCallback) this.callbackId = video.requestVideoFrameCallback(arrived);
-    else video.onloadeddata = () => arrived(performance.now());
   }
 
   async updateStats(generation) {
