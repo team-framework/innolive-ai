@@ -4,6 +4,9 @@
 `--face-swap-backend mobilefaceswap`으로 선택한다. 기본 renderer는 InSwapper,
 기본 요청 모드는 blur이며 protobuf 필드는 추가하지 않는다.
 
+새 560장 프리셋, 메인 Go gRPC 계약, CUDA 전송·복사 최적화의 검증 범위와 수치는
+[운영 경로 검증 기록](mobilefaceswap-production-validation.md)을 참고한다.
+
 ## 설치 및 모델 준비
 
 Linux x86_64, Python 3.11 또는 3.12, CUDA 13을 지원하는 NVIDIA 드라이버를 사용한다.
@@ -37,22 +40,28 @@ GPU별 TensorRT engine은 대상 서버에서 생성하며 다른 호스트에�
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python scripts/export_tensorrt.py \
   --checkpoint models/best.pt --output models/best_b1.engine --device 0
+.venv/bin/python scripts/prepare_mobilefaceswap_cache.py --workers 4
 ./scripts/run_mobilefaceswap_cuda.sh
 ```
 
 이 launcher는 YOLO TensorRT FP16, metadata CUDA, SCRFD CUDA(선택 시 TensorRT batch), MobileFaceSwap CUDA FP16을
 선택한다. 합성에는 Conv/BatchNorm fusion과 channels-last를 적용하고 프리셋별 조건부
-가중치를 최대 16개 캐시한다. 최초 identity 계산은 Paddle CPU에서 수행한다.
+가중치를 캐시한다. 일반 실행 기본값은 16개이며 CUDA launcher는 64개를 유지한다.
+`MOBILEFACESWAP_SOURCE_CACHE_SIZE=1..128`로 GPU 메모리 예산에 맞게 조절한다.
+최초 identity 계산은 배포 전 Paddle CPU에서 수행한다.
 `MOBILEFACESWAP_PRECISION=fp32`로 합성 정밀도만 되돌릴 수 있다. 일반 CLI의 기본값은
 FP32이며 `--mobilefaceswap-precision fp16`은 MobileFaceSwap CUDA에서만 허용한다.
 
 기본 gRPC는 `127.0.0.1:50061`, 웹은 `0.0.0.0:8443`이다. `GRPC_PORT`, `WEB_HOST`,
 `WEB_PORT`, `TARGET_FPS` 환경변수로 변경한다. 웹 입력 상한은 30 FPS이며 실측 FPS와 다르다.
 CUDA launcher의 기본 웹 화면은 [WebRTC H.264 전송](webrtc-serving.md)을 사용한다.
-새 프리셋의 첫 준비 비용을 줄이려면 실행 전
+CUDA launcher는 요청 중 source conditioning을 금지하고 시작 전에 renderer를 예열한다.
+실행 전 반드시
 `.venv/bin/python scripts/prepare_mobilefaceswap_cache.py --workers 4`로 캐시를 만든다.
 `MOBILEFACESWAP_CACHE_DIR` 기본값은 `.runtime/mobilefaceswap-cache`이며 생성된 가중치는
-Git에서 제외한다. NVENC 드라이버 버전 불일치의 서비스 한정 복구는 WebRTC 가이드를 따른다.
+Git에서 제외한다. `MOBILEFACESWAP_REQUIRE_CACHE=1`에서 캐시 누락은 시작을 거부하며,
+요청 중 읽을 수 없거나 손상된 캐시는 해당 얼굴을 blur로 처리한다.
+NVENC 드라이버 버전 불일치의 서비스 한정 복구는 WebRTC 가이드를 따른다.
 JPEG 비교 화면은 `/jpeg`이며, 이 경로의 `CLIENT_WINDOW=2`는 원격 왕복 대기를 겹친다.
 1~5 사이에서 조정할 수 있으며 값이 커지면 대기 중인 프레임도 늘어난다.
 `WEBRTC_ENABLED=0`이면 기존 JPEG 화면을 기본으로 사용한다. 기본 blur 5 / Mac 합성 1
@@ -60,6 +69,27 @@ JPEG 비교 화면은 `/jpeg`이며, 이 경로의 `CLIENT_WINDOW=2`는 원격 �
 `AI_BACKEND=pytorch`로 engine 없이 비교할 수 있고, 이때도 합성과 SCRFD는 CUDA를 사용한다.
 
 ## HTTPS 및 지속 실행
+
+브라우저 gateway 없이 Go 서버와 연결할 때도 같은 메인 `ai_processor_server.py`를 실행한다.
+아래 환경변수의 캐시와 SCRFD engine은 해당 GPU에서 먼저 생성한다.
+
+```bash
+export MOBILEFACESWAP_CACHE_DIR="$PWD/.runtime/mobilefaceswap-cache"
+export MOBILEFACESWAP_REQUIRE_CACHE=1
+export MOBILEFACESWAP_SOURCE_CACHE_SIZE=64
+export MOBILEFACESWAP_CUDA_GRAPHS=1
+export MOBILEFACESWAP_SCRFD_ENGINE="$PWD/.runtime/scrfd-b8-fp16.engine"
+export FACE_METADATA_WARMUP_MAX_BATCH=8
+OMP_NUM_THREADS=1 .venv/bin/python ai_processor_server.py \
+  --host 127.0.0.1 --port 50051 --backend tensorrt \
+  --engine models/best_b1.engine --device 0 --face-metadata-device cuda:0 \
+  --face-swap-backend mobilefaceswap --face-swap-provider cuda \
+  --mobilefaceswap-precision fp16 --face-swap-warmup
+```
+
+별도 호스트의 Go 서버가 접속할 경우 gRPC의 bind 주소와 기존 방화벽·TLS 설정을 배포망에 맞춘다.
+모델 선택에 따른 protobuf 변경은 없다. `anonymization_mode=1`, `output_mode=2`를 보내며
+자세한 값과 실패 응답은 [Go 계약](go-face-swap-grpc.md)을 따른다.
 
 원격 브라우저의 카메라는 HTTPS 또는 localhost가 필요하다. TLS 파일을 지정하지 않으면
 launcher는 HTTP를 제공하므로, 카메라 용도로는 다음처럼 인증서를 지정한다.

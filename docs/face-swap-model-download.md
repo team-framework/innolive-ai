@@ -60,7 +60,8 @@ EOF
 
 ## 프리셋 이미지와 Python 의존성 설치
 
-팀에서 `dataset_manifest.csv`와 `images/`가 들어 있는 **전체 `synthetic_faces` 배포본**을 받는다.
+팀에서 `dataset_manifest.csv`와 `images/`가 들어 있는 **현재 카탈로그와 같은 배포본**을 받는다.
+현재 카탈로그는 `natural_faces_v2` 560장을 참조하며, 이전 `synthetic_faces` 이미지와 해시가 다르다.
 프리셋 PNG는 Git에 포함되지 않으므로 팀 배포본을 별도로 받아야 한다.
 
 ```bash
@@ -68,8 +69,8 @@ EOF
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-face-swap.txt
 
-# /path/to/synthetic_faces를 받은 배포본의 실제 경로로 변경
-.venv/bin/python scripts/import_face_presets.py --source /path/to/synthetic_faces
+# 받은 배포본의 실제 경로로 변경. 기존 이미지 세트는 먼저 별도 보존.
+.venv/bin/python scripts/import_face_presets.py --source /path/to/natural_faces_v2
 ```
 
 importer가 560장의 이미지 hash와 조합을 검증하고 `config/face_presets/`에 복사한 뒤 catalog를 갱신한다.

@@ -4,6 +4,11 @@
 `main` 기준이다. 기존 `/AiProcessor/ProcessVideo`에 **얼굴 처리 방식**과 **결과 반환 방식**을 지정하면 된다.
 AI 서버도 이 기능이 포함된 버전으로 배포하고 [모델과 프리셋](face-swap-model-download.md)을 준비해야 한다.
 
+AI 서버가 `--face-swap-backend mobilefaceswap`을 선택해도 아래 RPC와 요청·응답 계약은
+동일하다. Go 요청에 모델 이름이나 새 enum을 추가하지 않는다. 기본 backend는 InSwapper이며,
+모델 선택은 AI 서버 실행 설정으로 한다. CUDA 설치와 프리셋 사전 계산은
+[MobileFaceSwap 운영 가이드](mobilefaceswap-cuda.md)를 따른다.
+
 ## 어떤 필드에 넣는가
 
 매 프레임 보내는 **`VideoChunk` 메시지의 최상위 필드**에 넣는다.
