@@ -111,7 +111,7 @@ class WebRtcTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failures, [True])
         await track.close()
 
-    def test_h264_packetizes_each_frame_and_decodes_with_no_b_frames(self):
+    def test_h264_packetizes_each_frame_with_no_b_frames(self):
         encoder = RealtimeH264Encoder("libx264")
         for i in range(3):
             packets, timestamp = encoder.encode(self.frame(64, 64, i * 3000), force_keyframe=i == 0)
