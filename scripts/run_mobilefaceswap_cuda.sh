@@ -39,6 +39,11 @@ print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 PY
 
 TLS_ARGS=()
+WEBRTC_ARGS=()
+if [[ "${WEBRTC_ENABLED:-1}" == "1" ]]; then
+  "$PYTHON" -c 'import aiortc, av'
+  WEBRTC_ARGS=(--webrtc --webrtc-encoder "${WEBRTC_ENCODER:-auto}" --webrtc-max-peers "${WEBRTC_MAX_PEERS:-2}")
+fi
 if [[ -n "${SSL_CERTFILE:-}" || -n "${SSL_KEYFILE:-}" ]]; then
   [[ -f "${SSL_CERTFILE:-}" && -f "${SSL_KEYFILE:-}" ]] || { echo "Both TLS files are required" >&2; exit 1; }
   TLS_ARGS=(--ssl-certfile "$SSL_CERTFILE" --ssl-keyfile "$SSL_KEYFILE")
@@ -84,7 +89,8 @@ PY
 
 "$PYTHON" -u server.py --host "${WEB_HOST:-0.0.0.0}" --port "$WEB_PORT" \
   --grpc-target "127.0.0.1:$GRPC_PORT" --anonymization-mode face_swap \
-  --target-fps "${TARGET_FPS:-30}" --client-window "${CLIENT_WINDOW:-2}" "${TLS_ARGS[@]}" &
+  --target-fps "${TARGET_FPS:-30}" --client-window "${CLIENT_WINDOW:-2}" \
+  "${WEBRTC_ARGS[@]}" "${TLS_ARGS[@]}" &
 WEB_PID=$!
 while kill -0 "$GRPC_PID" 2>/dev/null && kill -0 "$WEB_PID" 2>/dev/null; do sleep 1; done
 exit 1

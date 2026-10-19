@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import math
+import os
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator, Callable
@@ -80,8 +82,32 @@ class ServerSettings:
     anonymization_mode: str = "blur"
     target_fps: int | None = None
     client_window: int | None = None
+    webrtc: bool = False
+    webrtc_encoder: str = "auto"
+    webrtc_max_peers: int = 2
+    webrtc_ice_servers: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.webrtc_encoder not in {"auto", "nvenc", "x264"}:
+            raise ValueError("webrtc_encoder must be auto, nvenc or x264")
+        if type(self.webrtc_max_peers) is not int or not 1 <= self.webrtc_max_peers <= 8:
+            raise ValueError("webrtc_max_peers must be in 1..8")
+        if len(self.webrtc_ice_servers) > 4:
+            raise ValueError("at most four ICE servers are supported")
+        for entry in self.webrtc_ice_servers:
+            if not isinstance(entry, dict) or set(entry) - {"urls", "username", "credential"}:
+                raise ValueError("invalid ICE server fields")
+            urls = entry.get("urls")
+            urls = [urls] if isinstance(urls, str) else urls
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or any(
+                    not isinstance(url, str) or not url.startswith(("stun:", "turn:", "turns:"))
+                    for url in urls
+                )
+            ):
+                raise ValueError("invalid ICE server URLs")
         if self.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
             raise ValueError("invalid anonymization_mode")
         if self.target_fps is not None and not 1 <= self.target_fps <= 240:
@@ -177,6 +203,8 @@ class GrpcDemoGateway:
             ):
                 raise RuntimeError(f"gRPC health service reports {GRPC_SERVICE} NOT_SERVING")
             app.state.grpc_client = client
+            if app.state.webrtc:
+                await app.state.webrtc.start()
             app.state.ready = True
             LOGGER.info("gRPC demo gateway connected to %s", self.settings.grpc_target)
         except Exception as error:
@@ -186,15 +214,24 @@ class GrpcDemoGateway:
             yield
         finally:
             app.state.ready = False
+            if app.state.webrtc:
+                await app.state.webrtc.close()
             app.state.grpc_client = None
             await stack.aclose()
 
     async def index(self) -> FileResponse:
+        if self.settings.webrtc:
+            return FileResponse(WEB_ROOT / "webrtc.html")
+        return FileResponse(WEB_ROOT / "index.html")
+
+    async def jpeg_index(self) -> FileResponse:
         return FileResponse(WEB_ROOT / "index.html")
 
     async def health(self, request: Request) -> JSONResponse:
         serving, health_error = await self._grpc_serving(request.app)
         payload = self._health_payload(serving)
+        if request.app.state.webrtc:
+            payload["webrtc"] = request.app.state.webrtc.config()
         if request.app.state.startup_error:
             payload["startup_error"] = request.app.state.startup_error
         if health_error:
@@ -771,8 +808,17 @@ def create_app(
 ) -> FastAPI:
     gateway = GrpcDemoGateway(settings, client_factory)
     app = FastAPI(title="InnoLive gRPC browser demo", lifespan=gateway.lifespan)
+    app.state.webrtc = None
+    if settings.webrtc:
+        from service.webrtc import WebRtcGateway
+
+        app.state.webrtc = WebRtcGateway(settings)
+        app.add_api_route("/api/webrtc/config", app.state.webrtc.capabilities, methods=["GET"])
+        app.add_api_route("/api/webrtc/offer", app.state.webrtc.offer, methods=["POST"])
+        app.add_api_route("/api/webrtc/{peer_id}", app.state.webrtc.delete, methods=["DELETE"])
     app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
     app.add_api_route("/", gateway.index, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/jpeg", gateway.jpeg_index, methods=["GET"], include_in_schema=False)
     app.add_api_route("/healthz", gateway.health, methods=["GET"])
     app.add_api_route("/readyz", gateway.readiness, methods=["GET"])
     app.add_api_route("/api/sessions", gateway.create_session, methods=["POST"])
@@ -844,6 +890,9 @@ def parse_args() -> argparse.Namespace:
         "--target-fps", type=int, help="browser input FPS limit (default: mode preset)"
     )
     parser.add_argument("--client-window", type=int, help="browser requests in flight (1..5)")
+    parser.add_argument("--webrtc", action="store_true", help="enable the H.264 WebRTC video page")
+    parser.add_argument("--webrtc-encoder", choices=("auto", "nvenc", "x264"), default="auto")
+    parser.add_argument("--webrtc-max-peers", type=int, default=2)
     parser.add_argument(
         "--anonymization-mode", choices=("blur", "face_swap", "face_metadata"), default="blur"
     )
@@ -870,6 +919,10 @@ def main() -> None:
         anonymization_mode=args.anonymization_mode,
         target_fps=args.target_fps,
         client_window=args.client_window,
+        webrtc=args.webrtc,
+        webrtc_encoder=args.webrtc_encoder,
+        webrtc_max_peers=args.webrtc_max_peers,
+        webrtc_ice_servers=tuple(json.loads(os.getenv("WEBRTC_ICE_SERVERS_JSON", "[]"))),
         session_id=args.session_id,
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,

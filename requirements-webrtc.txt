@@ -1,0 +1,3 @@
+# Optional browser video transport; the H.264 factory hook is tested against this exact release.
+aiortc==1.15.0
+av==17.1.0
