@@ -195,8 +195,12 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 | 필드 | 타입 | 범위 | 의미 |
 | --- | --- | --- | --- |
 | `blur_radius` | `double` | `(0, 64]` | 가우시안 블러 반경(px). 클수록 더 흐림 |
-| `pixel_size` | `uint32` | `1..8` | 모자이크 블록 크기(px). `1`은 픽셀화 비활성(순수 블러) |
+| `pixel_size` | `uint32` | `1..8` | 블러 축소 격자 최소 크기(px). `1`은 `blur_radius` 12 이하에서 원본 해상도 블러 |
 | `mask_margin` | `uint32` | `0..64` | 입력 프레임 기준 윤곽선 바깥 확장 폭(px). 바깥 최대 8px만 부드럽게 전환 |
+
+블러는 `pixel_size` 격자로 줄인 이미지에 sigma `blur_radius / pixel_size`를 적용합니다.
+이 값이 기본값과 같은 12를 넘으면 격자를 `ceil(blur_radius / 12)`로 올려 처리 시간을
+제한합니다. 블러 반경은 그대로라 흐림 정도는 유지됩니다.
 
 세 필드 모두 `optional`이라 필요한 값만 지정할 수 있으며 unset 필드는 서버 기본값을
 사용합니다. 범위를 벗어나면 해당 프레임만 `MOSAIC_CONFIG_INVALID` 에러를 받고

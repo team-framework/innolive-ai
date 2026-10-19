@@ -513,14 +513,16 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             data=source,
                             frame_id=2,
                             output_mode=ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG,
-                            mosaic_config=ai_processor_pb2.MosaicConfig(pixel_size=1),
+                            mosaic_config=ai_processor_pb2.MosaicConfig(pixel_size=3),
                         ),
                     )
                 )
             )
 
         self.assertEqual([r.status_message for r in responses], ["success", "success"])
-        # Only pixel_size changes; the default blur radius stays 24.
+        # Only pixel_size changes; the default blur radius stays 24. pixel_size 1 would reduce on
+        # the default 2px cell because 24 / 1 exceeds the reduced sigma cap, and every even cell
+        # averages the 1px stripes to the same gray.
         self.assertNotEqual(responses[0].data, responses[1].data)
         self.assertTrue(responses[1].timing.blur_encode_ms > 0)
 
