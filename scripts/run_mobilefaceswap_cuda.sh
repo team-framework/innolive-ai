@@ -81,7 +81,7 @@ PY
 
 "$PYTHON" -u server.py --host "${WEB_HOST:-0.0.0.0}" --port "$WEB_PORT" \
   --grpc-target "127.0.0.1:$GRPC_PORT" --anonymization-mode face_swap \
-  --target-fps "${TARGET_FPS:-30}" "${TLS_ARGS[@]}" &
+  --target-fps "${TARGET_FPS:-30}" --client-window "${CLIENT_WINDOW:-2}" "${TLS_ARGS[@]}" &
 WEB_PID=$!
 while kill -0 "$GRPC_PID" 2>/dev/null && kill -0 "$WEB_PID" 2>/dev/null; do sleep 1; done
 exit 1

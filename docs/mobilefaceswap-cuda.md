@@ -48,6 +48,8 @@ FP32이며 `--mobilefaceswap-precision fp16`은 MobileFaceSwap CUDA에서만 허
 
 기본 gRPC는 `127.0.0.1:50061`, 웹은 `0.0.0.0:8443`이다. `GRPC_PORT`, `WEB_HOST`,
 `WEB_PORT`, `TARGET_FPS` 환경변수로 변경한다. 웹 입력 상한은 30 FPS이며 실측 FPS와 다르다.
+CUDA launcher는 `CLIENT_WINDOW=2`로 원격 왕복 대기를 겹친다. 1~5 사이에서 조정할 수
+있으며 값이 커지면 대기 중인 프레임도 늘어난다. 기본 blur 5 / Mac 합성 1 설정은 유지한다.
 `AI_BACKEND=pytorch`로 engine 없이 비교할 수 있고, 이때도 합성과 SCRFD는 CUDA를 사용한다.
 
 ## HTTPS 및 지속 실행
@@ -69,6 +71,7 @@ GRPC_PORT=50061
 WEB_HOST=0.0.0.0
 WEB_PORT=8443
 TARGET_FPS=30
+CLIENT_WINDOW=2
 AI_BACKEND=tensorrt
 MOBILEFACESWAP_PRECISION=fp16
 OMP_NUM_THREADS=1
@@ -107,3 +110,31 @@ journalctl --user -u mobilefaceswap.service -n 60
 FP16 검증은 같은 source/target을 원본 Paddle과 비교한다. 0..1 출력에서 최대 오차 0.01,
 평균 오차 0.0005를 상한으로 두고, FP32의 최대 오차 상한은 0.0001이다.
 합성 모델 단독 시간, 전체 서버 시간, 네트워크 왕복 시간은 구분해서 기록한다.
+
+### RTX 3090 확인 결과 (2026-10-19)
+
+Python 3.11.15, Torch 2.13.0+cu130, ORT GPU 1.30.0, Paddle 3.3.1,
+TensorRT 11.1.0.106, RTX 3090 24GB에서 확인했다.
+
+| 범위 | 결과 |
+| --- | --- |
+| YOLO 탐지, 동일 움직임 입력 60프레임, 처음 5개 제외 | PyTorch 중앙값 7.66ms → TensorRT FP16 3.75ms |
+| 주요 얼굴 bbox 일치 | 평균 IoU 0.9915, 최소 0.9754 |
+| MobileFaceSwap 단독, 동일 source/target 1쌍, warmup 3 + 측정 15회 | CUDA FP32 중앙값 0.987ms / FP16 0.896ms |
+| FP16 대 원본 Paddle, 0..1 출력 | 합성 최대 오차 0.001705, 평균 0.000154 / mask 최대 0.002207 |
+| HTTPS/WebSocket 157프레임, 첫 프레임 제외 전체 서버 시간 | 중앙값 17.135ms, p95 34.573ms |
+| 원격 왕복을 포함한 640×640 정지 입력 40프레임 | 요청 window 1: 3.76 FPS / window 2: 7.19 FPS |
+
+60프레임 비교의 첫 프레임에서 PyTorch가 동일 얼굴을 2개로 중복 검출했고 TensorRT는
+1개로 검출했다. 주요 얼굴 누락은 없었으며 완전히 동일한 검출 출력을 보장하는 결과는 아니다.
+
+157프레임은 합성 프리셋 사진의 크기·위치·기울기를 바꾼 4:3/16:9 각 60프레임,
+얼굴 2개 배치 12프레임, 가림/복귀 25프레임으로 구성했다. 움직임 입력 120/120에서
+`swapped`, 가림 5프레임에서 `blur_fallback`, 가림 제거 후 합성 복귀를 확인했다.
+얼굴 2개 배치에서는 탐지기가 프레임당 3개 face 후보를 반환했다.
+
+마지막 행의 원격 FPS는 해당 Tailscale 연결에서 Mac 클라이언트가 측정한 값이다.
+서버 처리 시간의 역수를 브라우저 FPS로 해석하지 않는다. 실제 웹캠 촬영 및 장시간·동시
+사용자 부하는 별도 검증 대상이다. GPU 서버의 `reports/parity-cuda-*`,
+`reports/detector-compare.json`과 클라이언트의 `reports/mobilefaceswap/gpu-websocket/`에
+원시 결과를 보관하며 Git에는 포함하지 않는다.

@@ -278,6 +278,7 @@ def app(
     max_jpeg_bytes: int = 4096,
     anonymization_mode: str = "blur",
     target_fps: int | None = None,
+    client_window: int | None = None,
 ):
     fake = client or FakeGrpcClient()
     application = create_app(
@@ -287,6 +288,7 @@ def app(
             max_jpeg_bytes=max_jpeg_bytes,
             anonymization_mode=anonymization_mode,
             target_fps=target_fps,
+            client_window=client_window,
         ),
         client_factory=lambda *_args, **_kwargs: fake,
     )
@@ -307,6 +309,20 @@ class GrpcDemoGatewayTests(unittest.TestCase):
         for invalid in (0, -1, 241):
             with self.assertRaisesRegex(ValueError, "target_fps"):
                 ServerSettings(target_fps=invalid)
+
+    def test_request_window_override_keeps_default_profiles_and_bounds(self):
+        for mode, override, expected in (
+            ("blur", None, 5),
+            ("face_swap", None, 1),
+            ("face_swap", 2, 2),
+        ):
+            application, _ = app(anonymization_mode=mode, client_window=override)
+            with TestClient(application) as client:
+                profile = client.get("/healthz").json()["serving_profile"]
+            self.assertEqual(profile["client_window"], expected)
+        for invalid in (0, -1, 6):
+            with self.assertRaisesRegex(ValueError, "client_window"):
+                ServerSettings(client_window=invalid)
 
     def test_face_swap_gateway_sends_mode_and_shows_processed_image(self):
         application, fake = app(anonymization_mode="face_swap")
