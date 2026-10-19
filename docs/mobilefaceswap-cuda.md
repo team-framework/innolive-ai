@@ -48,8 +48,11 @@ FP32이며 `--mobilefaceswap-precision fp16`은 MobileFaceSwap CUDA에서만 허
 
 기본 gRPC는 `127.0.0.1:50061`, 웹은 `0.0.0.0:8443`이다. `GRPC_PORT`, `WEB_HOST`,
 `WEB_PORT`, `TARGET_FPS` 환경변수로 변경한다. 웹 입력 상한은 30 FPS이며 실측 FPS와 다르다.
-CUDA launcher는 `CLIENT_WINDOW=2`로 원격 왕복 대기를 겹친다. 1~5 사이에서 조정할 수
-있으며 값이 커지면 대기 중인 프레임도 늘어난다. 기본 blur 5 / Mac 합성 1 설정은 유지한다.
+CUDA launcher의 기본 웹 화면은 [WebRTC H.264 전송](webrtc-serving.md)을 사용한다.
+JPEG 비교 화면은 `/jpeg`이며, 이 경로의 `CLIENT_WINDOW=2`는 원격 왕복 대기를 겹친다.
+1~5 사이에서 조정할 수 있으며 값이 커지면 대기 중인 프레임도 늘어난다.
+`WEBRTC_ENABLED=0`이면 기존 JPEG 화면을 기본으로 사용한다. 기본 blur 5 / Mac 합성 1
+설정은 유지한다.
 `AI_BACKEND=pytorch`로 engine 없이 비교할 수 있고, 이때도 합성과 SCRFD는 CUDA를 사용한다.
 
 ## HTTPS 및 지속 실행
@@ -72,6 +75,9 @@ WEB_HOST=0.0.0.0
 WEB_PORT=8443
 TARGET_FPS=30
 CLIENT_WINDOW=2
+WEBRTC_ENABLED=1
+WEBRTC_ENCODER=auto
+WEBRTC_MAX_PEERS=2
 AI_BACKEND=tensorrt
 MOBILEFACESWAP_PRECISION=fp16
 OMP_NUM_THREADS=1
@@ -111,7 +117,7 @@ FP16 검증은 같은 source/target을 원본 Paddle과 비교한다. 0..1 출�
 평균 오차 0.0005를 상한으로 두고, FP32의 최대 오차 상한은 0.0001이다.
 합성 모델 단독 시간, 전체 서버 시간, 네트워크 왕복 시간은 구분해서 기록한다.
 
-### RTX 3090 확인 결과 (2026-10-19)
+### RTX 3090 JPEG 경로 확인 결과 (2026-10-19)
 
 Python 3.11.15, Torch 2.13.0+cu130, ORT GPU 1.30.0, Paddle 3.3.1,
 TensorRT 11.1.0.106, RTX 3090 24GB에서 확인했다.
