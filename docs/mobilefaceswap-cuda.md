@@ -63,6 +63,9 @@ CUDA launcher는 요청 중 source conditioning을 금지하고 시작 전에 re
 `MOBILEFACESWAP_CACHE_DIR` 기본값은 `.runtime/mobilefaceswap-cache`이며 생성된 가중치는
 Git에서 제외한다. `MOBILEFACESWAP_REQUIRE_CACHE=1`에서 캐시 누락은 시작을 거부하며,
 요청 중 읽을 수 없거나 손상된 캐시는 해당 얼굴을 blur로 처리한다.
+모델 예열 후에는 시작 시점의 객체를 GC 수거 대상에서 제외한다. Python이 이미 일부
+객체를 동결한 환경에서도 예열된 모델을 추가로 동결하며, 이후 세션의 순환 참조 수거는
+유지한다. 기존 동결 영역이 있던 프로세스는 종료 시 그 영역을 임의로 해제하지 않는다.
 NVENC 드라이버 버전 불일치의 서비스 한정 복구는 WebRTC 가이드를 따른다.
 JPEG 비교 화면은 `/jpeg`이며, 이 경로의 `CLIENT_WINDOW=2`는 원격 왕복 대기를 겹친다.
 1~5 사이에서 조정할 수 있으며 값이 커지면 대기 중인 프레임도 늘어난다.
