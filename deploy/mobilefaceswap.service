@@ -1,0 +1,20 @@
+[Unit]
+Description=InnoLive MobileFaceSwap CUDA demo
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/innolive-mobilefaceswap
+EnvironmentFile=%h/apps/innolive-mobilefaceswap/.runtime/server.env
+ExecStart=%h/apps/innolive-mobilefaceswap/scripts/run_mobilefaceswap_cuda.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

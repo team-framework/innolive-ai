@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import math
+import os
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator, Callable
@@ -77,8 +79,41 @@ class ServerSettings:
     grpc_connect_timeout_seconds: float = 10.0
     grpc_health_timeout_seconds: float = 2.0
     max_jpeg_bytes: int = MAX_JPEG_BYTES
+    anonymization_mode: str = "blur"
+    target_fps: int | None = None
+    client_window: int | None = None
+    webrtc: bool = False
+    webrtc_encoder: str = "auto"
+    webrtc_max_peers: int = 2
+    webrtc_ice_servers: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.webrtc_encoder not in {"auto", "nvenc", "x264"}:
+            raise ValueError("webrtc_encoder must be auto, nvenc or x264")
+        if type(self.webrtc_max_peers) is not int or not 1 <= self.webrtc_max_peers <= 8:
+            raise ValueError("webrtc_max_peers must be in 1..8")
+        if len(self.webrtc_ice_servers) > 4:
+            raise ValueError("at most four ICE servers are supported")
+        for entry in self.webrtc_ice_servers:
+            if not isinstance(entry, dict) or set(entry) - {"urls", "username", "credential"}:
+                raise ValueError("invalid ICE server fields")
+            urls = entry.get("urls")
+            urls = [urls] if isinstance(urls, str) else urls
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or any(
+                    not isinstance(url, str) or not url.startswith(("stun:", "turn:", "turns:"))
+                    for url in urls
+                )
+            ):
+                raise ValueError("invalid ICE server URLs")
+        if self.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
+            raise ValueError("invalid anonymization_mode")
+        if self.target_fps is not None and not 1 <= self.target_fps <= 240:
+            raise ValueError("target_fps must be in 1..240")
+        if self.client_window is not None and not 1 <= self.client_window <= REQUEST_WINDOW:
+            raise ValueError(f"client_window must be in 1..{REQUEST_WINDOW}")
         target = self.grpc_target.strip()
         validate_session_id(self.session_id)
         if not target:
@@ -168,6 +203,8 @@ class GrpcDemoGateway:
             ):
                 raise RuntimeError(f"gRPC health service reports {GRPC_SERVICE} NOT_SERVING")
             app.state.grpc_client = client
+            if app.state.webrtc:
+                await app.state.webrtc.start()
             app.state.ready = True
             LOGGER.info("gRPC demo gateway connected to %s", self.settings.grpc_target)
         except Exception as error:
@@ -177,15 +214,24 @@ class GrpcDemoGateway:
             yield
         finally:
             app.state.ready = False
+            if app.state.webrtc:
+                await app.state.webrtc.close()
             app.state.grpc_client = None
             await stack.aclose()
 
     async def index(self) -> FileResponse:
+        if self.settings.webrtc:
+            return FileResponse(WEB_ROOT / "webrtc.html")
+        return FileResponse(WEB_ROOT / "index.html")
+
+    async def jpeg_index(self) -> FileResponse:
         return FileResponse(WEB_ROOT / "index.html")
 
     async def health(self, request: Request) -> JSONResponse:
         serving, health_error = await self._grpc_serving(request.app)
         payload = self._health_payload(serving)
+        if request.app.state.webrtc:
+            payload["webrtc"] = request.app.state.webrtc.config()
         if request.app.state.startup_error:
             payload["startup_error"] = request.app.state.startup_error
         if health_error:
@@ -314,13 +360,25 @@ class GrpcDemoGateway:
                 )
 
             result = None
-            async with aclosing(
-                client.process_jpegs(
-                    [model_input_jpeg],
+            if self.settings.anonymization_mode == "blur":
+                stream = client.process_jpegs([model_input_jpeg], session_id=session_id, window=1)
+            else:
+
+                async def image_frames():
+                    yield VideoFrame(
+                        model_input_jpeg,
+                        time.perf_counter_ns(),
+                        1,
+                        anonymization_mode=self.settings.anonymization_mode,
+                    )
+
+                stream = client.process_video(
+                    image_frames(),
                     session_id=session_id,
                     window=1,
+                    raise_frame_errors=True,
                 )
-            ) as results:
+            async with aclosing(stream) as results:
                 async for item in results:
                     result = item
                     break
@@ -335,7 +393,14 @@ class GrpcDemoGateway:
                     "gRPC image result dimensions do not match the resized model input"
                 )
             objects = [_face_object(face) for face in response.faces]
-            visualization = annotate_detections(model_input, objects)
+            visualization_input = model_input
+            if self.settings.anonymization_mode != "blur":
+                visualization_input = decode_image(
+                    result.processed_jpeg, FrameLimits(max_jpeg_bytes=self.settings.max_jpeg_bytes)
+                )
+                if visualization_input.shape != model_input.shape:
+                    raise VideoClientError("invalid anonymized image dimensions")
+            visualization = annotate_detections(visualization_input, objects)
             visualization_jpeg = encode_jpeg(visualization, JPEG_QUALITY)
         except PayloadTooLarge as error:
             return _api_error(413, "PAYLOAD_TOO_LARGE", str(error))
@@ -363,6 +428,7 @@ class GrpcDemoGateway:
                     "jpeg_base64": base64.b64encode(visualization_jpeg).decode("ascii"),
                 },
                 "objects": objects,
+                "anonymization_mode": self.settings.anonymization_mode,
                 "elapsed_ms": round((time.perf_counter() - started) * 1_000, 2),
             },
             headers={"Cache-Control": "no-store"},
@@ -451,6 +517,7 @@ class GrpcDemoGateway:
     def _health_payload(self, serving: bool) -> dict[str, Any]:
         return {
             "status": "ok" if serving else "not_ready",
+            "anonymization_mode": self.settings.anonymization_mode,
             "profile": PROFILE,
             "protocol": {"name": "ILF1", "version": VERSION},
             "transport_path": ["browser-websocket", "grpc-bidi-ProcessVideo"],
@@ -464,8 +531,11 @@ class GrpcDemoGateway:
                 "image_size": IMAGE_SIZE,
                 "max_long_edge": IMAGE_SIZE,
                 "jpeg_quality": JPEG_QUALITY,
-                "client_window": REQUEST_WINDOW,
-                "target_fps": TARGET_FPS,
+                "client_window": self.settings.client_window
+                or (REQUEST_WINDOW if self.settings.anonymization_mode == "blur" else 1),
+                "target_fps": self.settings.target_fps
+                or (TARGET_FPS if self.settings.anonymization_mode == "blur" else 10),
+                "frame_timeout_ms": 1500 if self.settings.anonymization_mode == "blur" else 60_000,
             },
             "enrollment_content_types": ["image/jpeg", "image/png", "image/webp"],
             "active_streams": self.active_streams,
@@ -580,6 +650,7 @@ class GrpcWebSocketSession:
             data=jpeg,
             timestamp=time.perf_counter_ns(),
             frame_id=sequence,
+            anonymization_mode=self.settings.anonymization_mode,
         )
 
     async def _frame_source(self) -> AsyncIterator[VideoFrame]:
@@ -719,6 +790,14 @@ def _face_object(face: Any) -> dict[str, Any]:
     }
     if face.HasField("track_id"):
         item["track_id"] = int(face.track_id)
+    if face.HasField("anonymization"):
+        info = face.anonymization
+        item["anonymization"] = {
+            "status": info.status,
+            "fallback_reason": info.fallback_reason,
+            "identity_key": info.identity_key,
+            "preset_key": info.preset_key,
+        }
     return item
 
 
@@ -729,8 +808,17 @@ def create_app(
 ) -> FastAPI:
     gateway = GrpcDemoGateway(settings, client_factory)
     app = FastAPI(title="InnoLive gRPC browser demo", lifespan=gateway.lifespan)
+    app.state.webrtc = None
+    if settings.webrtc:
+        from service.webrtc import WebRtcGateway
+
+        app.state.webrtc = WebRtcGateway(settings)
+        app.add_api_route("/api/webrtc/config", app.state.webrtc.capabilities, methods=["GET"])
+        app.add_api_route("/api/webrtc/offer", app.state.webrtc.offer, methods=["POST"])
+        app.add_api_route("/api/webrtc/{peer_id}", app.state.webrtc.delete, methods=["DELETE"])
     app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
     app.add_api_route("/", gateway.index, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/jpeg", gateway.jpeg_index, methods=["GET"], include_in_schema=False)
     app.add_api_route("/healthz", gateway.health, methods=["GET"])
     app.add_api_route("/readyz", gateway.readiness, methods=["GET"])
     app.add_api_route("/api/sessions", gateway.create_session, methods=["POST"])
@@ -798,6 +886,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--grpc-target", default="127.0.0.1:50051")
+    parser.add_argument(
+        "--target-fps", type=int, help="browser input FPS limit (default: mode preset)"
+    )
+    parser.add_argument("--client-window", type=int, help="browser requests in flight (1..5)")
+    parser.add_argument("--webrtc", action="store_true", help="enable the H.264 WebRTC video page")
+    parser.add_argument("--webrtc-encoder", choices=("auto", "nvenc", "x264"), default="auto")
+    parser.add_argument("--webrtc-max-peers", type=int, default=2)
+    parser.add_argument(
+        "--anonymization-mode", choices=("blur", "face_swap", "face_metadata"), default="blur"
+    )
     parser.add_argument("--session-id", default="demo-session")
     parser.add_argument("--grpc-connect-timeout", type=float, default=10.0)
     parser.add_argument("--grpc-health-timeout", type=float, default=2.0)
@@ -818,6 +916,13 @@ def main() -> None:
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         raise SystemExit("--ssl-certfile and --ssl-keyfile must be supplied together")
     settings = ServerSettings(
+        anonymization_mode=args.anonymization_mode,
+        target_fps=args.target_fps,
+        client_window=args.client_window,
+        webrtc=args.webrtc,
+        webrtc_encoder=args.webrtc_encoder,
+        webrtc_max_peers=args.webrtc_max_peers,
+        webrtc_ice_servers=tuple(json.loads(os.getenv("WEBRTC_ICE_SERVERS_JSON", "[]"))),
         session_id=args.session_id,
         grpc_target=args.grpc_target,
         grpc_connect_timeout_seconds=args.grpc_connect_timeout,

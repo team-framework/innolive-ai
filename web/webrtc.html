@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>InnoLive 실시간 얼굴 합성</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/webrtc.css" />
+  </head>
+  <body>
+    <header>
+      <div><p class="eyebrow">INNOLIVE · WEBRTC</p><h1>실시간 얼굴 합성</h1></div>
+      <strong id="status" data-online="false" role="status">서버 확인 중</strong>
+    </header>
+    <main>
+      <section class="panel rtc-controls">
+        <label class="active-session-control"><span>현재 세션</span><select id="session" disabled></select></label>
+        <button id="new-session" disabled>새 세션</button>
+        <button id="start" class="primary" disabled>카메라 시작</button>
+        <button id="stop" disabled>중지</button>
+        <label class="rtc-file"><span>동영상으로 테스트</span><input id="video-file" type="file" accept="video/*" /></label>
+        <button id="clear-file" class="secondary" hidden>카메라로 전환</button>
+      </section>
+      <section class="viewers">
+        <article class="panel danger"><h2>원본 <em>보호되지 않음</em></h2><video id="source" autoplay muted playsinline></video></article>
+        <article class="panel protected"><h2>합성 결과</h2><div class="rtc-output"><video id="result" autoplay muted playsinline hidden></video><p id="placeholder">카메라를 시작하면 합성 결과가 표시됩니다.</p></div></article>
+      </section>
+      <section class="metrics panel" aria-label="실시간 성능">
+        <div><span>수신 FPS</span><strong id="fps">—</strong></div>
+        <div><span>서버 처리</span><strong id="server-ms">—</strong></div>
+        <div><span>연결 RTT</span><strong id="rtt">—</strong></div>
+      </section>
+      <div class="rtc-footer"><p id="detail">등록된 화이트리스트 얼굴은 합성에서 제외됩니다.</p><a href="/jpeg">이미지·화이트리스트 관리 / JPEG 비교</a></div>
+    </main>
+    <script type="module" src="/static/webrtc.js"></script>
+  </body>
+</html>

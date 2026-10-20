@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the InnoLive Tailscale HTTPS certificate
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/apps/innolive-mobilefaceswap/.runtime/server.env
+ExecStart=%h/apps/innolive-mobilefaceswap/scripts/renew_mobilefaceswap_tls.sh
+UMask=0077

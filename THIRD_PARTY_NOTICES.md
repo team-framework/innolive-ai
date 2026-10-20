@@ -25,6 +25,17 @@ The Python dependency is installed separately and is not vendored in this
 repository. Exporting the checkpoint to TensorRT does not by itself remove the
 licenses that apply to the source checkpoint or exporter.
 
+## MobileFaceSwap
+
+`service/_vendor/mobilefaceswap/model.py` and `arcface.py` are unmodified copies
+from [Seanseattle/MobileFaceSwap](https://github.com/Seanseattle/MobileFaceSwap),
+commit `29552474c2f621c27818ff7fc32447e1a60a96fb`. Its Apache-2.0 license is
+included in `service/_vendor/mobilefaceswap/LICENSE`.
+`service/mobilefaceswap_torch.py` adapts the conditioned synthesis network to
+PyTorch, with strict tensor conversion, BatchNorm fusion and device caching.
+Model checkpoints, SCRFD weights and preset images are installed separately;
+this code license does not grant rights in those artifacts.
+
 ## Training data and external annotation tools
 
 The tracked `models/best.pt` checkpoint was trained using WIDER FACE images

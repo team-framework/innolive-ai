@@ -202,6 +202,40 @@ class AnonymizationTests(unittest.TestCase):
         self.assertEqual(self.runtime.extractor.predict.call_count, 3)
         self.assertEqual(self.runtime.renderer.swap.call_count, 61)
 
+    def test_mobilefaceswap_shares_original_frame_only_within_one_process_call(self):
+        self.presets()
+        self.runtime.config = FaceAnonymizationConfig(swap_backend="mobilefaceswap")
+        self.runtime.extractor.predict.return_value *= 2
+        renderer = self.runtime.renderer = Mock()
+        renderer.prepare_frame.side_effect = [Mock(), Mock()]
+        renderer.swap_many.side_effect = lambda image, jobs, **__: [None] * len(jobs)
+        objects = [face(1), face(2)]
+        self.process(objects)
+        renderer.prepare_frame.assert_called_once()
+        self.assertIs(renderer.prepare_frame.call_args.args[0], self.image)
+        first = renderer.swap_many.call_args
+        np.testing.assert_array_equal(first.args[0], self.image)
+        self.assertIsNot(first.args[0], self.image)
+        self.assertEqual([item["track_id"] for item, _ in first.args[1]], [1, 2])
+        self.assertTrue(all(item["anonymization"]["status"] == "swapped" for item in objects))
+        self.process([face(1)], frame=2)
+        self.assertEqual(renderer.prepare_frame.call_count, 2)
+        self.assertIsNot(first.kwargs["target"], renderer.swap_many.call_args.kwargs["target"])
+
+    def test_mobile_batch_failure_keeps_blur_and_filters_whitelisted_held_faces(self):
+        self.presets()
+        self.runtime.config = FaceAnonymizationConfig(swap_backend="mobilefaceswap")
+        renderer = self.runtime.renderer = Mock()
+        renderer.swap_many.return_value = [ValueError("invalid mask")]
+        objects = [face(1), face(2, whitelisted=True), face(3, held=True)]
+        with self.assertLogs("innolive.face_swap", level="WARNING"):
+            result = self.process(objects)
+        jobs = renderer.swap_many.call_args.args[1]
+        self.assertEqual([item["track_id"] for item, _ in jobs], [1])
+        self.assertEqual(objects[0]["anonymization"]["reason"], "swap_failed")
+        self.assertEqual(objects[2]["anonymization"]["reason"], "held_face")
+        self.assertEqual(result, mosaic_jpeg(self.image, objects))
+
     def test_tracks_refresh_on_independent_schedules_and_batch_only_due_faces(self):
         self.process([face(1)], mode=2)
         self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]
