@@ -323,6 +323,20 @@ class RuntimeManager:
             self._latency[stage].append(float(value))
         return result
 
+    async def self_check(self) -> float:
+        """Run one blank frame through the shared lane and return its latency in ms.
+
+        The lane is FIFO, so this also waits for every frame queued ahead of it.
+        """
+        if not self.ready or self._closed:
+            raise RuntimeError("runtime is not ready")
+        loop = asyncio.get_running_loop()
+        blank = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+        async with self.lane:
+            started = time.perf_counter()
+            await loop.run_in_executor(self._executor, self._predict, blank)
+            return (time.perf_counter() - started) * 1000
+
     def _infer_sync(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
         started = time.perf_counter()
         motion = None
