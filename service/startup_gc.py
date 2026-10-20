@@ -8,20 +8,24 @@ class StartupGc:
 
     Use only before admitting streams. Freezing a live process could retain
     session cycles. Reference-counted cache entries can still be evicted normally.
+    Add warmed models even when Python has already frozen startup objects.
     An existing owner's frozen generation must not be unfrozen by this owner.
     """
 
     def __init__(self):
         self.owned = False
+        self.applied = False
 
     def freeze(self):
-        if self.owned or gc.get_freeze_count():
+        if self.applied:
             return
+        self.owned = gc.get_freeze_count() == 0
         gc.collect()
         gc.freeze()
-        self.owned = True
+        self.applied = True
 
     def close(self):
         if self.owned:
             gc.unfreeze()
             self.owned = False
+            self.applied = False
