@@ -95,6 +95,13 @@ Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 (`AI_MOSAIC_MAX_INFLIGHT`)이며, max-inflight는 workers 이상이어야 합니다. 얼굴 합성
 모드는 공유 model session을 쓰므로 별도 단일 thread에서 차례로 처리합니다.
 
+프레임 추론이 `--inference-timeout`(`GRPC_INFERENCE_TIMEOUT`, 기본 1.5초)을 넘기거나
+실패하면 그 프레임은 픽셀 없이 오류로 응답하고, health를 `NOT_SERVING`으로 바꿔 새
+stream을 받지 않습니다. 남은 추론이 끝나고 빈 프레임 자가 점검을 통과하면 다시
+`SERVING`으로 돌아갑니다. `--inference-recovery-timeout`(`GRPC_INFERENCE_RECOVERY_TIMEOUT`,
+기본 30초) 안에 회복하지 못하거나 점검이 실패하면 종료 코드 75로 끝나며, systemd
+`Restart=on-failure`가 다시 띄웁니다. 재시작하면 메모리에만 있는 whitelist는 사라집니다.
+
 CPU 실행을 강제하려면 다음 command를 사용합니다.
 
 ```bash

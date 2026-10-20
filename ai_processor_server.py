@@ -98,6 +98,23 @@ DEFAULT_MOSAIC_WORKERS = 4
 DEFAULT_MOSAIC_MAX_INFLIGHT = 8
 # 얼굴 합성은 공유 모델 세션을 쓰므로 종전대로 한 스레드에서 차례로 처리한다.
 FACE_ANONYMIZATION_MAX_INFLIGHT = 2
+# 런타임이 스스로 회복하지 못하면 0이 아닌 코드로 끝내 systemd(Restart=on-failure)가 다시 띄운다.
+UNRECOVERABLE_RUNTIME_EXIT_CODE = 75
+
+
+def exit_unrecoverable_runtime(reason: str) -> None:
+    """Hard-exit so the supervisor restarts the worker.
+
+    A wedged inference thread cannot be interrupted, and a normal shutdown would wait on it
+    forever (runtime.close() and interpreter exit both join the executor threads).
+    """
+    LOGGER.critical(
+        "exiting with code %d so the supervisor restarts the worker: %s",
+        UNRECOVERABLE_RUNTIME_EXIT_CODE,
+        reason,
+    )
+    logging.shutdown()
+    os._exit(UNRECOVERABLE_RUNTIME_EXIT_CODE)
 
 
 def _output_mode(value: int) -> int:
@@ -125,6 +142,8 @@ class GrpcServerSettings:
     max_jpeg_bytes: int = MAX_JPEG_BYTES
     max_long_edge: int = MAX_LONG_EDGE
     inference_timeout_seconds: float = 1.5
+    # 실패 뒤 늦은 추론이 끝나고 자가 점검을 통과할 때까지 기다리는 상한. 넘기면 프로세스를 끝낸다.
+    inference_recovery_seconds: float = 30.0
     shutdown_grace_seconds: float = 5.0
     mosaic_workers: int = DEFAULT_MOSAIC_WORKERS
     mosaic_max_inflight: int = DEFAULT_MOSAIC_MAX_INFLIGHT
@@ -146,6 +165,11 @@ class GrpcServerSettings:
             raise ValueError(f"max_long_edge must be at least {MIN_FRAME_DIMENSION}")
         if not math.isfinite(self.inference_timeout_seconds) or self.inference_timeout_seconds <= 0:
             raise ValueError("inference_timeout_seconds must be positive")
+        if (
+            not math.isfinite(self.inference_recovery_seconds)
+            or self.inference_recovery_seconds <= 0
+        ):
+            raise ValueError("inference_recovery_seconds must be positive")
         if not math.isfinite(self.shutdown_grace_seconds) or self.shutdown_grace_seconds < 0:
             raise ValueError("shutdown_grace_seconds cannot be negative")
         if self.mosaic_workers < 1:
@@ -184,7 +208,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         sessions: SessionRegistry,
         adaface: Any | None,
         tracker_factory: Callable[..., Any] = StreamTracker,
-        mark_unhealthy: Callable[[], Awaitable[None]] | None = None,
+        publish_health: Callable[[bool], Awaitable[None]] | None = None,
+        exit_process: Callable[[str], None] = exit_unrecoverable_runtime,
     ):
         self.runtime = runtime
         self.settings = settings
@@ -192,7 +217,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self.adaface = adaface
         self.face_anonymization = FaceAnonymizationRuntime(settings.face_anonymization)
         self.tracker_factory = tracker_factory
-        self.mark_unhealthy = mark_unhealthy
+        self.publish_health = publish_health
+        self.exit_process = exit_process
         self.active_streams = 0
         self.frame_limits = FrameLimits(
             max_jpeg_bytes=settings.max_jpeg_bytes,
@@ -211,6 +237,12 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         )
         self._face_slots = asyncio.BoundedSemaphore(FACE_ANONYMIZATION_MAX_INFLIGHT)
         self._accepting = False
+        self._closing = False
+        # 시간 초과로 응답을 포기했지만 아직 GPU에서 도는 추론. 회복은 이것들이 끝나기를 기다린다.
+        self._stalled_inferences: set[asyncio.Task] = set()
+        self._recovery: asyncio.Task | None = None
+        self._failure_generation = 0
+        self._health_lock = asyncio.Lock()
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
         if not self._accepting or not self.runtime.ready:
@@ -229,7 +261,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 )
             except Exception:
                 LOGGER.exception("tracker initialization failed")
-                await self._mark_runtime_unhealthy()
+                await self._enter_recovery("TRACKER_INIT_FAILED")
                 await context.abort(
                     grpc.StatusCode.INTERNAL,
                     "tracker initialization failed",
@@ -383,7 +415,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         if stream.session is None:
             stream.session = self.sessions.acquire_stream(stream.session_id)
 
-        result, failure = await self._run_inference(request, image, tracker, received_at)
+        result, failure = await self._run_inference(
+            request, image, tracker, received_at, stream.session_id
+        )
         if failure is not None:
             return failure
         try:
@@ -509,7 +543,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         image: np.ndarray,
         tracker: Any,
         received_at: float,
+        session_id: str,
     ) -> tuple[dict[str, Any] | None, FrameOutcome | None]:
+        submitted_at = time.perf_counter()
         task = asyncio.create_task(
             self.runtime.infer(image, tracker),
             name=f"grpc-infer-{request.frame_id}",
@@ -523,7 +559,19 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             )
             return result, None
         except TimeoutError:
-            await self._mark_runtime_unhealthy()
+            LOGGER.warning(
+                "frame %d inference timed out after %.0f ms (session=%s limit=%.2fs)",
+                request.frame_id,
+                (time.perf_counter() - submitted_at) * 1_000,
+                session_id,
+                self.settings.inference_timeout_seconds,
+            )
+            self._stalled_inferences.add(task)
+            task.add_done_callback(self._stalled_inferences.discard)
+            task.add_done_callback(
+                partial(self._log_stalled_inference, request.frame_id, session_id, submitted_at)
+            )
+            await self._enter_recovery("INFERENCE_TIMEOUT")
             return None, self._fatal_inference_outcome(
                 request,
                 "INFERENCE_TIMEOUT",
@@ -541,7 +589,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             )
         except InferenceFailure:
             LOGGER.exception("frame %d inference failed", request.frame_id)
-            await self._mark_runtime_unhealthy()
+            await self._enter_recovery("INFERENCE_FAILED")
             return None, self._fatal_inference_outcome(
                 request,
                 "INFERENCE_FAILED",
@@ -553,7 +601,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             raise
         except Exception:
             LOGGER.exception("frame %d processing failed", request.frame_id)
-            await self._mark_runtime_unhealthy()
+            await self._enter_recovery("PROCESSING_FAILED")
             return None, self._fatal_inference_outcome(
                 request,
                 "PROCESSING_FAILED",
@@ -734,7 +782,13 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                 raise
 
     async def close(self) -> None:
+        self._closing = True
         self._accepting = False
+        recovery = self._recovery
+        if recovery is not None and not recovery.done():
+            recovery.cancel()
+            with suppress(asyncio.CancelledError):
+                await recovery
         tasks = tuple(self._inference_tasks)
         for task in tasks:
             await self._settle_inference(task)
@@ -748,13 +802,101 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
     def set_accepting(self, accepting: bool) -> None:
         self._accepting = accepting
 
-    async def _mark_runtime_unhealthy(self) -> None:
+    async def _enter_recovery(self, reason: str) -> None:
+        """Stop admitting streams until the runtime proves it still answers.
+
+        Health turns NOT_SERVING before the failed frame's response leaves, so a caller that
+        probes readiness on that response already sees it.
+        """
         self._accepting = False
-        if self.mark_unhealthy is not None:
+        if self._closing:
+            return
+        self._failure_generation += 1
+        if self._recovery is None:
+            LOGGER.warning(
+                "stopped admitting streams after %s; self-check within %.0fs",
+                reason,
+                self.settings.inference_recovery_seconds,
+            )
+            self._recovery = asyncio.create_task(
+                self._recover_runtime(reason), name="runtime-recovery"
+            )
+        await self._publish_admission()
+
+    async def _recover_runtime(self, reason: str) -> None:
+        started = time.perf_counter()
+        deadline = asyncio.get_running_loop().time() + self.settings.inference_recovery_seconds
+        try:
+            async with asyncio.timeout_at(deadline):
+                while True:
+                    generation = self._failure_generation
+                    stalled = tuple(self._stalled_inferences)
+                    if stalled:
+                        await asyncio.wait(stalled)
+                    check_ms = await self._self_check()
+                    # 점검 중 새 실패가 났다면 그 실패 뒤에도 런타임이 답하는지 다시 확인한다.
+                    if generation == self._failure_generation:
+                        break
+        except TimeoutError:
+            self.exit_process(
+                f"{reason}: runtime did not recover within "
+                f"{self.settings.inference_recovery_seconds:.0f}s"
+            )
+            return
+        except Exception as error:
+            LOGGER.exception("runtime self-check failed after %s", reason)
+            self.exit_process(f"{reason}: runtime self-check failed ({type(error).__name__})")
+            return
+        if self._closing:
+            return
+        # 동기 구간에서 회복을 끝내야 이 뒤에 들어온 실패가 새 회복을 시작한다.
+        self._recovery = None
+        self._accepting = True
+        LOGGER.info(
+            "runtime recovered from %s in %.0f ms (self-check %.0f ms); admitting streams",
+            reason,
+            (time.perf_counter() - started) * 1_000,
+            check_ms,
+        )
+        await self._publish_admission()
+
+    async def _self_check(self) -> float:
+        tracker = await asyncio.to_thread(
+            self.tracker_factory,
+            self.settings.tracker_config,
+            getattr(self.runtime, "device", self.settings.runtime.device),
+        )
+        tracker.reset()
+        return await self.runtime.self_check()
+
+    async def _publish_admission(self) -> None:
+        """Publish the current admission state; the lock keeps the last change last."""
+
+        if self.publish_health is None:
+            return
+        async with self._health_lock:
             try:
-                await self.mark_unhealthy()
+                await self.publish_health(self._accepting)
             except Exception:
-                LOGGER.exception("failed to publish NOT_SERVING health state")
+                LOGGER.exception("failed to publish health state")
+
+    @staticmethod
+    def _log_stalled_inference(
+        frame_id: int, session_id: str, submitted_at: float, task: asyncio.Task
+    ) -> None:
+        if task.cancelled():
+            outcome = "was cancelled"
+        elif task.exception() is not None:
+            outcome = f"failed ({type(task.exception()).__name__})"
+        else:
+            outcome = "finished"
+        LOGGER.warning(
+            "timed-out frame %d inference %s %.0f ms after submission (session=%s)",
+            frame_id,
+            outcome,
+            (time.perf_counter() - submitted_at) * 1_000,
+            session_id,
+        )
 
     @staticmethod
     async def _settle_inference(task: asyncio.Future) -> None:
@@ -934,12 +1076,17 @@ def build_grpc_server(
     sessions: SessionRegistry | None = None,
     adaface: Any | None = None,
     tracker_factory: Callable[..., Any] = StreamTracker,
+    exit_process: Callable[[str], None] = exit_unrecoverable_runtime,
 ) -> GrpcServerBundle:
     server = grpc.aio.server(options=server_options())
     health_servicer = health.aio.HealthServicer()
 
-    async def mark_unhealthy() -> None:
-        status = health_pb2.HealthCheckResponse.NOT_SERVING
+    async def publish_health(serving: bool) -> None:
+        status = (
+            health_pb2.HealthCheckResponse.SERVING
+            if serving
+            else health_pb2.HealthCheckResponse.NOT_SERVING
+        )
         await health_servicer.set("", status)
         await health_servicer.set(SERVICE_NAME, status)
 
@@ -953,7 +1100,8 @@ def build_grpc_server(
         ),
         adaface=adaface,
         tracker_factory=tracker_factory,
-        mark_unhealthy=mark_unhealthy,
+        publish_health=publish_health,
+        exit_process=exit_process,
     )
     ai_processor_pb2_grpc.add_AiProcessorServicer_to_server(servicer, server)
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
@@ -1156,6 +1304,13 @@ def parse_args() -> argparse.Namespace:
         default=float(os.getenv("GRPC_INFERENCE_TIMEOUT", "1.5")),
     )
     parser.add_argument(
+        "--inference-recovery-timeout",
+        type=float,
+        default=float(os.getenv("GRPC_INFERENCE_RECOVERY_TIMEOUT", "30")),
+        help="Seconds a failed runtime may take to finish stalled frames and pass a self-check "
+        "before the process exits for a supervisor restart.",
+    )
+    parser.add_argument(
         "--shutdown-grace",
         type=float,
         default=float(os.getenv("GRPC_SHUTDOWN_GRACE", "5")),
@@ -1251,6 +1406,7 @@ def main() -> None:
         max_whitelist_entries=arguments.max_whitelist_entries,
         max_long_edge=arguments.max_long_edge,
         inference_timeout_seconds=arguments.inference_timeout,
+        inference_recovery_seconds=arguments.inference_recovery_timeout,
         shutdown_grace_seconds=arguments.shutdown_grace,
         mosaic_workers=arguments.mosaic_workers,
         mosaic_max_inflight=arguments.mosaic_max_inflight,

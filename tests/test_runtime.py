@@ -213,6 +213,55 @@ class ParallelMotionTests(unittest.TestCase):
         self.assertEqual(tracker.received, "unset")
 
 
+class SelfCheckTests(unittest.IsolatedAsyncioTestCase):
+    def _runtime(self, predict):
+        from concurrent.futures import ThreadPoolExecutor
+
+        runtime = RuntimeManager.__new__(RuntimeManager)
+        runtime.ready = True
+        runtime._closed = False
+        runtime._lane = None
+        runtime._predict = predict
+        runtime._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
+        self.addCleanup(runtime._executor.shutdown, wait=True)
+        return runtime
+
+    async def test_blank_frame_runs_on_the_inference_thread_after_queued_frames(self):
+        import asyncio
+        import threading
+
+        seen: list[tuple[tuple[int, ...], str]] = []
+
+        def predict(image):
+            seen.append((image.shape, threading.current_thread().name))
+            return "prediction"
+
+        runtime = self._runtime(predict)
+        await runtime.lane.acquire()
+        check = asyncio.create_task(runtime.self_check())
+        await asyncio.sleep(0.02)
+        self.assertFalse(check.done())
+        self.assertEqual(seen, [])
+
+        runtime.lane.release()
+        self.assertGreaterEqual(await asyncio.wait_for(check, timeout=1.0), 0.0)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], (IMAGE_SIZE, IMAGE_SIZE, 3))
+        self.assertTrue(seen[0][1].startswith("b1-inference"))
+
+    async def test_backend_error_and_closed_runtime_fail_the_check(self):
+        def predict(image):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        runtime = self._runtime(predict)
+        with self.assertRaisesRegex(RuntimeError, "illegal memory access"):
+            await runtime.self_check()
+
+        runtime._closed = True
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            await runtime.self_check()
+
+
 class PolygonLimitTests(unittest.TestCase):
     @staticmethod
     def contour(mask: np.ndarray) -> np.ndarray:
