@@ -1,0 +1,18 @@
+.rtc-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 22px; }
+.rtc-controls .active-session-control { flex: 1 1 300px; }
+.rtc-file { display: grid; gap: 8px; color: var(--muted); font-size: .8rem; }
+.rtc-file input { max-width: 230px; }
+.rtc-output { position: relative; min-height: 240px; background: #08111c; border-radius: 10px; overflow: hidden; }
+.rtc-output video { display: block; width: 100%; margin: 0; }
+.rtc-output video[hidden] { display: none; }
+.rtc-output p { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; margin: 0; text-align: center; color: #cbd5e1; }
+.rtc-output p[hidden] { display: none; }
+.rtc-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: .85rem; }
+.rtc-footer p { margin: 0; }
+.rtc-footer a { color: var(--primary); }
+.metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 640px) {
+  .rtc-controls { padding: 16px; }
+  .rtc-controls .active-session-control { flex-basis: 100%; }
+  .metrics { grid-template-columns: 1fr; }
+}

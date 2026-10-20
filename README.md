@@ -280,6 +280,17 @@ importer로 설치합니다. `FACE_ANONYMIZATION_MODE_FACE_METADATA`로 속성�
 Go 서버의 요청 필드와 값별 동작은 [Go 연동 가이드](docs/go-face-swap-grpc.md),
 모델 다운로드와 프리셋 설치는 [모델 준비 가이드](docs/face-swap-model-download.md)를 참고합니다.
 
+Mac에서 `best.pt`를 유지하면서 **MobileFaceSwap 224**를 테스트하려면
+[공식 사전학습 모델 다운로드·설치](models/README.md#mobilefaceswap-224)를 마친 뒤
+[실행 가이드](docs/mobilefaceswap-mac.md)의 `./scripts/run_mobilefaceswap.sh`를 사용합니다.
+메인 `ai_processor_server.py`에서 `--face-swap-backend mobilefaceswap`을 선택할 수 있습니다.
+Go의 기존 `ProcessVideo` 요청·응답과 InSwapper 기본값은 유지됩니다.
+RTX 3090의 CUDA FP16·TensorRT 실행, 프리셋 사전 계산, HTTPS/systemd 구성은
+[CUDA 배포 가이드](docs/mobilefaceswap-cuda.md)를 참고합니다.
+CUDA 실행기의 기본 브라우저 경로는 H.264 WebRTC입니다. 기존 JPEG 화면은 `/jpeg`에서
+사용할 수 있으며, 전송 구조와 같은 입력의 FPS·지연 비교는
+[WebRTC 실행 가이드](docs/webrtc-serving.md)를 참고합니다.
+
 ## 검증
 
 ```bash

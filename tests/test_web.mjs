@@ -453,6 +453,14 @@ assert.deepEqual(negotiateServerProfile(health), {
   ...PROFILE,
   maxStreams: 32,
 });
+assert.equal(negotiateServerProfile({
+  ...health,
+  serving_profile: { ...health.serving_profile, frame_timeout_ms: 60000 },
+}).timeoutMs, 60000);
+assert.throws(() => negotiateServerProfile({
+  ...health,
+  serving_profile: { ...health.serving_profile, frame_timeout_ms: -1 },
+}), /frame_timeout_ms/);
 assert.deepEqual(negotiateServerProfile({
   ...health,
   serving_profile: {

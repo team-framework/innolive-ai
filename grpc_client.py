@@ -104,13 +104,16 @@ class MosaicConfig:
 
 @dataclass(frozen=True, slots=True)
 class VideoFrame:
-    """One complete JPEG request; timestamp is an opaque signed int64 value."""
+    """One JPEG, or opt-in packed yuv420p frame; timestamp is an opaque int64."""
 
     data: bytes
     timestamp: int
     frame_id: int
     mosaic: MosaicConfig | None = None
     anonymization_mode: str = "blur"
+    width: int = 0
+    height: int = 0
+    pix_fmt: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +122,11 @@ class VideoResult:
 
     source_jpeg: bytes
     response: ai_processor_pb2.ProcessedVideoChunk
+
+    @property
+    def processed_data(self) -> bytes:
+        """Processed pixels in the request's format (JPEG or packed yuv420p)."""
+        return bytes(self.response.data)
 
     @property
     def processed_jpeg(self) -> bytes:
@@ -685,6 +693,9 @@ class VideoProcessorClient:
                     anonymization_mode={"blur": 0, "face_swap": 1, "face_metadata": 2}[
                         normalized.anonymization_mode
                     ],
+                    width=normalized.width,
+                    height=normalized.height,
+                    pix_fmt=normalized.pix_fmt,
                 )
                 config = normalized.mosaic
                 if config is not None:
@@ -748,7 +759,12 @@ class VideoProcessorClient:
                         "server does not report experimental face anonymization; update the server proto and runtime"
                     )
         try:
-            _validate_jpeg(response.data)
+            if source.pix_fmt:
+                if (response.width, response.height) != (source.width, source.height):
+                    raise ValueError("raw response dimensions changed")
+                _validate_raw(response.data, response.width, response.height, source.pix_fmt)
+            else:
+                _validate_jpeg(response.data)
         except (TypeError, ValueError) as error:
             raise VideoProtocolError(
                 f"frame {source.frame_id} returned invalid processed data: {error}"
@@ -798,7 +814,12 @@ async def _iterate_bytes(
 def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
     if not isinstance(frame, VideoFrame):
         raise TypeError("frames must yield VideoFrame instances")
-    jpeg = _validate_jpeg(frame.data)
+    if frame.pix_fmt:
+        data = _validate_raw(frame.data, frame.width, frame.height, frame.pix_fmt)
+    else:
+        if frame.width or frame.height:
+            raise ValueError("raw dimensions require pix_fmt")
+        data = _validate_jpeg(frame.data)
     if type(frame.timestamp) is not int or not -(2**63) <= frame.timestamp < 2**63:
         raise ValueError("VideoFrame.timestamp must be a signed int64")
     if type(frame.frame_id) is not int or not 0 <= frame.frame_id <= MAX_FRAME_ID:
@@ -810,7 +831,29 @@ def _validate_frame(frame: VideoFrame, last_frame_id: int) -> VideoFrame:
         raise TypeError("VideoFrame.mosaic must be a MosaicConfig instance")
     if frame.anonymization_mode not in {"blur", "face_swap", "face_metadata"}:
         raise ValueError("VideoFrame.anonymization_mode must be blur, face_swap, or face_metadata")
-    return VideoFrame(jpeg, frame.timestamp, frame.frame_id, mosaic, frame.anonymization_mode)
+    return VideoFrame(
+        data,
+        frame.timestamp,
+        frame.frame_id,
+        mosaic,
+        frame.anonymization_mode,
+        frame.width,
+        frame.height,
+        frame.pix_fmt,
+    )
+
+
+def _validate_raw(data: bytes, width: int, height: int, pix_fmt: str) -> bytes:
+    if pix_fmt != "yuv420p":
+        raise ValueError("only packed yuv420p raw frames are supported")
+    if any(
+        type(value) is not int or value < 32 or value > 1920 or value % 2
+        for value in (width, height)
+    ):
+        raise ValueError("raw dimensions must be even integers in 32..1920")
+    if not isinstance(data, bytes) or len(data) != width * height * 3 // 2:
+        raise ValueError("raw frame length does not match its dimensions")
+    return data
 
 
 def _validate_jpeg(value: bytes | bytearray | memoryview) -> bytes:

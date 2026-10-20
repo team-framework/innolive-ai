@@ -68,7 +68,7 @@
         <div class="section-heading">
           <div>
             <h2>이미지 단건 추론 시각화</h2>
-            <p class="section-description">업로드한 이미지와 모델에 실제 전달한 resize 이미지, box/mask 윤곽선을 비교합니다.</p>
+            <p class="section-description">원본·모델 입력·추론 결과를 비교합니다. 얼굴 합성 모드에서는 합성된 얼굴과 탐지 윤곽선을 표시합니다.</p>
           </div>
           <span id="inference-status" class="inference-status">이미지 선택 대기 중</span>
         </div>
@@ -91,8 +91,8 @@
             <img id="inference-model-input" class="inference-image" alt="모델에 전달된 resize 이미지" />
           </figure>
           <figure class="inference-figure inference-figure-result">
-            <figcaption>추론 결과 · box/mask 윤곽선</figcaption>
-            <img id="inference-result" class="inference-image" alt="box와 mask 윤곽선이 표시된 추론 결과" />
+            <figcaption>추론 결과 · 탐지 및 보호 처리</figcaption>
+            <img id="inference-result" class="inference-image" alt="탐지 윤곽선과 선택한 보호 처리가 적용된 결과" />
           </figure>
         </div>
       </section>

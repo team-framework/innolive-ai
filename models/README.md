@@ -69,3 +69,59 @@ See [the preset pipeline guide](../docs/face-preset-anonymization.md) for artifa
 optional ONNX dependencies, the manifest, and the actual gRPC test client.
 For official download commands and preset installation, see
 [the model download guide](../docs/face-swap-model-download.md).
+
+## MobileFaceSwap 224
+
+[공식 사전학습 모델 다운로드: checkpoints.tar](https://drive.google.com/file/d/1ZIzGLDB15GRAZAbkfNR0hNWdgQpxeA_r/view)
+([원본 프로젝트 안내](https://github.com/Seanseattle/MobileFaceSwap#readme)).
+약 543 MiB의 TAR 파일이며, 내부 `checkpoints/`를 이 서버의
+`models/mobilefaceswap/`에 맞춰 설치한다. `models/best.pt`와 metadata 모델은 그대로 사용한다.
+
+| 저장 위치 (`models/` 기준) | 용도 | 다운로드 파일에서 확인한 SHA-256 |
+| --- | --- | --- |
+| `mobilefaceswap/MobileFaceSwap_224.pdparams` | 224px 얼굴 합성 | `ee51a18684d2862363deefde14220d7e7eb33b78b5b1840e1a76566a7f3508fb` |
+| `mobilefaceswap/arcface.pdparams` | 합성할 얼굴의 identity·특징 추출 | `adc5d94075fc2f8ad93ba1040310b97f604843d03c82ecf3a4bdb86af658ca3b` |
+| `mobilefaceswap/landmarks/scrfd_10g_bnkps.onnx` | 얼굴 검출·landmark 정렬 | `5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91` |
+
+다음 명령은 **저장소 루트**에서 실행한다. 프로젝트의 `.venv`를 사용하며, 없으면
+먼저 `python3 -m venv .venv`로 생성한다. `gdown`은 Google Drive 다운로드에만 필요하다.
+
+```bash
+.venv/bin/python -m pip install gdown
+mkdir -p .runtime/downloads models/mobilefaceswap
+.venv/bin/python -m gdown 1ZIzGLDB15GRAZAbkfNR0hNWdgQpxeA_r \
+  --no-cookies --continue -O .runtime/downloads/checkpoints.tar
+```
+
+Drive 다운로드 제한이 발생하면 위 링크에서 직접 받아
+`.runtime/downloads/checkpoints.tar`에 저장한 뒤 아래부터 실행한다.
+전체 압축을 풀지 않고 런타임에 필요한 세 파일만 설치한다.
+번들에 포함된 `landmarks/glintr100.onnx`는 현재 파이프라인에서 사용하지 않는다.
+
+```bash
+tar -xf .runtime/downloads/checkpoints.tar \
+  -C models/mobilefaceswap --strip-components=1 \
+  checkpoints/MobileFaceSwap_224.pdparams \
+  checkpoints/arcface.pdparams \
+  checkpoints/landmarks/scrfd_10g_bnkps.onnx
+
+shasum -a 256 -c <<'EOF'
+ee51a18684d2862363deefde14220d7e7eb33b78b5b1840e1a76566a7f3508fb  models/mobilefaceswap/MobileFaceSwap_224.pdparams
+adc5d94075fc2f8ad93ba1040310b97f604843d03c82ecf3a4bdb86af658ca3b  models/mobilefaceswap/arcface.pdparams
+5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91  models/mobilefaceswap/landmarks/scrfd_10g_bnkps.onnx
+EOF
+```
+
+세 파일이 모두 `OK`여야 한다. Linux에서는 `sha256sum -c`도 사용할 수 있다.
+이 번들에는 탐지·metadata 모델과 프리셋 이미지가 없으므로
+공통 파일은 [모델·프리셋 준비 가이드](../docs/face-swap-model-download.md)를 따른다.
+InSwapper용 `inswapper_128.onnx`와 `w600k_r50.onnx`는 MobileFaceSwap에서 사용하지 않는다.
+
+의존성 설치와 실행은 환경별 가이드를 따른다.
+
+- Apple Silicon MPS: [Mac 실행 가이드](../docs/mobilefaceswap-mac.md), `./scripts/run_mobilefaceswap.sh`
+- NVIDIA CUDA: [CUDA 배포 가이드](../docs/mobilefaceswap-cuda.md), 캐시 사전 생성 후 `./scripts/run_mobilefaceswap_cuda.sh`
+
+메인 서버에서는 `--face-swap-backend mobilefaceswap`으로 선택한다.
+일반 서버의 기본 backend는 InSwapper이며 Go gRPC 요청·응답 계약은 유지된다.
+모델과 생성 캐시는 Git에 추가하지 않는다.

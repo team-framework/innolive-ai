@@ -23,6 +23,7 @@ from service.face_presets import (
     StreamFaceIdentities,
 )
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
+from service.mobilefaceswap import DEFAULT_MODEL_DIR
 from service.mosaic import (
     DEFAULT_MASK_MARGIN,
     _compose_protected,
@@ -44,10 +45,24 @@ class FaceAnonymizationConfig:
     metadata_device: str = "cpu"
     swap_provider: str = "cpu"
     retention_frames: int = 30
+    swap_backend: str = "inswapper"
+    mobilefaceswap_dir: Path = DEFAULT_MODEL_DIR
+    mobilefaceswap_precision: str = "fp32"
+    warmup: bool = False
 
     def __post_init__(self) -> None:
-        if self.swap_provider not in {"cpu", "cuda"}:
-            raise ValueError("swap_provider must be cpu or cuda")
+        if self.swap_backend not in {"inswapper", "mobilefaceswap"}:
+            raise ValueError("swap_backend must be inswapper or mobilefaceswap")
+        if self.swap_provider not in {"cpu", "mps", "cuda"}:
+            raise ValueError("swap_provider must be cpu, mps or cuda")
+        if self.swap_backend == "inswapper" and self.swap_provider == "mps":
+            raise ValueError("InSwapper supports cpu or cuda; mps requires MobileFaceSwap")
+        if self.mobilefaceswap_precision not in {"fp32", "fp16"}:
+            raise ValueError("mobilefaceswap_precision must be fp32 or fp16")
+        if self.mobilefaceswap_precision == "fp16" and (
+            self.swap_backend != "mobilefaceswap" or self.swap_provider != "cuda"
+        ):
+            raise ValueError("MobileFaceSwap fp16 requires the mobilefaceswap CUDA backend")
         if self.retention_frames < 1:
             raise ValueError("identity retention must be positive")
 
@@ -62,6 +77,14 @@ class FaceAnonymizationRuntime:
         self.renderer: Any | None = None
         self.load_error: str | None = None
         self.renderer_error: str | None = None
+
+    def warmup(self) -> None:
+        """Explicit serving startup; default blur-only servers remain lazy."""
+        self._metadata()
+        self._renderer()
+        prepare = getattr(self.renderer, "warmup", None)
+        if prepare is not None:
+            prepare(list(self.catalog.presets.values()))
 
     def _metadata(self) -> None:
         if self.load_error:
@@ -86,15 +109,37 @@ class FaceAnonymizationRuntime:
         if self.renderer is not None:
             return
         try:
-            self.renderer = InSwapperRenderer(
-                self.config.swapper_model,
-                self.config.arcface_model,
-                self.config.yunet_model,
+            if self.config.swap_backend == "mobilefaceswap":
+                if self.config.swap_provider == "cpu":
+                    from service.mobilefaceswap import MobileFaceSwapRenderer
+
+                    self.renderer = MobileFaceSwapRenderer(self.config.mobilefaceswap_dir, "cpu")
+                else:
+                    from service.mobilefaceswap_torch import TorchMobileFaceSwapRenderer
+
+                    self.renderer = TorchMobileFaceSwapRenderer(
+                        self.config.mobilefaceswap_dir,
+                        self.config.swap_provider,
+                        precision=self.config.mobilefaceswap_precision,
+                    )
+            else:
+                self.renderer = InSwapperRenderer(
+                    self.config.swapper_model,
+                    self.config.arcface_model,
+                    self.config.yunet_model,
+                    self.config.swap_provider,
+                )
+            LOGGER.info(
+                "face swap renderer ready: backend=%s provider=%s",
+                self.config.swap_backend,
                 self.config.swap_provider,
             )
         except Exception:
             self.renderer_error = "swapper_unavailable"
-            LOGGER.exception("experimental InSwapper unavailable; restart after fixing artifacts")
+            LOGGER.exception(
+                "experimental %s unavailable; restart after fixing artifacts",
+                self.config.swap_backend,
+            )
             raise
 
     def process(
@@ -170,6 +215,7 @@ class FaceAnonymizationRuntime:
                 track_id = eligible[index].get("track_id")
                 if track_id is not None:
                     identities.cache_metadata(int(track_id), prediction, frame)
+        mobile_jobs = []
         for item, prediction in zip(eligible, predictions, strict=True):
             if prediction is None:
                 continue
@@ -192,6 +238,9 @@ class FaceAnonymizationRuntime:
             if self.renderer_error:
                 info["reason"] = "swapper_unavailable"
                 continue
+            if self.config.swap_backend == "mobilefaceswap":
+                mobile_jobs.append((item, preset))
+                continue
             try:
                 self._renderer()
                 candidate = self.renderer.swap(output.copy(), item, preset)
@@ -203,6 +252,27 @@ class FaceAnonymizationRuntime:
             except Exception:
                 info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
                 LOGGER.warning("track %s swap failed; applying blur", track_id, exc_info=True)
+        if mobile_jobs:
+            try:
+                self._renderer()
+                errors = self.renderer.swap_many(
+                    output, mobile_jobs, target=self.renderer.prepare_frame(image)
+                )
+                if len(errors) != len(mobile_jobs):
+                    raise ValueError("MobileFaceSwap result count mismatch")
+            except Exception as error:
+                errors = [error] * len(mobile_jobs)
+                LOGGER.warning("MobileFaceSwap frame failed; applying blur", exc_info=True)
+            swapped = set()
+            for (item, _), error in zip(mobile_jobs, errors, strict=True):
+                info = item["anonymization"]
+                if error is None:
+                    info.update(status="swapped", reason="")
+                    swapped.add(id(item))
+                else:
+                    info["reason"] = "swapper_unavailable" if self.renderer_error else "swap_failed"
+                    LOGGER.warning("track %s swap failed: %s", item["track_id"], error)
+            remaining = [item for item in remaining if id(item) not in swapped]
         if not render:
             return b""
         # Apply failed/held face and number-plate blur last so it takes precedence

@@ -22,6 +22,7 @@ from service.adaface_backbones import (
     build_adaface_backbone,
     checkpoint_backbone_state,
 )
+from service.cuda_capture import CUDA_CAPTURE_LOCK
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ADAFACE_ARCHITECTURE = "vit_base_kprpe"
@@ -439,6 +440,7 @@ def _square_face_crop(image: np.ndarray, face: np.ndarray) -> tuple[np.ndarray, 
 
 def _synchronize(device: torch.device) -> None:
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        with CUDA_CAPTURE_LOCK:
+            torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()

@@ -1,6 +1,6 @@
 # 얼굴 합성 모델 다운로드와 설치
 
-[PR #38](https://github.com/team-framework/innolive-ai/pull/38)이 병합된 `main`의 gRPC 얼굴 합성 기능 기준이다.
+`main`의 gRPC 얼굴 합성 기능 기준이다. 기본 InSwapper와 선택형 MobileFaceSwap 224를 지원한다.
 아래 작업은 **AI 서버의 저장소 루트**에서 실행한다. Go 서버는 [gRPC 요청 필드](go-face-swap-grpc.md)만 설정한다.
 서버는 모델을 자동 다운로드하지 않는다.
 
@@ -8,16 +8,22 @@
 
 | 저장 위치 | 용도 | 확보 방법 |
 | --- | --- | --- |
-| `models/best.pt` | 얼굴·번호판 탐지 | Git에 포함, 최신 `main` checkout으로 확보 |
-| `models/face_metadata_extracter.pt` | 성별·나이·안경·표정 분석 | Git에 포함, 최신 `main` checkout으로 확보 |
-| `models/face_swap/inswapper_128.onnx` | 얼굴 합성 | 아래 공식 다운로드 명령 |
-| `models/face_swap/w600k_r50.onnx` | 합성할 얼굴의 identity 추출 | 공식 `buffalo_l.zip`에서 추출 |
+| `models/best.pt` | 얼굴·번호판 탐지 | Git LFS에 포함, 최신 `main`에서 `git lfs pull`로 확보 |
+| `models/face_metadata_extracter.pt` | 성별·나이·안경·표정 분석 | Git LFS에 포함, 최신 `main`에서 `git lfs pull`로 확보 |
+| `models/face_swap/inswapper_128.onnx` | InSwapper 얼굴 합성 | 아래 공식 다운로드 명령 |
+| `models/face_swap/w600k_r50.onnx` | InSwapper source identity 추출 | 공식 `buffalo_l.zip`에서 추출 |
+| `models/mobilefaceswap/MobileFaceSwap_224.pdparams` | MobileFaceSwap 얼굴 합성 | [공식 번들 다운로드·설치](../models/README.md#mobilefaceswap-224) |
+| `models/mobilefaceswap/arcface.pdparams` | MobileFaceSwap source identity·특징 추출 | 같은 공식 번들에서 추출 |
+| `models/mobilefaceswap/landmarks/scrfd_10g_bnkps.onnx` | MobileFaceSwap 얼굴 정렬 | 같은 공식 번들에서 추출 |
 | `models/face_detection_yunet_2023mar.onnx` | 얼굴 위치와 landmark 정렬 | 아래 OpenCV 다운로드 명령 |
-| `config/face_presets.json`과 `config/face_presets/images/*.png` | 합성할 가짜 얼굴 목록과 이미지 | catalog는 Git에 포함, 이미지는 팀의 `synthetic_faces` 배포본 설치 |
+| `config/face_presets.json`과 `config/face_presets/images/*.png` | 합성할 가짜 얼굴 목록과 이미지 | catalog는 Git에 포함, 이미지는 팀의 `natural_faces_v2` 배포본 설치 |
 
 기존 whitelist용 AdaFace 모델은 [models/README.md](../models/README.md)의 준비 방법을 따른다.
 
-## 외부 모델 다운로드
+합성 모델은 선택한 backend에 필요한 파일만 설치한다. 탐지·metadata·프리셋과
+whitelist용 AdaFace·YuNet은 공통 준비 항목이다.
+
+## InSwapper 외부 모델 다운로드
 
 InSwapper와 호환되는 ArcFace는 **`buffalo_l`의 `w600k_r50.onnx`**다.
 공식 [InSwapper 안내](https://github.com/deepinsight/insightface/blob/master/examples/in_swapper/README.md)와
@@ -58,18 +64,27 @@ be9b42f67dbab87c6a6a73161995ddb43b73e64c6203748f3ab3222edef4448a  models/face_me
 EOF
 ```
 
+## MobileFaceSwap 모델 다운로드
+
+[models/README.md의 MobileFaceSwap 224 설치 명령](../models/README.md#mobilefaceswap-224)으로
+공식 `checkpoints.tar`를 다운로드하고 필요한 세 파일을 설치·검증한다.
+InSwapper용 ONNX 두 개는 필요하지 않으며, 기존 `best.pt`는 유지한다.
+MPS 의존성·실행은 [Mac 가이드](mobilefaceswap-mac.md), CUDA 의존성·캐시 준비·실행은
+[CUDA 가이드](mobilefaceswap-cuda.md)를 따른다.
+
 ## 프리셋 이미지와 Python 의존성 설치
 
-팀에서 `dataset_manifest.csv`와 `images/`가 들어 있는 **전체 `synthetic_faces` 배포본**을 받는다.
+팀에서 `dataset_manifest.csv`와 `images/`가 들어 있는 **현재 카탈로그와 같은 배포본**을 받는다.
+현재 카탈로그는 `natural_faces_v2` 560장을 참조하며, 이전 `synthetic_faces` 이미지와 해시가 다르다.
 프리셋 PNG는 Git에 포함되지 않으므로 팀 배포본을 별도로 받아야 한다.
 
 ```bash
-# CPU 실행용 기본 설치
+# InSwapper CPU 실행용 기본 설치 (MobileFaceSwap은 위 환경별 가이드 사용)
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-face-swap.txt
 
-# /path/to/synthetic_faces를 받은 배포본의 실제 경로로 변경
-.venv/bin/python scripts/import_face_presets.py --source /path/to/synthetic_faces
+# 받은 배포본의 실제 경로로 변경. 기존 이미지 세트는 먼저 별도 보존.
+.venv/bin/python scripts/import_face_presets.py --source /path/to/natural_faces_v2
 ```
 
 importer가 560장의 이미지 hash와 조합을 검증하고 `config/face_presets/`에 복사한 뒤 catalog를 갱신한다.
@@ -78,7 +93,7 @@ importer가 560장의 이미지 hash와 조합을 검증하고 `config/face_pres
 ## 서버 실행과 확인
 
 ```bash
-# CPU에서 동작 확인
+# 기본 InSwapper를 CPU에서 동작 확인
 .venv/bin/python ai_processor_server.py --backend pytorch --device cpu
 ```
 

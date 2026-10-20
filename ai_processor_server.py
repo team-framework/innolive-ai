@@ -83,6 +83,7 @@ from service.runtime import (
     TrackingFailure,
     detector_mask_pad,
 )
+from service.startup_gc import StartupGc
 from service.tracking import StreamTracker
 
 LOGGER = logging.getLogger("innolive.grpc")
@@ -1163,6 +1164,7 @@ async def serve(settings: GrpcServerSettings) -> None:
     runtime = None
     adaface = None
     bundle = None
+    startup_gc = StartupGc()
     try:
         runtime = await asyncio.to_thread(RuntimeManager, settings.runtime)
         tracker_probe = await asyncio.to_thread(
@@ -1188,6 +1190,14 @@ async def serve(settings: GrpcServerSettings) -> None:
             sessions=sessions,
             adaface=adaface,
         )
+        if settings.face_anonymization.warmup:
+            await asyncio.get_running_loop().run_in_executor(
+                bundle.servicer._face_executor, bundle.servicer.face_anonymization.warmup
+            )
+            # A generation-2 scan of the imported frameworks and warmed models
+            # otherwise stalls an in-flight response despite no garbage to free.
+            # Streams are not admitted yet; their later cycles remain collectable.
+            startup_gc.freeze()
         await bundle.set_serving(True)
         await bundle.server.start()
         LOGGER.info(
@@ -1207,6 +1217,7 @@ async def serve(settings: GrpcServerSettings) -> None:
             )
         await bundle.server.wait_for_termination()
     finally:
+        startup_gc.close()
         if bundle is not None:
             bundle.servicer.set_accepting(False)
             await bundle.health_servicer.enter_graceful_shutdown()
@@ -1357,6 +1368,11 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Frames one stream processes at once; 2+ overlaps composition with the next frame.",
     )
+    parser.add_argument(
+        "--face-swap-backend", choices=("inswapper", "mobilefaceswap"), default="inswapper"
+    )
+    parser.add_argument("--mobilefaceswap-dir", type=Path, default=experimental.mobilefaceswap_dir)
+    parser.add_argument("--mobilefaceswap-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
     parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
     parser.add_argument("--face-swap-model", type=Path, default=experimental.swapper_model)
@@ -1365,7 +1381,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--face-metadata-device", default="cpu", help="torch device: cpu, mps, cuda:0"
     )
-    parser.add_argument("--face-swap-provider", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--face-swap-provider", choices=("cpu", "mps", "cuda"), default="cpu")
+    parser.add_argument(
+        "--face-swap-warmup",
+        action="store_true",
+        help="Load face metadata/renderer and warm source models before reporting SERVING.",
+    )
     parser.add_argument("--face-identity-retention-frames", type=positive_int, default=30)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
@@ -1388,6 +1409,9 @@ def main() -> None:
             warmup_runs=arguments.warmup_runs,
         ),
         face_anonymization=FaceAnonymizationConfig(
+            swap_backend=arguments.face_swap_backend,
+            mobilefaceswap_dir=arguments.mobilefaceswap_dir,
+            mobilefaceswap_precision=arguments.mobilefaceswap_precision,
             metadata_model=arguments.face_metadata_model,
             preset_manifest=arguments.face_preset_manifest,
             swapper_model=arguments.face_swap_model,
@@ -1396,6 +1420,7 @@ def main() -> None:
             metadata_device=arguments.face_metadata_device,
             swap_provider=arguments.face_swap_provider,
             retention_frames=arguments.face_identity_retention_frames,
+            warmup=arguments.face_swap_warmup,
         ),
         adaface=AdaFaceConfig(
             architecture=arguments.adaface_architecture,

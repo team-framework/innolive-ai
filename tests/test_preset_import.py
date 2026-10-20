@@ -118,6 +118,23 @@ class PresetImportTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     dataset_catalog(self.source)
 
+    def test_dataset_provenance_survives_import_without_changing_slot_contract(self):
+        (self.source / "codebook.json").write_text(
+            json.dumps(
+                {
+                    "dataset": "natural_faces_v2",
+                    "generator": "built-in ImageGen",
+                }
+            )
+        )
+        payload = dataset_catalog(self.source)
+        self.assertEqual(payload["provenance"]["dataset"], "natural_faces_v2")
+        self.assertEqual(payload["provenance"]["generator"], "built-in ImageGen")
+        self.assertEqual({p["identity"] for p in payload["presets"]}, set(range(1, 6)))
+        (self.source / "codebook.json").write_text('{"dataset": {}}')
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            dataset_catalog(self.source)
+
     def test_mislabeled_filename_and_invalid_identity_are_rejected(self):
         for mutation in ({"gender": "male"}, {"local_id": "5"}, {"glasses": "unknown"}):
             rows = [dict(row) for row in self.rows]

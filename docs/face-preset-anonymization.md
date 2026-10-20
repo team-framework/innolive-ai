@@ -1,8 +1,12 @@
-# metadata 프리셋 기반 experimental 얼굴 합성
+# metadata 프리셋 기반 얼굴 합성
 
 메인 `ProcessVideo`에서 YOLO segmentation과 BoT-SORT, AdaFace whitelist 처리를 마친
 얼굴에 metadata 추출과 프리셋 매칭을 연결한다. 프리셋이 아직 없는 상태에서도
 metadata와 identity 할당 결과를 확인할 수 있다.
+
+기본 renderer는 InSwapper-128이다. `--face-swap-backend mobilefaceswap`으로
+메인 gRPC 파이프라인에서 MobileFaceSwap 224를 선택한다. [CUDA 운영 가이드](mobilefaceswap-cuda.md)와
+[Mac 가이드](mobilefaceswap-mac.md)를 참고한다. Go 요청·응답 계약과 기본 blur 동작은 동일하다.
 
 ## 요청 모드
 
@@ -10,7 +14,7 @@ metadata와 identity 할당 결과를 확인할 수 있다.
 | --- | --- | --- |
 | `FACE_ANONYMIZATION_MODE_BLUR` (0, 생략) | `blur` | 기본 Gaussian blur; experimental 모델 로딩 없음 |
 | `FACE_ANONYMIZATION_MODE_FACE_METADATA` (2) | `face_metadata` | metadata 추출·프리셋 매칭 결과 반환, 화면은 blur |
-| `FACE_ANONYMIZATION_MODE_FACE_SWAP` (1) | `face_swap` | metadata 추출·프리셋 매칭 후 InSwapper-128 합성; 실패한 얼굴은 blur |
+| `FACE_ANONYMIZATION_MODE_FACE_SWAP` (1) | `face_swap` | metadata 추출·프리셋 매칭 후 선택된 backend로 합성; 실패한 얼굴은 blur |
 
 모드는 한 `ProcessVideo` RPC 동안 고정한다. 바꾸려면 새 RPC를 연다. 기본
 `MosaicConfig.pixel_size`는 2이며 `blur_radius`는 24px이다. `pixel_size` 1은
@@ -20,7 +24,7 @@ metadata와 identity 할당 결과를 확인할 수 있다.
 기존 field 번호와 RPC 경로는 유지한다.
 `VIDEO_OUTPUT_MODE_MOSAIC_JPEG`라는 기존 이름도 유지하며 합성 모드에서는 합성된 JPEG를
 반환한다. `VIDEO_OUTPUT_MODE_METADATA_ONLY`에서는 선택한 experimental 모드의 metadata와
-매칭 결과만 반환하며 InSwapper를 실행하지 않는다. raw `yuv420p` 입출력도 지원한다.
+매칭 결과만 반환하며 합성 모델을 실행하지 않는다. raw `yuv420p` 입출력도 지원한다.
 
 ```mermaid
 flowchart LR
@@ -32,7 +36,7 @@ flowchart LR
   E -->|아니오| K[트랙 metadata 캐시]
   M --> F[트랙 identity 유지 → 최신 exp / glasses 매칭]
   K --> F
-  F -->|face_swap + 프리셋 존재| G[YuNet 정렬 → InSwapper-128]
+  F -->|face_swap + 프리셋 존재| G[InSwapper-128 또는 MobileFaceSwap-224]
   F -->|프리셋 누락 또는 metadata 모드| D
   G -->|실패| D
   G --> H[보호 대상 blur와 합성 → 인코딩]
@@ -50,7 +54,7 @@ flowchart LR
 주기는 서버가 해당 RPC에서 받은 프레임 순서로 계산하며 클라이언트 `frame_id`나 timestamp와
 무관하다. 첫 관측이 RPC의 1번째 프레임이면 1·31·61번째, 10번째 프레임이면 10·40·70번째에
 추출한다. 해당 시점에 held 또는 너무 작은 얼굴이면 다음 적격 검출에서 추출한다.
-같은 프레임에 갱신이 필요한 얼굴만 모아 batch 추론한다. InSwapper 합성은 현재 프레임의
+같은 프레임에 갱신이 필요한 얼굴만 모아 batch 추론한다. 얼굴 합성은 현재 프레임의
 얼굴에서 계속 실행하며 metadata 갱신 주기만 줄인다. `exp`와 `glasses` 변화는 다음 갱신
 시점에 반영되므로 감지까지 최대 30 입력 프레임의 지연이 생길 수 있다.
 
