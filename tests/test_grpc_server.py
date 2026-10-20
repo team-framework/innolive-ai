@@ -95,6 +95,19 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
     await asyncio.wait_for(wait(), timeout=timeout)
 
 
+async def _health_status(server: Any) -> int:
+    response = await server.health.Check(health_pb2.HealthCheckRequest(service=SERVICE_NAME))
+    return response.status
+
+
+async def _wait_for_health(server: Any, status: int, timeout: float = 1.0) -> None:
+    async def wait() -> None:
+        while await _health_status(server) != status:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(wait(), timeout=timeout)
+
+
 class FakeTracker:
     def __init__(self, runtime: Any):
         self.runtime = runtime
@@ -115,6 +128,14 @@ class FakeRuntime:
 
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[int, ...], FakeTracker]] = []
+        self.self_checks = 0
+        self.self_check_error: Exception | None = None
+
+    async def self_check(self) -> float:
+        self.self_checks += 1
+        if self.self_check_error is not None:
+            raise self.self_check_error
+        return 1.0
 
     async def infer(
         self,
@@ -194,6 +215,42 @@ class FailedRuntime(FakeRuntime):
         raise InferenceFailure("injected inference failure")
 
 
+class SwitchableFailureRuntime(FakeRuntime):
+    """Fails while ``fail`` is set; its self-check waits for the test to release it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+        self.self_check_started = asyncio.Event()
+        self.release_self_check = asyncio.Event()
+
+    async def infer(
+        self,
+        image: np.ndarray,
+        tracker: FakeTracker,
+    ) -> dict[str, Any]:
+        if self.fail:
+            raise InferenceFailure("injected inference failure")
+        return await super().infer(image, tracker)
+
+    async def self_check(self) -> float:
+        self.self_check_started.set()
+        await self.release_self_check.wait()
+        return await super().self_check()
+
+
+class FailOnceRuntime(FakeRuntime):
+    async def infer(
+        self,
+        image: np.ndarray,
+        tracker: FakeTracker,
+    ) -> dict[str, Any]:
+        if not self.calls:
+            self.calls.append((image.shape, tracker))
+            raise InferenceFailure("injected transient inference failure")
+        return await super().infer(image, tracker)
+
+
 class BlockingRuntime(FakeRuntime):
     def __init__(self) -> None:
         super().__init__()
@@ -246,22 +303,28 @@ class LoopbackServer:
         runtime: FakeRuntime,
         *,
         inference_timeout_seconds: float = 1.5,
+        inference_recovery_seconds: float = 30.0,
         adaface: FakeAdaFace | None = None,
         max_sessions: int = 1_024,
         max_long_edge: int = MAX_LONG_EDGE,
     ):
         self.runtime = runtime
         self.inference_timeout_seconds = inference_timeout_seconds
+        self.inference_recovery_seconds = inference_recovery_seconds
         self.adaface = adaface
         self.max_long_edge = max_long_edge
         self.sessions = SessionRegistry(max_sessions=max_sessions)
         self.trackers: list[FakeTracker] = []
+        self.tracker_error: Exception | None = None
+        self.exits: list[str] = []
         self.bundle = None
         self.channel = None
         self.stub = None
         self.health = None
 
     def tracker_factory(self, *_args: Any) -> FakeTracker:
+        if self.tracker_error is not None:
+            raise self.tracker_error
         tracker = FakeTracker(self.runtime)
         self.trackers.append(tracker)
         return tracker
@@ -273,6 +336,7 @@ class LoopbackServer:
             host="127.0.0.1",
             port=0,
             inference_timeout_seconds=self.inference_timeout_seconds,
+            inference_recovery_seconds=self.inference_recovery_seconds,
             shutdown_grace_seconds=0,
             max_long_edge=self.max_long_edge,
         )
@@ -282,6 +346,7 @@ class LoopbackServer:
             sessions=self.sessions,
             adaface=self.adaface,
             tracker_factory=self.tracker_factory,
+            exit_process=self.exits.append,
         )
         await self.bundle.set_serving(True)
         await self.bundle.server.start()
@@ -316,6 +381,17 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=RuntimeConfig(engine=Path("unused.engine")),
                 max_long_edge=16,
             )
+
+    async def test_inference_recovery_limit_must_be_positive_and_finite(self):
+        for value in (0.0, -1.0, float("inf"), float("nan")):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "inference_recovery_seconds"),
+            ):
+                GrpcServerSettings(
+                    runtime=RuntimeConfig(engine=Path("unused.engine")),
+                    inference_recovery_seconds=value,
+                )
 
     async def test_mosaic_pool_settings_are_validated(self):
         with self.assertRaisesRegex(ValueError, "mosaic_workers"):
@@ -757,6 +833,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inference_failure_returns_terminal_error_and_ends_stream(self):
         runtime = FailedRuntime()
+        runtime.self_check_error = RuntimeError("CUDA error: an illegal memory access")
         async with LoopbackServer(runtime) as server:
             responses = await _collect(
                 server.stub.ProcessVideo(
@@ -779,7 +856,10 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 unavailable.exception.code(),
                 grpc.StatusCode.UNAVAILABLE,
             )
+            await _wait_until(lambda: server.exits)
 
+        self.assertEqual(len(server.exits), 1)
+        self.assertIn("INFERENCE_FAILED", server.exits[0])
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0].status_message, "failed")
         self.assertEqual(responses[0].error_code, "INFERENCE_FAILED")
@@ -1170,6 +1250,133 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await call.read(), grpc.aio.EOF)
             await _wait_until(lambda: server.bundle.servicer.active_streams == 0)
             self.assertTrue(server.trackers[0].reset_after_inference)
+
+    async def test_timeout_readmits_streams_after_the_late_frame_and_self_check_finish(self):
+        runtime = BlockingRuntime()
+        async with LoopbackServer(runtime, inference_timeout_seconds=0.02) as server:
+            with self.assertLogs("innolive.grpc", level="WARNING") as logs:
+                call = server.stub.ProcessVideo()
+                await call.write(_request(timestamp=81, frame_id=8, session_id="session-slow"))
+                response = await asyncio.wait_for(call.read(), timeout=0.5)
+                self.assertEqual(response.error_code, "INFERENCE_TIMEOUT")
+                self.assertEqual(response.data, b"")
+                self.assertEqual(
+                    await _health_status(server),
+                    health_pb2.HealthCheckResponse.NOT_SERVING,
+                )
+                rejected = server.stub.ProcessVideo(_requests(_request(timestamp=82, frame_id=9)))
+                with self.assertRaises(grpc.aio.AioRpcError) as unavailable:
+                    await rejected.read()
+                self.assertEqual(unavailable.exception.code(), grpc.StatusCode.UNAVAILABLE)
+                await asyncio.sleep(0.05)
+                self.assertEqual(runtime.self_checks, 0)
+
+                runtime.release_inference.set()
+                self.assertIs(await call.read(), grpc.aio.EOF)
+                await _wait_for_health(server, health_pb2.HealthCheckResponse.SERVING)
+
+            readmitted = await _collect(
+                server.stub.ProcessVideo(_requests(_request(timestamp=83, frame_id=10)))
+            )
+
+        self.assertEqual(runtime.self_checks, 1)
+        self.assertEqual(server.exits, [])
+        self.assertEqual(readmitted[0].status_message, "success")
+        self.assertTrue(server.trackers[0].reset_after_inference)
+        output = "\n".join(logs.output)
+        self.assertRegex(
+            output,
+            r"frame 8 inference timed out after \d+ ms \(session=session-slow limit=0\.02s\)",
+        )
+        self.assertRegex(
+            output,
+            r"timed-out frame 8 inference finished \d+ ms after submission \(session=session-slow\)",
+        )
+
+    async def test_timeout_exits_when_the_stalled_frame_outlives_the_recovery_limit(self):
+        runtime = BlockingRuntime()
+        async with LoopbackServer(
+            runtime,
+            inference_timeout_seconds=0.02,
+            inference_recovery_seconds=0.1,
+        ) as server:
+            call = server.stub.ProcessVideo()
+            await call.write(_request(timestamp=91, frame_id=9))
+            response = await asyncio.wait_for(call.read(), timeout=0.5)
+            self.assertEqual(response.error_code, "INFERENCE_TIMEOUT")
+            self.assertEqual(response.data, b"")
+            await _wait_until(lambda: server.exits)
+
+            self.assertEqual(
+                await _health_status(server),
+                health_pb2.HealthCheckResponse.NOT_SERVING,
+            )
+            rejected = server.stub.ProcessVideo(_requests(_request(timestamp=92, frame_id=10)))
+            with self.assertRaises(grpc.aio.AioRpcError) as unavailable:
+                await rejected.read()
+            self.assertEqual(unavailable.exception.code(), grpc.StatusCode.UNAVAILABLE)
+
+        self.assertEqual(len(server.exits), 1)
+        self.assertIn("INFERENCE_TIMEOUT", server.exits[0])
+        self.assertEqual(runtime.self_checks, 0)
+
+    async def test_inference_failure_readmits_streams_when_the_self_check_passes(self):
+        runtime = FailOnceRuntime()
+        async with LoopbackServer(runtime) as server:
+            failed = await _collect(
+                server.stub.ProcessVideo(_requests(_request(timestamp=101, frame_id=11)))
+            )
+            await _wait_for_health(server, health_pb2.HealthCheckResponse.SERVING)
+            readmitted = await _collect(
+                server.stub.ProcessVideo(_requests(_request(timestamp=102, frame_id=12)))
+            )
+
+        self.assertEqual(failed[0].error_code, "INFERENCE_FAILED")
+        self.assertEqual(failed[0].data, b"")
+        self.assertEqual(readmitted[0].status_message, "success")
+        self.assertEqual(runtime.self_checks, 1)
+        self.assertEqual(server.exits, [])
+
+    async def test_failure_during_self_check_is_checked_again_before_readmission(self):
+        runtime = SwitchableFailureRuntime()
+        async with LoopbackServer(runtime) as server:
+            first = server.stub.ProcessVideo()
+            second = server.stub.ProcessVideo()
+            for call, frame_id in ((first, 1), (second, 2)):
+                await call.write(_request(timestamp=120 + frame_id, frame_id=frame_id))
+                self.assertEqual((await call.read()).status_message, "success")
+
+            runtime.fail = True
+            await first.write(_request(timestamp=123, frame_id=3))
+            self.assertEqual((await first.read()).error_code, "INFERENCE_FAILED")
+            await asyncio.wait_for(runtime.self_check_started.wait(), timeout=1.0)
+            await second.write(_request(timestamp=124, frame_id=4))
+            self.assertEqual((await second.read()).error_code, "INFERENCE_FAILED")
+
+            runtime.fail = False
+            runtime.release_self_check.set()
+            await _wait_for_health(server, health_pb2.HealthCheckResponse.SERVING)
+
+        self.assertEqual(runtime.self_checks, 2)
+        self.assertEqual(server.exits, [])
+
+    async def test_tracker_initialization_failure_exits_when_the_tracker_probe_fails(self):
+        runtime = FakeRuntime()
+        async with LoopbackServer(runtime) as server:
+            server.tracker_error = RuntimeError("tracker config is unreadable")
+            aborted = server.stub.ProcessVideo(_requests(_request(timestamp=111, frame_id=13)))
+            with self.assertRaises(grpc.aio.AioRpcError) as internal:
+                await aborted.read()
+            self.assertEqual(internal.exception.code(), grpc.StatusCode.INTERNAL)
+            await _wait_until(lambda: server.exits)
+            self.assertEqual(
+                await _health_status(server),
+                health_pb2.HealthCheckResponse.NOT_SERVING,
+            )
+
+        self.assertEqual(len(server.exits), 1)
+        self.assertIn("TRACKER_INIT_FAILED", server.exits[0])
+        self.assertEqual(runtime.self_checks, 0)
 
 
 if __name__ == "__main__":
