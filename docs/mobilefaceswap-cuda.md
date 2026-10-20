@@ -24,6 +24,8 @@ Torch 2.13 CUDA 13 / cuDNN 9와 ORT GPU 1.30을 조합한다.
 참고하며, CUDA renderer 로딩 시 `preload_dlls()`로 해당 환경의 CUDA/cuDNN을 준비한다.
 
 모델·프리셋은 GitHub에 추가하지 않고 서버에 별도로 설치한다.
+MobileFaceSwap 세 파일의 [공식 다운로드·압축 해제·해시 검증 명령](../models/README.md#mobilefaceswap-224)을
+실행한 뒤 아래 공통 모델과 프리셋도 준비한다.
 
 - Git LFS의 `models/best.pt`, `models/face_metadata_extracter.pt` 실제 파일
 - 기존 AdaFace checkpoint와 YuNet: [모델 가이드](face-swap-model-download.md)

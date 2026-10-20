@@ -7,6 +7,8 @@ MobileFaceSwap 224로 선택한다. 기존 추적, metadata, 프리셋 선택, w
 ## 실행
 
 Apple Silicon Mac에서 저장소 루트를 기준으로 실행한다.
+먼저 [MobileFaceSwap 사전학습 모델 다운로드·설치](../models/README.md#mobilefaceswap-224)로
+필수 모델 세 파일을 준비하고, [공통 모델·프리셋](face-swap-model-download.md)을 설치한다.
 
 ```bash
 .venv/bin/python -m pip install -r requirements-mobilefaceswap.txt
@@ -31,7 +33,7 @@ Apple Silicon Mac에서 저장소 루트를 기준으로 실행한다.
 이 launcher의 **매 프레임 얼굴 합성은 MPS**에서 실행한다. 처음 사용하는 프리셋의
 identity·조건부 가중치 생성은 원본 Paddle CPU로 수행하고, 그 결과를 PyTorch UNet에
 strict 로딩해 GPU에 캐시한다. Conv/BatchNorm fusion과 channels-last 메모리 배치를 적용했다.
-원본 `.pdparams`는 수정하지 않으며 추가 모델 다운로드는 하지 않는다. Paddle 3.3.1 / Python 3.13 /
+원본 `.pdparams`는 수정하지 않으며 실행 중 모델을 자동 다운로드하지 않는다. Paddle 3.3.1 / Python 3.13 /
 macOS arm64에서 확인했다. `landmarks/glintr100.onnx`는 수정하지 않으며 이 경로에서는
 사용하지 않는다. MobileFaceSwap에 필요한 identity feature map은 `arcface.pdparams`에서 얻는다.
 
