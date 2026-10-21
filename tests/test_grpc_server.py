@@ -112,6 +112,7 @@ class FakeTracker:
     def __init__(self, runtime: Any):
         self.runtime = runtime
         self.frame_id = 0
+        self.live_track_ids: frozenset[int] = frozenset()
         self.reset_called = False
         self.reset_after_inference = False
         self.reset_event = asyncio.Event()
@@ -1004,6 +1005,67 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             await call.done_writing()
             self.assertIs(await call.read(), grpc.aio.EOF)
+
+    async def test_approved_track_remains_unblurred_over_grpc_until_entry_deletion(self):
+        for output_mode, pix_fmt in (
+            (ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG, ""),
+            (ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG, "yuv420p"),
+            (ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY, ""),
+            (ai_processor_pb2.VIDEO_OUTPUT_MODE_METADATA_ONLY, "yuv420p"),
+        ):
+            with self.subTest(output_mode=output_mode, pix_fmt=pix_fmt):
+                adaface = FakeAdaFace()
+                source = _striped_jpeg()
+                if pix_fmt:
+                    bgr = cv2.imdecode(np.frombuffer(source, dtype=np.uint8), 1)
+                    source = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420).tobytes()
+                async with LoopbackServer(FaceRuntime(), adaface=adaface) as server:
+                    session = server.sessions.get_or_create("session-a")
+                    entry, _, _ = session.append(np.asarray([1.0, 0.0]))
+                    call = server.stub.ProcessVideo()
+                    try:
+                        for frame in range(1, 66):
+                            if frame == 3:
+                                # A later query would fail, but approved IDs need no query.
+                                adaface.error = RuntimeError("alignment failed")
+                            if frame == 65:
+                                session.delete_entry(entry.entry_id)
+                            request = _request(
+                                data=source,
+                                frame_id=frame,
+                                output_mode=output_mode,
+                            )
+                            if pix_fmt:
+                                request.pix_fmt = pix_fmt
+                                request.width, request.height = 64, 36
+                            await call.write(request)
+                            response = await call.read()
+                            approved = 2 <= frame < 65
+                            self.assertEqual(response.faces[0].whitelisted, approved)
+                            self.assertEqual(response.stats.adaface_calls, int(frame == 1))
+                            if output_mode == ai_processor_pb2.VIDEO_OUTPUT_MODE_MOSAIC_JPEG:
+                                if approved:
+                                    self.assertEqual(response.data, source)
+                                else:
+                                    if pix_fmt:
+                                        decoded = cv2.cvtColor(
+                                            np.frombuffer(response.data, dtype=np.uint8).reshape(
+                                                54, 64
+                                            ),
+                                            cv2.COLOR_YUV2BGR_I420,
+                                        )
+                                    else:
+                                        decoded = cv2.imdecode(
+                                            np.frombuffer(response.data, dtype=np.uint8), 1
+                                        )
+                                    self.assertLess(float(decoded[8:28, 16:44].std()), 20)
+                            else:
+                                self.assertEqual(response.data, b"")
+                        self.assertEqual(adaface.calls, 1)
+                        await call.done_writing()
+                        self.assertIs(await call.read(), grpc.aio.EOF)
+                    finally:
+                        call.cancel()
 
     async def test_delete_whitelist_validates_session_and_entry_ids(self):
         async with LoopbackServer(FakeRuntime()) as server:
