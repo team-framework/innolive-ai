@@ -252,6 +252,7 @@ class SessionRegistry:
 @dataclass(frozen=True, slots=True)
 class RecognitionConfig:
     cosine_threshold: float = 0.4
+    # Only tracks that have not passed AdaFace are periodically rechecked.
     revalidate_frames: int = 30
     quick_retry_frames: int = 5
     quick_retry_limit: int = 2
@@ -315,7 +316,7 @@ class PendingRecognition:
 
 
 class StreamRecognition:
-    """Track decisions owned by exactly one ProcessVideo RPC."""
+    """Stream-local approval, retained for the matched entry and tracker lifetime."""
 
     def __init__(
         self,
@@ -330,7 +331,8 @@ class StreamRecognition:
         self.owner = owner
         self._clock = clock
         self._states: dict[int, TrackDecision] = {}
-        self._generations: dict[int, int] = {}
+        # Unique incarnations reject late results without retaining every retired ID.
+        self._next_generation = 0
         self._pending: dict[RecognitionToken, PendingRecognition] = {}
         self.stale_results = 0
 
@@ -340,6 +342,8 @@ class StreamRecognition:
         objects: list[dict[str, Any]],
         snapshot: WhitelistSnapshot,
         frame_sequence: int,
+        *,
+        live_track_ids: frozenset[int] | None = None,
     ) -> dict[str, int]:
         current_entry_ids = frozenset(entry.entry_id for entry in snapshot.entries)
         self._expire_pending(self._clock())
@@ -348,21 +352,19 @@ class StreamRecognition:
         current_ids = {
             int(item["track_id"]) for item in objects if item.get("track_id") is not None
         }
-        self._retire_missing(current_ids, frame_sequence)
+        self._retire_missing(current_ids, frame_sequence, live_track_ids)
 
         for track_id in current_ids:
             state = self._states.get(track_id)
             if state is None:
-                generation = self._generations.get(track_id, 0)
-                state = TrackDecision(generation=generation)
+                state = TrackDecision(generation=self._next_generation)
+                self._next_generation += 1
                 self._states[track_id] = state
             state.last_seen_frame = frame_sequence
 
         scheduled = 0
         overflow = 0
         runtime_ready = bool(getattr(self.runtime, "ready", False))
-        if not runtime_ready:
-            self._protect_all_tracks()
         if snapshot.entries and runtime_ready:
             for item in objects:
                 if not is_face_object(item):
@@ -371,7 +373,6 @@ class StreamRecognition:
                     item,
                     image,
                     snapshot,
-                    current_entry_ids,
                     frame_sequence,
                 )
                 scheduled += outcome == "scheduled"
@@ -383,7 +384,6 @@ class StreamRecognition:
             state = self._states.get(int(track_id)) if track_id is not None else None
             allowed = (
                 is_face_object(item)
-                and runtime_ready
                 and state is not None
                 and self._is_whitelisted_for_entries(
                     state,
@@ -404,7 +404,6 @@ class StreamRecognition:
         item: dict[str, Any],
         image: np.ndarray,
         snapshot: WhitelistSnapshot,
-        current_entry_ids: frozenset[str],
         frame_sequence: int,
     ) -> str:
         track_id_value = item.get("track_id")
@@ -444,8 +443,7 @@ class StreamRecognition:
             frame_sequence=frame_sequence,
             whitelist_version=snapshot.version,
         )
-        if not self._is_whitelisted_for_entries(state, current_entry_ids):
-            state.status = "pending"
+        state.status = "pending"
         state.pending_token = token
         self._pending[token] = PendingRecognition(
             future,
@@ -460,6 +458,10 @@ class StreamRecognition:
         whitelist_version: int,
         frame_sequence: int,
     ) -> bool:
+        # Removed whitelist entries are invalidated before scheduling. A surviving
+        # approval must not depend on a later crop, queue admission or model result.
+        if state.status == "whitelisted":
+            return False
         if state.pending_token is not None:
             return False
         if state.last_checked_frame < 0:
@@ -553,10 +555,6 @@ class StreamRecognition:
         state.matched_entry_id = None
         state.last_checked_frame = -1
 
-    def _protect_all_tracks(self) -> None:
-        for state in self._states.values():
-            self._require_fresh_match(state)
-
     @staticmethod
     def _is_whitelisted_for_entries(
         state: TrackDecision,
@@ -585,14 +583,23 @@ class StreamRecognition:
             and token.whitelist_version == current_whitelist_version
         )
 
-    def _retire_missing(self, current_ids: set[int], frame_sequence: int) -> None:
+    def _retire_missing(
+        self,
+        current_ids: set[int],
+        frame_sequence: int,
+        live_track_ids: frozenset[int] | None,
+    ) -> None:
         for track_id, state in tuple(self._states.items()):
             if track_id in current_ids:
                 continue
-            if frame_sequence - state.last_seen_frame <= self.config.missing_track_frames:
+            if state.status == "whitelisted" and live_track_ids is not None:
+                # BoT-SORT can restore a lost ID after the ordinary recognition
+                # cache timeout. Keep approval until the tracker retires that ID.
+                if track_id in live_track_ids:
+                    continue
+            elif frame_sequence - state.last_seen_frame <= self.config.missing_track_frames:
                 continue
             del self._states[track_id]
-            self._generations[track_id] = state.generation + 1
 
     def close(self) -> None:
         for pending in self._pending.values():

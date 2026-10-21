@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from ultralytics.trackers.basetrack import TrackState
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
 from ultralytics.trackers.utils.stracks import multi_gmc, parse_bboxes
 from ultralytics.utils import LOGGER, YAML, IterableSimpleNamespace
@@ -20,8 +21,8 @@ MAX_MASK_HOLD_FRAMES = 1
 HOLD_CONFIDENCE_DECAY = 0.90
 # 검출 결과를 쓰는 GMC 방식. 이 방식은 검출 전에 미리 계산할 수 없다.
 DETECTION_DEPENDENT_GMC = frozenset({"orb", "sift"})
-# GMC 입력 장변 상한. ultralytics 기본 축소 배율 2는 720p를 640×360으로 계산하지만 FHD는 960×540으로
-# 2.25배를 계산한다(#62). 첫 프레임 장변으로 배율을 정해 FHD도 720p와 같은 640×360으로 계산한다.
+# GMC 입력 장변 상한. ultralytics 기본 축소 배율 2는 720p를 640x360으로 계산하지만 FHD는 960x540으로
+# 2.25배를 계산한다(#62). 첫 프레임 장변으로 배율을 정해 FHD도 720p와 같은 640x360으로 계산한다.
 GMC_MAX_LONG_EDGE = 640
 GMC_MIN_DOWNSCALE = 2
 
@@ -136,6 +137,15 @@ class StreamTracker:
     @property
     def frame_id(self) -> int:
         return self._tracker.frame_id
+
+    @property
+    def live_track_ids(self) -> frozenset[int]:
+        """IDs still tracked or recoverable after a brief detection gap."""
+        return frozenset(
+            int(track.track_id)
+            for track in (*self._tracker.tracked_stracks, *self._tracker.lost_stracks)
+            if track.state in (TrackState.Tracked, TrackState.Lost)
+        )
 
     @property
     def motion_precomputable(self) -> bool:
