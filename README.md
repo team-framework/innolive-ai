@@ -254,6 +254,30 @@ JPEG·raw yuv420p의 블러, 번호판, 얼굴 합성 실패 시 fallback에 동
 message field와 RPC 계약은 [`protos/ai_processor.proto`](protos/ai_processor.proto)를
 참고합니다.
 
+### Track별 블러 해제 유지
+
+AdaFace를 한 번 통과한 face track은 같은 stream에서 해당 BoT-SORT ID가 유지되는 동안
+블러를 계속 해제합니다. 통과한 track에는 주기적 AdaFace 검사를 다시 수행하지 않으며,
+작은 얼굴·정렬 실패·인식 큐 포화로 재검증 결과가 바뀌는 깜빡임을 방지합니다. AdaFace가
+일시적으로 사용 불가해도 기존 승인은 유지하고, 미통과 track은 계속 보호합니다.
+
+- 미통과 track: 기본 5프레임 간격 빠른 재시도 2회 후 30프레임마다 재검증
+- 잠깐 사라진 승인 track: BoT-SORT의 복구 가능한 lost ID까지 승인 유지
+- 승인 해제: 매칭된 whitelist entry 삭제, tracker에서 해당 ID 제거, stream 종료
+- 새 track ID·새 stream: AdaFace 재검증 필요. 다른 whitelist entry 추가·삭제는 기존 승인 유지
+
+현재 BoT-SORT는 `with_reid=false`로 움직임·IoU 기반 ID 연결을 사용합니다. 따라서 최초
+AdaFace 오승인이나 추적 중 ID 오연결이 생기면 해당 ID의 승인도 유지될 수 있습니다.
+이 정책은 오인식률을 낮추는 변경이 아니라, 통과 후 반복 검증을 생략하는 변경입니다.
+번호판은 승인 상태와 관계없이 계속 보호합니다.
+
+`--adaface-revalidate-frames`는 미통과 track의 주기적 재검증 간격,
+`--adaface-missing-track-frames`는 미통과 track의 캐시 정리 간격입니다.
+승인 track의 수명은 BoT-SORT가 관리합니다. 늦은 인식 결과는 stream 내 고유 세대 번호로
+구분하며, 종료된 ID의 이력을 계속 저장하지 않습니다. Android/iOS 온디바이스 이식 시에도
+`미통과 → 검증 중 → 승인 유지` 상태와 위 승인 해제 조건을 함께 적용해야 합니다.
+이번 변경은 서버에만 적용되며, 기존 protobuf 필드와 enum 값은 유지합니다.
+
 > gRPC 서버 자체에는 인증이 없습니다. 외부 공개 시 private network 또는 authenticated
 > proxy 뒤에서 사용해야 합니다.
 
