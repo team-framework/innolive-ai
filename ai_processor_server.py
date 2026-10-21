@@ -430,6 +430,7 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
                     objects,
                     stream.session.snapshot(),
                     frame_sequence,
+                    live_track_ids=tracker.live_track_ids,
                 )
             )
         except (TypeError, ValueError, OverflowError):
@@ -1266,11 +1267,13 @@ def parse_args() -> argparse.Namespace:
         "--adaface-revalidate-frames",
         type=positive_int,
         default=positive_int(os.getenv("ADAFACE_REVALIDATE_FRAMES", "30")),
+        help="periodic retry interval for tracks that have not passed AdaFace",
     )
     parser.add_argument(
         "--adaface-missing-track-frames",
         type=positive_int,
         default=positive_int(os.getenv("ADAFACE_MISSING_TRACK_FRAMES", "3")),
+        help="missing-track cache lifetime before approval; approved IDs follow BoT-SORT lifetime",
     )
     parser.add_argument(
         "--adaface-max-pending-per-stream",
