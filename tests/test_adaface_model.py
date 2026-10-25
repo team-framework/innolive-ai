@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from service.adaface_model import (
     FaceCountError,
     FaceTooSmallError,
     _square_face_crop,
+    embedding_model_fingerprint,
 )
 
 
@@ -37,8 +39,24 @@ class AdaFaceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertFalse(runtime.ready)
             self.assertIn("not found", runtime.load_error)
+            self.assertIsNone(runtime.embedding_model)
         finally:
             runtime.close()
+
+    async def test_embedding_model_fingerprint_follows_architecture_and_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = Path(directory) / "adaface.ckpt"
+            weights.write_bytes(b"weights-a")
+            first = embedding_model_fingerprint("ir18", weights)
+            same = embedding_model_fingerprint("ir18", weights)
+            other_architecture = embedding_model_fingerprint("ir50", weights)
+            weights.write_bytes(b"weights-b")
+            other_weights = embedding_model_fingerprint("ir18", weights)
+
+        self.assertEqual(first, same)
+        self.assertTrue(first.startswith("ir18:"))
+        self.assertNotEqual(first, other_architecture)
+        self.assertNotEqual(first, other_weights)
 
     async def test_one_owner_cannot_fill_the_global_queue(self):
         runtime = unavailable_runtime(queue_capacity=4)

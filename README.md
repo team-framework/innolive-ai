@@ -189,7 +189,23 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 - `ProcessVideo`: JPEG frame과 처리된 JPEG·object metadata를 주고받는 bidirectional stream
 - `AddWhitelist` · `DeleteWhitelist` · `GetWhitelistStatus`: 세션별 face exemplar 관리
 - `CreateSession` · `ListSessions` · `DeleteSession`: in-memory session lifecycle 관리
+- `ExportWhitelist` · `ImportWhitelist`: 워커 교체 시 세션 화이트리스트 임베딩을 entry_id 그대로 이동. 인식 모델 지문(`embedding_model`)이 다르면 `FAILED_PRECONDITION`
 - Python client: `grpc_client.VideoProcessorClient`
+
+## 방송 중단 없는 워커 교체
+
+`deploy/rolling_replace.sh`는 GPU 서버에서 워커를 하나씩 새 릴리스로 바꿉니다. 새 릴리스로
+다른 포트(±100)에 인스턴스를 띄우고 SERVING이 되면 innolive-server 제어 API
+(`AI_CONTROL_ADDR`)에 교체를 요청합니다. 서버가 화이트리스트를 옮기고 진행 중인 세션을 다음
+프레임부터 새 워커로 넘긴 뒤에만 옛 인스턴스를 멈춥니다. 새 워커 하나 몫의 GPU 메모리만 더 씁니다.
+
+```bash
+sudo deploy/rolling_replace.sh /opt/innolive/ai-releases/<rev>        # 0~5 전체
+sudo deploy/rolling_replace.sh /opt/innolive/ai-releases/<rev> 3 4    # 일부
+```
+
+화이트리스트 이동 RPC가 없는 릴리스에서 처음 바꿀 때만 `ALLOW_REENROLL=1`을 씁니다. 그때 등록
+얼굴은 재등록 필요로 표시됩니다.
 
 ### 모자이크 강도·영역 실시간 설정 (`MosaicConfig`)
 

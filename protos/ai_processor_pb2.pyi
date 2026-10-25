@@ -269,6 +269,42 @@ class DeleteWhitelistRequest(_message.Message):
     entry_id: str
     def __init__(self, session_id: _Optional[str] = ..., entry_id: _Optional[str] = ...) -> None: ...
 
+class WhitelistEmbedding(_message.Message):
+    __slots__ = ("entry_id", "values")
+    ENTRY_ID_FIELD_NUMBER: _ClassVar[int]
+    VALUES_FIELD_NUMBER: _ClassVar[int]
+    entry_id: str
+    values: _containers.RepeatedScalarFieldContainer[float]
+    def __init__(self, entry_id: _Optional[str] = ..., values: _Optional[_Iterable[float]] = ...) -> None: ...
+
+class ExportWhitelistRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class ExportWhitelistResponse(_message.Message):
+    __slots__ = ("session_id", "embedding_model", "entries", "whitelist_version")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_MODEL_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_VERSION_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    embedding_model: str
+    entries: _containers.RepeatedCompositeFieldContainer[WhitelistEmbedding]
+    whitelist_version: int
+    def __init__(self, session_id: _Optional[str] = ..., embedding_model: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[WhitelistEmbedding, _Mapping]]] = ..., whitelist_version: _Optional[int] = ...) -> None: ...
+
+class ImportWhitelistRequest(_message.Message):
+    __slots__ = ("session_id", "embedding_model", "entries")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_MODEL_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    embedding_model: str
+    entries: _containers.RepeatedCompositeFieldContainer[WhitelistEmbedding]
+    def __init__(self, session_id: _Optional[str] = ..., embedding_model: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[WhitelistEmbedding, _Mapping]]] = ...) -> None: ...
+
 class CreateSessionRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
