@@ -728,6 +728,68 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
             whitelist_version=version,
         )
 
+    async def ExportWhitelist(self, request, context):
+        try:
+            session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        embedding_model = await self._embedding_model(context)
+        snapshot = self.sessions.snapshot(session_id)
+        return messages.ExportWhitelistResponse(
+            session_id=session_id,
+            embedding_model=embedding_model,
+            entries=[
+                messages.WhitelistEmbedding(
+                    entry_id=entry.entry_id,
+                    values=entry.embedding.tolist(),
+                )
+                for entry in snapshot.entries
+            ],
+            whitelist_version=snapshot.version,
+        )
+
+    async def ImportWhitelist(self, request, context):
+        try:
+            session_id = validate_session_id(request.session_id)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        embedding_model = await self._embedding_model(context)
+        if request.embedding_model != embedding_model:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"embedding model {request.embedding_model!r} does not match "
+                f"{embedding_model!r}; faces must be enrolled again",
+            )
+        entries = [
+            (entry.entry_id, np.asarray(entry.values, dtype=np.float32))
+            for entry in request.entries
+        ]
+        try:
+            _added, entry_count, version = self.sessions.import_entries(session_id, entries)
+        except SessionLimitError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+        except WhitelistLimitError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        return messages.WhitelistResponse(
+            status_message="success",
+            timestamp=time.time_ns(),
+            entry_count=entry_count,
+            whitelist_version=version,
+        )
+
+    async def _embedding_model(self, context) -> str:
+        """Return the loaded recognition model's fingerprint or abort the call."""
+
+        embedding_model = getattr(self.adaface, "embedding_model", None)
+        if not getattr(self.adaface, "ready", False) or not embedding_model:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "AdaFace is not available",
+            )
+        return embedding_model
+
     async def CreateSession(self, request, context):
         del request
         try:
