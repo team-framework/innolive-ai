@@ -4,4 +4,3 @@
 *.yaml     text eol=lf linguist-detectable
 *.yml      text eol=lf linguist-detectable
 *.json     text eol=lf linguist-detectable
-*.pt filter=lfs diff=lfs merge=lfs -text
