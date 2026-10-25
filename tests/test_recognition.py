@@ -113,6 +113,45 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(SessionLimitError):
             sessions.get_or_create("session-b")
 
+    async def test_import_keeps_entry_ids_and_skips_present_entries(self):
+        source = SessionRegistry()
+        first, _, _ = source.append("session-a", np.asarray([2.0, 0.0]))
+        second, _, _ = source.append("session-a", np.asarray([0.0, 3.0]))
+        exported = [
+            (entry.entry_id, entry.embedding) for entry in source.snapshot("session-a").entries
+        ]
+        target = SessionRegistry()
+
+        added, count, version = target.import_entries("session-a", exported)
+        again = target.import_entries("session-a", exported)
+        snapshot = target.snapshot("session-a")
+
+        self.assertEqual((added, count, version), (2, 2, 1))
+        self.assertEqual(again, (0, 2, 1))
+        self.assertEqual(
+            [entry.entry_id for entry in snapshot.entries], [first.entry_id, second.entry_id]
+        )
+        self.assertTrue(np.allclose(snapshot.entries[1].embedding, [0.0, 1.0]))
+
+    async def test_import_is_all_or_nothing(self):
+        sessions = SessionRegistry(max_entries_per_session=2)
+        sessions.append("session-a", np.asarray([1.0, 0.0]))
+
+        with self.assertRaises(WhitelistLimitError):
+            sessions.import_entries(
+                "session-a",
+                [("entry-b", np.asarray([0.0, 1.0])), ("entry-c", np.asarray([1.0, 1.0]))],
+            )
+        with self.assertRaises(ValueError):
+            sessions.import_entries(
+                "session-a",
+                [("entry-b", np.asarray([0.0, 1.0])), ("entry-c", np.asarray([0.0, 0.0]))],
+            )
+        with self.assertRaises(ValueError):
+            sessions.import_entries("session-a", [("   ", np.asarray([0.0, 1.0]))])
+
+        self.assertEqual(len(sessions.snapshot("session-a").entries), 1)
+
     async def test_status_lookup_does_not_create_a_session(self):
         sessions = SessionRegistry(max_sessions=1)
 

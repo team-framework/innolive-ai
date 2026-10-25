@@ -275,6 +275,7 @@ class BlockingRuntime(FakeRuntime):
 class FakeAdaFace:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
+        self.embedding_model = "fake:1"
         self.embedding = np.asarray([1.0, 0.0], dtype=np.float32)
         self.error: Exception | None = None
         self.overflow = False
@@ -945,6 +946,60 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(missing.entry_ids), [])
         self.assertEqual(adaface.calls, 3)
         self.assertEqual(adaface.enrollment_calls, 3)
+
+    async def test_exported_whitelist_imports_into_another_worker_with_the_same_ids(self):
+        async with (
+            LoopbackServer(FakeRuntime(), adaface=FakeAdaFace()) as source,
+            LoopbackServer(FakeRuntime(), adaface=FakeAdaFace()) as target,
+        ):
+            added = await source.stub.AddWhitelist(
+                ai_processor_pb2.FaceData(data=_jpeg(), session_id="session-a")
+            )
+            exported = await source.stub.ExportWhitelist(
+                ai_processor_pb2.ExportWhitelistRequest(session_id="session-a")
+            )
+            request = ai_processor_pb2.ImportWhitelistRequest(
+                session_id="session-a",
+                embedding_model=exported.embedding_model,
+                entries=exported.entries,
+            )
+            imported = await target.stub.ImportWhitelist(request)
+            repeated = await target.stub.ImportWhitelist(request)
+            status = await target.stub.GetWhitelistStatus(
+                ai_processor_pb2.GetWhitelistStatusRequest(session_id="session-a")
+            )
+            stored = target.sessions.snapshot("session-a").entries
+
+        self.assertEqual(exported.embedding_model, "fake:1")
+        self.assertEqual([entry.entry_id for entry in exported.entries], [added.entry_id])
+        self.assertEqual((imported.entry_count, imported.whitelist_version), (1, 1))
+        self.assertEqual((repeated.entry_count, repeated.whitelist_version), (1, 1))
+        self.assertEqual(list(status.entry_ids), [added.entry_id])
+        self.assertTrue(np.allclose(stored[0].embedding, [1.0, 0.0]))
+
+    async def test_import_rejects_embeddings_from_another_recognition_model(self):
+        async with LoopbackServer(FakeRuntime(), adaface=FakeAdaFace()) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await server.stub.ImportWhitelist(
+                    ai_processor_pb2.ImportWhitelistRequest(
+                        session_id="session-a",
+                        embedding_model="fake:2",
+                        entries=[ai_processor_pb2.WhitelistEmbedding(entry_id="e", values=[1, 0])],
+                    )
+                )
+            stored = server.sessions.snapshot("session-a").entries
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(stored, ())
+
+    async def test_whitelist_transfer_requires_an_available_adaface_model(self):
+        async with LoopbackServer(FakeRuntime()) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                await server.stub.ExportWhitelist(
+                    ai_processor_pb2.ExportWhitelistRequest(session_id="session-a")
+                )
+
+        self.assertEqual(rejected.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
 
     async def test_delete_whitelist_updates_status_during_an_active_stream(self):
         adaface = FakeAdaFace()
