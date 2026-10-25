@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import threading
 import time
@@ -102,6 +103,9 @@ class AdaFaceRuntime:
         self.ready = False
         self.load_error: str | None = None
         self.load_ms: float | None = None
+        # Identifies the weights behind every embedding this runtime produces. Workers
+        # moving whitelists between each other compare it before importing.
+        self.embedding_model: str | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="adaface")
         self._lock = threading.Lock()
         self._inflight = 0
@@ -140,6 +144,9 @@ class AdaFaceRuntime:
             )
         model.load_state_dict(model_state, strict=True)
         self._model = model.to(self.device).eval()
+        self.embedding_model = embedding_model_fingerprint(
+            self.config.architecture, self.config.weights
+        )
         self._detector = cv2.FaceDetectorYN.create(
             str(self.config.detector),
             "",
@@ -379,6 +386,16 @@ def _observe_future(future: asyncio.Future[np.ndarray]) -> None:
         future.exception()
     except BaseException:
         return
+
+
+def embedding_model_fingerprint(architecture: str, weights: Path) -> str:
+    """Name the embedding space by architecture and the weights' content."""
+
+    digest = hashlib.sha256()
+    with weights.open("rb") as handle:
+        for chunk in iter(partial(handle.read, 1 << 20), b""):
+            digest.update(chunk)
+    return f"{architecture}:{digest.hexdigest()[:32]}"
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
