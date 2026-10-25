@@ -71,6 +71,16 @@ class AiProcessorStub:
                 request_serializer=protos_dot_ai__processor__pb2.DeleteSessionRequest.SerializeToString,
                 response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
                 _registered_method=True)
+        self.ExportWhitelist = channel.unary_unary(
+                '/AiProcessor/ExportWhitelist',
+                request_serializer=protos_dot_ai__processor__pb2.ExportWhitelistRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.ExportWhitelistResponse.FromString,
+                _registered_method=True)
+        self.ImportWhitelist = channel.unary_unary(
+                '/AiProcessor/ImportWhitelist',
+                request_serializer=protos_dot_ai__processor__pb2.ImportWhitelistRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
+                _registered_method=True)
 
 
 class AiProcessorServicer:
@@ -126,6 +136,20 @@ class AiProcessorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ExportWhitelist(self, request, context):
+        """Exports one session's whitelist embeddings for a trusted worker-rollout client.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ImportWhitelist(self, request, context):
+        """Merges embeddings exported by another worker, keeping their entry IDs.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AiProcessorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -163,6 +187,16 @@ def add_AiProcessorServicer_to_server(servicer, server):
                     servicer.DeleteSession,
                     request_deserializer=protos_dot_ai__processor__pb2.DeleteSessionRequest.FromString,
                     response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            ),
+            'ExportWhitelist': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExportWhitelist,
+                    request_deserializer=protos_dot_ai__processor__pb2.ExportWhitelistRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.ExportWhitelistResponse.SerializeToString,
+            ),
+            'ImportWhitelist': grpc.unary_unary_rpc_method_handler(
+                    servicer.ImportWhitelist,
+                    request_deserializer=protos_dot_ai__processor__pb2.ImportWhitelistRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.WhitelistResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -355,6 +389,60 @@ class AiProcessor:
             '/AiProcessor/DeleteSession',
             protos_dot_ai__processor__pb2.DeleteSessionRequest.SerializeToString,
             google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExportWhitelist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/ExportWhitelist',
+            protos_dot_ai__processor__pb2.ExportWhitelistRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.ExportWhitelistResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ImportWhitelist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/AiProcessor/ImportWhitelist',
+            protos_dot_ai__processor__pb2.ImportWhitelistRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.WhitelistResponse.FromString,
             options,
             channel_credentials,
             insecure,
