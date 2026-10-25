@@ -7,7 +7,7 @@ import math
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -103,6 +103,31 @@ class SessionState:
             self._version += 1
             return entry, len(self._entries), self._version
 
+    def import_entries(
+        self,
+        entries: Iterable[tuple[str, np.ndarray]],
+    ) -> tuple[int, int, int]:
+        """Merge exported entries, keeping their IDs; already present IDs are skipped.
+
+        All-or-nothing: an invalid entry or an overflow imports nothing. Returns the
+        number of entries added, the entry count, and the whitelist version.
+        """
+        incoming: dict[str, WhitelistEntry] = {}
+        for entry_id, embedding in entries:
+            validated = validate_entry_id(entry_id)
+            incoming[validated] = WhitelistEntry(validated, _normalized_embedding(embedding))
+        with self._lock:
+            present = {entry.entry_id for entry in self._entries}
+            added = tuple(entry for entry_id, entry in incoming.items() if entry_id not in present)
+            if len(self._entries) + len(added) > self.max_entries:
+                raise WhitelistLimitError(
+                    f"session whitelist is limited to {self.max_entries} entries"
+                )
+            if added:
+                self._entries = (*self._entries, *added)
+                self._version += 1
+            return len(added), len(self._entries), self._version
+
     def delete_entry(self, entry_id: str) -> tuple[str, int, int]:
         with self._lock:
             remaining = tuple(entry for entry in self._entries if entry.entry_id != entry_id)
@@ -189,6 +214,16 @@ class SessionRegistry:
         with self._lock:
             session = self._get_or_create_locked(validated)
             return session.append(embedding)
+
+    def import_entries(
+        self,
+        session_id: str,
+        entries: Iterable[tuple[str, np.ndarray]],
+    ) -> tuple[int, int, int]:
+        validated = validate_session_id(session_id)
+        with self._lock:
+            session = self._get_or_create_locked(validated)
+            return session.import_entries(entries)
 
     def delete_whitelist_entry(
         self,
