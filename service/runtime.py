@@ -12,6 +12,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -55,6 +56,88 @@ def detector_mask_pad(height: int, width: int) -> int:
     if height <= 0 or width <= 0:
         raise ValueError("frame dimensions must be positive")
     return math.ceil(max(height, width) / IMAGE_SIZE)
+
+
+class PriorityLane:
+    """Serialize inference while always letting live frames pass VOD frames.
+
+    Live acquirers keep FIFO order among themselves and take the lane ahead of any
+    VOD acquirer. A VOD acquirer enters only when the lane is free and no live frame
+    holds or waits for it, so a VOD inference delays a live frame by at most the one
+    VOD frame already on the lane. Ownership is transferred on release, so no later
+    acquirer can jump a waiter that has already been granted the lane.
+
+    acquire()/release() mirror asyncio.Lock for existing callers; ``live=False``
+    requests the low-priority VOD behaviour.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+        self._live_waiters: deque[asyncio.Future[bool]] = deque()
+        self._vod_waiters: deque[asyncio.Future[bool]] = deque()
+
+    def locked(self) -> bool:
+        return self._held
+
+    @property
+    def live_waiting(self) -> int:
+        """Live acquirers currently waiting for the lane (for diagnostics/tests)."""
+        return sum(1 for waiter in self._live_waiters if not waiter.cancelled())
+
+    def _blocked(self, *, live: bool) -> bool:
+        if any(not waiter.cancelled() for waiter in self._live_waiters):
+            return True
+        if live:
+            return False
+        return any(not waiter.cancelled() for waiter in self._vod_waiters)
+
+    async def acquire(self, *, live: bool = True) -> bool:
+        if not self._held and not self._blocked(live=live):
+            self._held = True
+            return True
+        waiter: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        queue = self._live_waiters if live else self._vod_waiters
+        queue.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            with suppress(ValueError):
+                queue.remove(waiter)
+            # A cancelled acquirer that was already granted the lane hands it on.
+            if waiter.done() and not waiter.cancelled() and self._held:
+                self.release()
+            raise
+        with suppress(ValueError):
+            queue.remove(waiter)
+        # Ownership was transferred by release(); _held is already True.
+        return True
+
+    def release(self) -> None:
+        if not self._held:
+            raise RuntimeError("lane is not acquired")
+        waiter = self._next_waiter()
+        if waiter is None:
+            self._held = False
+        else:
+            # Keep the lane held and transfer ownership to the woken acquirer.
+            waiter.set_result(True)
+
+    def _next_waiter(self) -> asyncio.Future[bool] | None:
+        for queue in (self._live_waiters, self._vod_waiters):
+            while queue:
+                waiter = queue[0]
+                if waiter.cancelled():
+                    queue.popleft()
+                    continue
+                return waiter
+        return None
+
+    async def __aenter__(self) -> PriorityLane:
+        await self.acquire(live=True)
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        self.release()
 
 
 class InferenceFailure(RuntimeError):
@@ -252,7 +335,7 @@ class RuntimeManager:
         # GMC는 화면만 쓰므로 같은 프레임의 GPU 추론과 동시에 계산한다. 추론 줄이 한 번에 한 프레임만
         # 처리하므로 스레드 하나로 충분하다.
         self._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
-        self._lane: asyncio.Lock | None = None
+        self._lane: PriorityLane | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
         self.warmup_ms: float | None = None
@@ -276,9 +359,9 @@ class RuntimeManager:
             raise
 
     @property
-    def lane(self) -> asyncio.Lock:
+    def lane(self) -> PriorityLane:
         if self._lane is None:
-            self._lane = asyncio.Lock()
+            self._lane = PriorityLane()
         return self._lane
 
     def _predict(self, image: np.ndarray):
@@ -304,12 +387,20 @@ class RuntimeManager:
             raise RuntimeError(f"B1 inference returned {len(results)} results")
         return results[0]
 
-    async def infer(self, image: np.ndarray, tracker: StreamTracker) -> dict[str, Any]:
+    async def infer(
+        self, image: np.ndarray, tracker: StreamTracker, *, live: bool = True
+    ) -> dict[str, Any]:
+        """Run one frame on the shared lane.
+
+        ``live`` frames (the default, from ProcessVideo) take the lane ahead of VOD
+        frames; a ``live=False`` VOD frame waits while any live frame holds or waits.
+        """
         if not self.ready or self._closed:
             raise RuntimeError("runtime is not ready")
         loop = asyncio.get_running_loop()
         queued_at = time.perf_counter()
-        async with self.lane:
+        await self.lane.acquire(live=live)
+        try:
             admitted_at = time.perf_counter()
             result = await loop.run_in_executor(
                 self._executor,
@@ -317,6 +408,8 @@ class RuntimeManager:
                 image,
                 tracker,
             )
+        finally:
+            self.lane.release()
         result["timing_ms"]["queue"] = round((admitted_at - queued_at) * 1000, 2)
         self.frames += 1
         for stage, value in result["timing_ms"].items():
@@ -326,7 +419,9 @@ class RuntimeManager:
     async def self_check(self) -> float:
         """Run one blank frame through the shared lane and return its latency in ms.
 
-        The lane is FIFO, so this also waits for every frame queued ahead of it.
+        It acquires the lane at live priority, so it waits behind every live frame
+        already queued ahead of it (VOD frames never delay it beyond the one that may
+        already hold the lane).
         """
         if not self.ready or self._closed:
             raise RuntimeError("runtime is not ready")
