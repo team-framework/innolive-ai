@@ -19,12 +19,45 @@ class VideoOutputMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     VIDEO_OUTPUT_MODE_UNSPECIFIED: _ClassVar[VideoOutputMode]
     VIDEO_OUTPUT_MODE_METADATA_ONLY: _ClassVar[VideoOutputMode]
     VIDEO_OUTPUT_MODE_MOSAIC_JPEG: _ClassVar[VideoOutputMode]
+
+class VodJobState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    VOD_JOB_STATE_UNSPECIFIED: _ClassVar[VodJobState]
+    VOD_JOB_STATE_PROCESSING: _ClassVar[VodJobState]
+    VOD_JOB_STATE_PAUSED: _ClassVar[VodJobState]
+    VOD_JOB_STATE_DONE: _ClassVar[VodJobState]
+    VOD_JOB_STATE_FAILED: _ClassVar[VodJobState]
+    VOD_JOB_STATE_CANCELLED: _ClassVar[VodJobState]
+
+class VodQuality(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    VOD_QUALITY_STANDARD: _ClassVar[VodQuality]
+    VOD_QUALITY_HIGH: _ClassVar[VodQuality]
+
+class VodPauseReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    VOD_PAUSE_REASON_UNSPECIFIED: _ClassVar[VodPauseReason]
+    VOD_PAUSE_REASON_REQUESTED: _ClassVar[VodPauseReason]
+    VOD_PAUSE_REASON_WORKER_DRAINING: _ClassVar[VodPauseReason]
+    VOD_PAUSE_REASON_RUNTIME_RECOVERY: _ClassVar[VodPauseReason]
 FACE_ANONYMIZATION_MODE_BLUR: FaceAnonymizationMode
 FACE_ANONYMIZATION_MODE_FACE_SWAP: FaceAnonymizationMode
 FACE_ANONYMIZATION_MODE_FACE_METADATA: FaceAnonymizationMode
 VIDEO_OUTPUT_MODE_UNSPECIFIED: VideoOutputMode
 VIDEO_OUTPUT_MODE_METADATA_ONLY: VideoOutputMode
 VIDEO_OUTPUT_MODE_MOSAIC_JPEG: VideoOutputMode
+VOD_JOB_STATE_UNSPECIFIED: VodJobState
+VOD_JOB_STATE_PROCESSING: VodJobState
+VOD_JOB_STATE_PAUSED: VodJobState
+VOD_JOB_STATE_DONE: VodJobState
+VOD_JOB_STATE_FAILED: VodJobState
+VOD_JOB_STATE_CANCELLED: VodJobState
+VOD_QUALITY_STANDARD: VodQuality
+VOD_QUALITY_HIGH: VodQuality
+VOD_PAUSE_REASON_UNSPECIFIED: VodPauseReason
+VOD_PAUSE_REASON_REQUESTED: VodPauseReason
+VOD_PAUSE_REASON_WORKER_DRAINING: VodPauseReason
+VOD_PAUSE_REASON_RUNTIME_RECOVERY: VodPauseReason
 
 class VideoChunk(_message.Message):
     __slots__ = ("data", "timestamp", "frame_id", "batch_size", "session_id", "output_mode", "mosaic_config", "width", "height", "pix_fmt", "anonymization_mode")
@@ -338,3 +371,139 @@ class ListSessionsResponse(_message.Message):
     SESSIONS_FIELD_NUMBER: _ClassVar[int]
     sessions: _containers.RepeatedCompositeFieldContainer[SessionInfo]
     def __init__(self, sessions: _Optional[_Iterable[_Union[SessionInfo, _Mapping]]] = ...) -> None: ...
+
+class VodWhitelist(_message.Message):
+    __slots__ = ("embedding_model", "entries")
+    EMBEDDING_MODEL_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    embedding_model: str
+    entries: _containers.RepeatedCompositeFieldContainer[WhitelistEmbedding]
+    def __init__(self, embedding_model: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[WhitelistEmbedding, _Mapping]]] = ...) -> None: ...
+
+class VodOutputOptions(_message.Message):
+    __slots__ = ("video_encoder", "quality", "force_audio_aac")
+    VIDEO_ENCODER_FIELD_NUMBER: _ClassVar[int]
+    QUALITY_FIELD_NUMBER: _ClassVar[int]
+    FORCE_AUDIO_AAC_FIELD_NUMBER: _ClassVar[int]
+    video_encoder: str
+    quality: int
+    force_audio_aac: bool
+    def __init__(self, video_encoder: _Optional[str] = ..., quality: _Optional[int] = ..., force_audio_aac: _Optional[bool] = ...) -> None: ...
+
+class StartVodJobRequest(_message.Message):
+    __slots__ = ("job_id", "input_path", "output_path", "work_dir", "whitelist", "whitelist_session_id", "quality", "mosaic_config", "anonymization_mode", "output", "resume", "checkpoint_token", "overwrite_output", "segment_frames")
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_PATH_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_PATH_FIELD_NUMBER: _ClassVar[int]
+    WORK_DIR_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_FIELD_NUMBER: _ClassVar[int]
+    WHITELIST_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    QUALITY_FIELD_NUMBER: _ClassVar[int]
+    MOSAIC_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    ANONYMIZATION_MODE_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    RESUME_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    OVERWRITE_OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    SEGMENT_FRAMES_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    input_path: str
+    output_path: str
+    work_dir: str
+    whitelist: VodWhitelist
+    whitelist_session_id: str
+    quality: VodQuality
+    mosaic_config: MosaicConfig
+    anonymization_mode: FaceAnonymizationMode
+    output: VodOutputOptions
+    resume: bool
+    checkpoint_token: str
+    overwrite_output: bool
+    segment_frames: int
+    def __init__(self, job_id: _Optional[str] = ..., input_path: _Optional[str] = ..., output_path: _Optional[str] = ..., work_dir: _Optional[str] = ..., whitelist: _Optional[_Union[VodWhitelist, _Mapping]] = ..., whitelist_session_id: _Optional[str] = ..., quality: _Optional[_Union[VodQuality, str]] = ..., mosaic_config: _Optional[_Union[MosaicConfig, _Mapping]] = ..., anonymization_mode: _Optional[_Union[FaceAnonymizationMode, str]] = ..., output: _Optional[_Union[VodOutputOptions, _Mapping]] = ..., resume: _Optional[bool] = ..., checkpoint_token: _Optional[str] = ..., overwrite_output: _Optional[bool] = ..., segment_frames: _Optional[int] = ...) -> None: ...
+
+class VodJobRef(_message.Message):
+    __slots__ = ("job_id",)
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    def __init__(self, job_id: _Optional[str] = ...) -> None: ...
+
+class PauseVodJobRequest(_message.Message):
+    __slots__ = ("job_id",)
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    def __init__(self, job_id: _Optional[str] = ...) -> None: ...
+
+class CancelVodJobRequest(_message.Message):
+    __slots__ = ("job_id", "purge_work_dir")
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    PURGE_WORK_DIR_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    purge_work_dir: bool
+    def __init__(self, job_id: _Optional[str] = ..., purge_work_dir: _Optional[bool] = ...) -> None: ...
+
+class ListVodJobsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ListVodJobsResponse(_message.Message):
+    __slots__ = ("jobs",)
+    JOBS_FIELD_NUMBER: _ClassVar[int]
+    jobs: _containers.RepeatedCompositeFieldContainer[VodJobStatus]
+    def __init__(self, jobs: _Optional[_Iterable[_Union[VodJobStatus, _Mapping]]] = ...) -> None: ...
+
+class VodProgress(_message.Message):
+    __slots__ = ("frames_done", "frames_total", "frames_total_estimated", "fraction", "segments_done", "segments_total", "processing_fps", "eta_seconds")
+    FRAMES_DONE_FIELD_NUMBER: _ClassVar[int]
+    FRAMES_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    FRAMES_TOTAL_ESTIMATED_FIELD_NUMBER: _ClassVar[int]
+    FRACTION_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_DONE_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    PROCESSING_FPS_FIELD_NUMBER: _ClassVar[int]
+    ETA_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    frames_done: int
+    frames_total: int
+    frames_total_estimated: bool
+    fraction: float
+    segments_done: int
+    segments_total: int
+    processing_fps: float
+    eta_seconds: float
+    def __init__(self, frames_done: _Optional[int] = ..., frames_total: _Optional[int] = ..., frames_total_estimated: _Optional[bool] = ..., fraction: _Optional[float] = ..., segments_done: _Optional[int] = ..., segments_total: _Optional[int] = ..., processing_fps: _Optional[float] = ..., eta_seconds: _Optional[float] = ...) -> None: ...
+
+class VodJobStatus(_message.Message):
+    __slots__ = ("job_id", "state", "progress", "checkpoint_token", "pause_reason", "error_code", "error_message", "output_path", "updated_at_unix_ms", "width", "height", "avg_frame_rate", "duration_seconds", "has_audio", "input_size_bytes", "worker_target")
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    PAUSE_REASON_FIELD_NUMBER: _ClassVar[int]
+    ERROR_CODE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_PATH_FIELD_NUMBER: _ClassVar[int]
+    UPDATED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    WIDTH_FIELD_NUMBER: _ClassVar[int]
+    HEIGHT_FIELD_NUMBER: _ClassVar[int]
+    AVG_FRAME_RATE_FIELD_NUMBER: _ClassVar[int]
+    DURATION_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    HAS_AUDIO_FIELD_NUMBER: _ClassVar[int]
+    INPUT_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TARGET_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    state: VodJobState
+    progress: VodProgress
+    checkpoint_token: str
+    pause_reason: VodPauseReason
+    error_code: str
+    error_message: str
+    output_path: str
+    updated_at_unix_ms: int
+    width: int
+    height: int
+    avg_frame_rate: float
+    duration_seconds: float
+    has_audio: bool
+    input_size_bytes: int
+    worker_target: str
+    def __init__(self, job_id: _Optional[str] = ..., state: _Optional[_Union[VodJobState, str]] = ..., progress: _Optional[_Union[VodProgress, _Mapping]] = ..., checkpoint_token: _Optional[str] = ..., pause_reason: _Optional[_Union[VodPauseReason, str]] = ..., error_code: _Optional[str] = ..., error_message: _Optional[str] = ..., output_path: _Optional[str] = ..., updated_at_unix_ms: _Optional[int] = ..., width: _Optional[int] = ..., height: _Optional[int] = ..., avg_frame_rate: _Optional[float] = ..., duration_seconds: _Optional[float] = ..., has_audio: _Optional[bool] = ..., input_size_bytes: _Optional[int] = ..., worker_target: _Optional[str] = ...) -> None: ...
