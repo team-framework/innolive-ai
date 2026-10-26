@@ -481,6 +481,51 @@ class VodJobPruneTests(unittest.TestCase):
         self.assertIn("live", servicer._jobs)
         self.assertIsNone(handle.terminal_at)
 
+    def test_paused_older_than_ttl_stays_in_get_and_list(self):
+        clock = _FakeClock(0.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=10.0, vod_max_retained_jobs=100)
+        paused = _insert(servicer, "paused", messages.VOD_JOB_STATE_PAUSED)
+        _insert(servicer, "done", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        self.assertIsNone(paused.terminal_at)
+
+        clock.now = 1000.0  # far beyond ttl for both
+        got = asyncio.run(servicer.GetVodJob(messages.VodJobRef(job_id="paused"), _FakeContext()))
+        self.assertEqual(got.state, messages.VOD_JOB_STATE_PAUSED)
+        listed = asyncio.run(servicer.ListVodJobs(messages.ListVodJobsRequest(), _FakeContext()))
+        self.assertEqual([job.job_id for job in listed.jobs], ["paused"])
+
+    def test_paused_jobs_above_cap_are_kept_while_finished_jobs_are_evicted(self):
+        clock = _FakeClock(1.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=1e9, vod_max_retained_jobs=2)
+        for index in range(4):
+            _insert(servicer, f"paused-{index}", messages.VOD_JOB_STATE_PAUSED)
+        finished = [
+            ("failed", messages.VOD_JOB_STATE_FAILED),
+            ("cancelled", messages.VOD_JOB_STATE_CANCELLED),
+            ("done", messages.VOD_JOB_STATE_DONE),
+        ]
+        for job_id, state in finished:
+            _insert(servicer, job_id, state)
+            servicer._prune_jobs()
+            clock.now += 1.0
+        # 4 PAUSED exceed the cap of 2 on their own yet all stay; only the oldest finished
+        # job (failed) is evicted so DONE/FAILED/CANCELLED fit the cap.
+        self.assertEqual(
+            sorted(servicer._jobs),
+            ["cancelled", "done", "paused-0", "paused-1", "paused-2", "paused-3"],
+        )
+
+    def test_failed_and_cancelled_expire_after_ttl(self):
+        clock = _FakeClock(0.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=5.0, vod_max_retained_jobs=100)
+        _insert(servicer, "failed", messages.VOD_JOB_STATE_FAILED)
+        _insert(servicer, "cancelled", messages.VOD_JOB_STATE_CANCELLED)
+        servicer._prune_jobs()
+        clock.now = 5.0
+        servicer._prune_jobs()
+        self.assertEqual(servicer._jobs, {})
+
 
 class VodRetentionSettingsTests(unittest.TestCase):
     def test_defaults(self):

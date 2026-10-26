@@ -1161,6 +1161,15 @@ _VOD_TERMINAL = frozenset(
         messages.VOD_JOB_STATE_CANCELLED,
     }
 )
+# Finished states eligible for in-memory pruning. PAUSED is excluded: a paused job is still
+# resumable and must stay visible to GetVodJob/ListVodJobs for server reconciliation.
+_VOD_PRUNABLE = frozenset(
+    {
+        messages.VOD_JOB_STATE_DONE,
+        messages.VOD_JOB_STATE_FAILED,
+        messages.VOD_JOB_STATE_CANCELLED,
+    }
+)
 MAX_VOD_JOB_ID_BYTES = 256
 
 
@@ -1194,10 +1203,11 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
     Job records live only for the process lifetime; the on-disk checkpoint is the source of
     truth. VOD inference runs at low priority on the shared lane, so live frames always win.
 
-    In-memory job records in a terminal state (PAUSED/DONE/FAILED/CANCELLED) are pruned so the
-    map stays bounded: a terminal record is dropped once ``vod_job_ttl_seconds`` have elapsed
-    since it finished, and at most ``vod_max_retained_jobs`` terminal records are kept (oldest
-    evicted first). Running jobs and jobs with active WatchVodJob streams are never pruned.
+    Finished job records (DONE/FAILED/CANCELLED) are pruned so the map stays bounded: a
+    finished record is dropped once ``vod_job_ttl_seconds`` have elapsed since it finished, and
+    at most ``vod_max_retained_jobs`` finished records are kept (oldest evicted first). PAUSED
+    jobs (resumable), running jobs, and jobs with active WatchVodJob streams are never pruned
+    and do not count toward the cap.
     Pruning is memory-only; on-disk results, work_dir, and checkpoints are never touched.
     """
 
@@ -1438,16 +1448,22 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         )
 
     def _mark_terminal_if_needed(self, handle: _VodJobHandle) -> None:
-        """Stamp (or clear) the terminal timestamp so the TTL counts from when a job finished."""
+        """Stamp (or clear) the finish timestamp so the TTL counts from when a job finished.
 
-        if handle.status.state in _VOD_TERMINAL:
+        Only prunable states (DONE/FAILED/CANCELLED) are stamped; PAUSED is never pruned.
+        """
+
+        if handle.status.state in _VOD_PRUNABLE:
             if handle.terminal_at is None:
                 handle.terminal_at = self._clock()
         else:
             handle.terminal_at = None
 
     def _prune_jobs(self) -> None:
-        """Bound the in-memory job map: drop terminal records past the TTL or over the cap.
+        """Bound the in-memory job map: drop finished records past the TTL or over the cap.
+
+        Only DONE/FAILED/CANCELLED records are pruned or counted toward the cap; PAUSED,
+        running, and watched jobs are always kept.
 
         Memory-only. On-disk results, work_dir, and checkpoints are never touched here.
         """
@@ -1457,8 +1473,8 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             self._mark_terminal_if_needed(handle)
 
         def prunable(handle: _VodJobHandle) -> bool:
-            # Never drop a job that is still running or has a live WatchVodJob stream.
-            if handle.status.state not in _VOD_TERMINAL:
+            # Never drop a paused/running job or one with a live WatchVodJob stream.
+            if handle.status.state not in _VOD_PRUNABLE:
                 return False
             if handle.task is not None and not handle.task.done():
                 return False
@@ -1475,10 +1491,10 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         for job_id in expired:
             del self._jobs[job_id]
 
-        terminal_count = sum(
-            1 for handle in self._jobs.values() if handle.status.state in _VOD_TERMINAL
+        finished_count = sum(
+            1 for handle in self._jobs.values() if handle.status.state in _VOD_PRUNABLE
         )
-        excess = terminal_count - self.settings.vod_max_retained_jobs
+        excess = finished_count - self.settings.vod_max_retained_jobs
         if excess <= 0:
             return
         # Oldest first by terminal_at; dict order (insertion order) breaks ties via stable sort.
@@ -1990,13 +2006,19 @@ def parse_args() -> argparse.Namespace:
         "--vod-job-ttl-seconds",
         type=float,
         default=float(os.getenv("VOD_JOB_TTL_SECONDS", "86400")),
-        help="How long a terminal VOD job record is retained in memory (disk results untouched).",
+        help=(
+            "How long a DONE/FAILED/CANCELLED VOD job record is retained in memory "
+            "(PAUSED never pruned; disk results untouched)."
+        ),
     )
     parser.add_argument(
         "--vod-max-retained-jobs",
         type=int,
         default=int(os.getenv("VOD_MAX_RETAINED_JOBS", "100")),
-        help="Max terminal VOD job records kept in memory; oldest evicted first (disk untouched).",
+        help=(
+            "Max DONE/FAILED/CANCELLED VOD job records kept in memory; oldest evicted first "
+            "(PAUSED never pruned or counted; disk untouched)."
+        ),
     )
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()

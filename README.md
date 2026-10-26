@@ -212,8 +212,9 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 `--vod-segment-frames`(300), `--vod-warmup-frames`(30),
 `--vod-max-input-bytes`(`VOD_MAX_INPUT_BYTES`, 기본 2,147,483,648 B, 사용자 안내 문구는 2GB),
 `--vod-max-duration-seconds`(`VOD_MAX_DURATION_SECONDS`, 기본 3600),
-`--vod-job-ttl-seconds`(`VOD_JOB_TTL_SECONDS`, 기본 86400, 종료 상태 잡 메모리 보관 시간),
-`--vod-max-retained-jobs`(`VOD_MAX_RETAINED_JOBS`, 기본 100, 종료 상태 잡 보관 상한, 오래된 것부터 정리, 진행 중 잡 제외).
+`--vod-job-ttl-seconds`(`VOD_JOB_TTL_SECONDS`, 기본 86400, DONE·FAILED·CANCELLED 잡 메모리 보관 시간),
+`--vod-max-retained-jobs`(`VOD_MAX_RETAINED_JOBS`, 기본 100, DONE·FAILED·CANCELLED 잡 보관 상한, 오래된 것부터 정리).
+PAUSED·진행 중 잡은 재개·재조정을 위해 정리하지 않고 상한 계산에도 포함하지 않습니다.
 두 플래그는 메모리의 잡 레코드만 정리하며 디스크 결과·work_dir·checkpoint는 삭제하지 않습니다.
 
 개발·테스트용 CLI(운영 미사용, 같은 코어):
