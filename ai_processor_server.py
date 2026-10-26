@@ -152,7 +152,7 @@ class GrpcServerSettings:
     ssl_certfile: Path | None = None
     ssl_keyfile: Path | None = None
     vod_root: Path = Path("/var/lib/innolive/vod")
-    vod_max_jobs: int = 1
+    vod_max_jobs: int = 0
     vod_segment_frames: int = vod.DEFAULT_SEGMENT_FRAMES
     vod_warmup_frames: int = vod.DEFAULT_WARMUP_FRAMES
     vod_max_input_bytes: int = vod.DEFAULT_MAX_INPUT_BYTES
@@ -1889,8 +1889,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vod-max-jobs",
         type=int,
-        default=int(os.getenv("VOD_MAX_JOBS", "1")),
-        help="Concurrent VOD jobs; 0 disables VodProcessor (all RPCs return UNAVAILABLE).",
+        default=int(os.getenv("VOD_MAX_JOBS", "0")),
+        help=(
+            "Concurrent VOD jobs; default 0 disables VodProcessor "
+            "(all VodProcessor RPCs return UNAVAILABLE); set >0 to enable."
+        ),
     )
     parser.add_argument(
         "--vod-segment-frames", type=positive_int, default=vod.DEFAULT_SEGMENT_FRAMES

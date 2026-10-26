@@ -102,7 +102,7 @@ class VodLoopback:
         vod_root: Path,
         *,
         adaface: Any | None = None,
-        vod_max_jobs: int = 1,
+        vod_max_jobs: int | None = 1,
         segment_frames: int = 10,
     ) -> None:
         self.runtime = runtime
@@ -119,6 +119,8 @@ class VodLoopback:
         return FakeTracker()
 
     async def __aenter__(self) -> VodLoopback:
+        # vod_max_jobs=None omits the field so the dataclass default applies.
+        extra = {} if self.vod_max_jobs is None else {"vod_max_jobs": self.vod_max_jobs}
         settings = GrpcServerSettings(
             runtime=RuntimeConfig(engine=Path("unused.engine")),
             tracker_config=Path("unused.yaml"),
@@ -126,8 +128,8 @@ class VodLoopback:
             port=0,
             shutdown_grace_seconds=0,
             vod_root=self.vod_root,
-            vod_max_jobs=self.vod_max_jobs,
             vod_segment_frames=self.segment_frames,
+            **extra,
         )
         self.bundle = build_grpc_server(
             settings,
@@ -294,6 +296,47 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(grpc.aio.AioRpcError) as rejected:
                 await server.stub.StartVodJob(_start_request(self.tmp, "job-x"))
             self.assertEqual(rejected.exception.code(), grpc.StatusCode.UNAVAILABLE)
+
+    async def test_default_settings_disable_all_vod_rpcs(self):
+        # vod_max_jobs=None -> use the GrpcServerSettings default (0, disabled).
+        async with VodLoopback(SlowRuntime(), self.tmp, vod_max_jobs=None) as server:
+            with self.assertRaises(grpc.aio.AioRpcError) as start:
+                await server.stub.StartVodJob(_start_request(self.tmp, "job-y"))
+            self.assertEqual(start.exception.code(), grpc.StatusCode.UNAVAILABLE)
+
+            with self.assertRaises(grpc.aio.AioRpcError) as get:
+                await server.stub.GetVodJob(messages.VodJobRef(job_id="job-y"))
+            self.assertEqual(get.exception.code(), grpc.StatusCode.UNAVAILABLE)
+
+            with self.assertRaises(grpc.aio.AioRpcError) as listed:
+                await server.stub.ListVodJobs(messages.ListVodJobsRequest())
+            self.assertEqual(listed.exception.code(), grpc.StatusCode.UNAVAILABLE)
+
+            # The live AiProcessor service stays healthy on a disabled worker.
+            self.assertIsNotNone(server.bundle.servicer)
+
+
+class VodMaxJobsDefaultTests(unittest.TestCase):
+    def test_settings_default_disables_vod(self):
+        settings = GrpcServerSettings(
+            runtime=RuntimeConfig(engine=Path("unused.engine")),
+            tracker_config=Path("unused.yaml"),
+        )
+        self.assertEqual(settings.vod_max_jobs, 0)
+
+    def test_parse_args_vod_max_jobs_default_and_override(self):
+        import os
+        import sys
+        from unittest import mock
+
+        from ai_processor_server import parse_args
+
+        with mock.patch.object(sys, "argv", ["ai_processor_server"]):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VOD_MAX_JOBS", None)
+                self.assertEqual(parse_args().vod_max_jobs, 0)
+            with mock.patch.dict(os.environ, {"VOD_MAX_JOBS": "2"}):
+                self.assertEqual(parse_args().vod_max_jobs, 2)
 
 
 if __name__ == "__main__":

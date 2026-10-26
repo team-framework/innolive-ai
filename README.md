@@ -208,7 +208,7 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 - `set_accepting(False)`(rolling replace)·종료·runtime 회복 시 잡을 스스로 PAUSED로 전환
 
 워커 플래그(env): `--vod-root`(`VOD_ROOT`, 기본 `/var/lib/innolive/vod`),
-`--vod-max-jobs`(`VOD_MAX_JOBS`, 기본 1, `0`이면 비활성·모든 RPC `UNAVAILABLE`),
+`--vod-max-jobs`(`VOD_MAX_JOBS`, 기본 0(비활성, 모든 RPC `UNAVAILABLE`), 1 이상이면 활성),
 `--vod-segment-frames`(300), `--vod-warmup-frames`(30),
 `--vod-max-input-bytes`(`VOD_MAX_INPUT_BYTES`, 기본 2,147,483,648 B, 사용자 안내 문구는 2GB),
 `--vod-max-duration-seconds`(`VOD_MAX_DURATION_SECONDS`, 기본 3600).
