@@ -157,6 +157,8 @@ class GrpcServerSettings:
     vod_warmup_frames: int = vod.DEFAULT_WARMUP_FRAMES
     vod_max_input_bytes: int = vod.DEFAULT_MAX_INPUT_BYTES
     vod_max_duration_seconds: float = vod.DEFAULT_MAX_DURATION_SECONDS
+    vod_job_ttl_seconds: float = 86400.0
+    vod_max_retained_jobs: int = 100
 
     def __post_init__(self) -> None:
         if not self.host.strip():
@@ -196,6 +198,10 @@ class GrpcServerSettings:
             raise ValueError("vod_max_input_bytes must be positive")
         if not math.isfinite(self.vod_max_duration_seconds) or self.vod_max_duration_seconds <= 0:
             raise ValueError("vod_max_duration_seconds must be positive")
+        if not math.isfinite(self.vod_job_ttl_seconds) or self.vod_job_ttl_seconds <= 0:
+            raise ValueError("vod_job_ttl_seconds must be positive")
+        if self.vod_max_retained_jobs < 0:
+            raise ValueError("vod_max_retained_jobs cannot be negative")
 
 
 @dataclass(slots=True)
@@ -1166,6 +1172,7 @@ class _VodJobHandle:
     output_path: str = ""
     work_dir: str = ""
     revision: int = 0
+    terminal_at: float | None = None
     waiters: list[asyncio.Future] = field(default_factory=list)
 
     def notify(self) -> None:
@@ -1186,6 +1193,12 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
 
     Job records live only for the process lifetime; the on-disk checkpoint is the source of
     truth. VOD inference runs at low priority on the shared lane, so live frames always win.
+
+    In-memory job records in a terminal state (PAUSED/DONE/FAILED/CANCELLED) are pruned so the
+    map stays bounded: a terminal record is dropped once ``vod_job_ttl_seconds`` have elapsed
+    since it finished, and at most ``vod_max_retained_jobs`` terminal records are kept (oldest
+    evicted first). Running jobs and jobs with active WatchVodJob streams are never pruned.
+    Pruning is memory-only; on-disk results, work_dir, and checkpoints are never touched.
     """
 
     def __init__(
@@ -1196,6 +1209,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         sessions: SessionRegistry,
         adaface: Any | None,
         tracker_factory: Callable[..., Any] = StreamTracker,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.runtime = runtime
         self.settings = settings
@@ -1206,6 +1220,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         self.worker_target = f"{settings.host}:{settings.port}"
         self._jobs: dict[str, _VodJobHandle] = {}
         self._accepting = False
+        self._clock = clock
 
     def set_accepting(self, accepting: bool) -> None:
         self._accepting = accepting
@@ -1236,6 +1251,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
     async def StartVodJob(self, request, context):
         await self._require_enabled(context)
         job_id = await self._validate_job_id(request.job_id, context)
+        self._prune_jobs()
 
         existing = self._jobs.get(job_id)
         if existing is not None and existing.status.state == messages.VOD_JOB_STATE_PROCESSING:
@@ -1257,7 +1273,9 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             whitelist = self._resolve_whitelist(request)
         except vod.VodError as error:
             handle = _VodJobHandle(self._failed_status(job_id, error.code, error.message))
+            self._mark_terminal_if_needed(handle)
             self._jobs[job_id] = handle
+            self._prune_jobs()
             return self._clone(handle.status)
 
         handle = _VodJobHandle(self._new_status(job_id, messages.VOD_JOB_STATE_PROCESSING))
@@ -1291,12 +1309,14 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
 
         handle.job = job
         self._jobs[job_id] = handle
+        self._prune_jobs()
         try:
             probe = await job.validate(overwrite_output=request.overwrite_output)
         except vod.VodError as error:
             handle.status.state = messages.VOD_JOB_STATE_FAILED
             handle.status.error_code = error.code
             handle.status.error_message = error.message
+            self._mark_terminal_if_needed(handle)
             handle.notify()
             return self._clone(handle.status)
         _apply_probe(handle.status, probe)
@@ -1341,10 +1361,12 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             handle.status.error_message = str(error)
         finally:
             handle.status.updated_at_unix_ms = int(time.time() * 1000)
+            self._mark_terminal_if_needed(handle)
             handle.notify()
 
     async def WatchVodJob(self, request, context) -> AsyncIterator:
         await self._require_enabled(context)
+        self._prune_jobs()
         handle = self._jobs.get(request.job_id)
         if handle is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
@@ -1363,6 +1385,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
 
     async def GetVodJob(self, request, context):
         await self._require_enabled(context)
+        self._prune_jobs()
         handle = self._jobs.get(request.job_id)
         if handle is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
@@ -1370,6 +1393,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
 
     async def PauseVodJob(self, request, context):
         await self._require_enabled(context)
+        self._prune_jobs()
         handle = self._jobs.get(request.job_id)
         if handle is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
@@ -1384,6 +1408,7 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
 
     async def CancelVodJob(self, request, context):
         await self._require_enabled(context)
+        self._prune_jobs()
         handle = self._jobs.get(request.job_id)
         if handle is None:
             # The worker does not know this job; nothing local to purge.
@@ -1400,15 +1425,67 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         handle.status.state = messages.VOD_JOB_STATE_CANCELLED
         handle.status.error_code = "CANCELLED"
         handle.status.updated_at_unix_ms = int(time.time() * 1000)
+        self._mark_terminal_if_needed(handle)
         handle.notify()
         return self._clone(handle.status)
 
     async def ListVodJobs(self, request, context):
         await self._require_enabled(context)
+        self._prune_jobs()
         del request
         return messages.ListVodJobsResponse(
             jobs=[self._clone(handle.status) for handle in self._jobs.values()]
         )
+
+    def _mark_terminal_if_needed(self, handle: _VodJobHandle) -> None:
+        """Stamp (or clear) the terminal timestamp so the TTL counts from when a job finished."""
+
+        if handle.status.state in _VOD_TERMINAL:
+            if handle.terminal_at is None:
+                handle.terminal_at = self._clock()
+        else:
+            handle.terminal_at = None
+
+    def _prune_jobs(self) -> None:
+        """Bound the in-memory job map: drop terminal records past the TTL or over the cap.
+
+        Memory-only. On-disk results, work_dir, and checkpoints are never touched here.
+        """
+
+        now = self._clock()
+        for handle in self._jobs.values():
+            self._mark_terminal_if_needed(handle)
+
+        def prunable(handle: _VodJobHandle) -> bool:
+            # Never drop a job that is still running or has a live WatchVodJob stream.
+            if handle.status.state not in _VOD_TERMINAL:
+                return False
+            if handle.task is not None and not handle.task.done():
+                return False
+            return not handle.waiters
+
+        ttl = self.settings.vod_job_ttl_seconds
+        expired = [
+            job_id
+            for job_id, handle in self._jobs.items()
+            if prunable(handle)
+            and handle.terminal_at is not None
+            and now - handle.terminal_at >= ttl
+        ]
+        for job_id in expired:
+            del self._jobs[job_id]
+
+        terminal_count = sum(
+            1 for handle in self._jobs.values() if handle.status.state in _VOD_TERMINAL
+        )
+        excess = terminal_count - self.settings.vod_max_retained_jobs
+        if excess <= 0:
+            return
+        # Oldest first by terminal_at; dict order (insertion order) breaks ties via stable sort.
+        evictable = [(job_id, handle) for job_id, handle in self._jobs.items() if prunable(handle)]
+        evictable.sort(key=lambda item: now if item[1].terminal_at is None else item[1].terminal_at)
+        for job_id, _handle in evictable[:excess]:
+            del self._jobs[job_id]
 
     @staticmethod
     def _cleanup_cancel(handle: _VodJobHandle, purge_work_dir: bool, vod_root: Path) -> None:
@@ -1909,6 +1986,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.getenv("VOD_MAX_DURATION_SECONDS", str(vod.DEFAULT_MAX_DURATION_SECONDS))),
     )
+    parser.add_argument(
+        "--vod-job-ttl-seconds",
+        type=float,
+        default=float(os.getenv("VOD_JOB_TTL_SECONDS", "86400")),
+        help="How long a terminal VOD job record is retained in memory (disk results untouched).",
+    )
+    parser.add_argument(
+        "--vod-max-retained-jobs",
+        type=int,
+        default=int(os.getenv("VOD_MAX_RETAINED_JOBS", "100")),
+        help="Max terminal VOD job records kept in memory; oldest evicted first (disk untouched).",
+    )
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 
@@ -1977,6 +2066,8 @@ def main() -> None:
         vod_warmup_frames=arguments.vod_warmup_frames,
         vod_max_input_bytes=arguments.vod_max_input_bytes,
         vod_max_duration_seconds=arguments.vod_max_duration_seconds,
+        vod_job_ttl_seconds=arguments.vod_job_ttl_seconds,
+        vod_max_retained_jobs=arguments.vod_max_retained_jobs,
     )
     with suppress(KeyboardInterrupt):
         asyncio.run(serve(settings))

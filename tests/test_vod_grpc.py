@@ -339,10 +339,6 @@ class VodMaxJobsDefaultTests(unittest.TestCase):
                 self.assertEqual(parse_args().vod_max_jobs, 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class VodCancelCleanupTests(unittest.TestCase):
     def test_cancel_cleanup_never_leaves_the_vod_root(self):
         from ai_processor_server import VodProcessorServicer, _VodJobHandle
@@ -370,3 +366,170 @@ class VodCancelCleanupTests(unittest.TestCase):
             handle.work_dir = str(inside)
             VodProcessorServicer._cleanup_cancel(handle, True, root)
             self.assertFalse(inside.exists())
+
+
+class _FakeClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _FakeContext:
+    async def abort(self, code: Any, details: str) -> None:
+        raise AssertionError(f"unexpected abort: {code} {details}")
+
+
+def _make_servicer(clock: _FakeClock, **settings_overrides: Any):
+    from ai_processor_server import GrpcServerSettings, VodProcessorServicer
+
+    settings = GrpcServerSettings(
+        runtime=RuntimeConfig(engine=Path("unused.engine")),
+        tracker_config=Path("unused.yaml"),
+        vod_max_jobs=1,
+        **settings_overrides,
+    )
+    return VodProcessorServicer(
+        object(),
+        settings,
+        sessions=SessionRegistry(),
+        adaface=None,
+        clock=clock,
+    )
+
+
+def _insert(servicer: Any, job_id: str, state: int) -> Any:
+    from ai_processor_server import _VodJobHandle
+
+    handle = _VodJobHandle(status=messages.VodJobStatus(job_id=job_id, state=state))
+    servicer._jobs[job_id] = handle
+    return handle
+
+
+class VodJobPruneTests(unittest.TestCase):
+    def test_ttl_counts_from_terminal_time_not_insertion(self):
+        clock = _FakeClock(0.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=10.0, vod_max_retained_jobs=100)
+        # Inserted while still PROCESSING; the TTL must not start ticking yet.
+        handle = _insert(servicer, "job", messages.VOD_JOB_STATE_PROCESSING)
+        clock.now = 100.0
+        servicer._prune_jobs()
+        self.assertIsNone(handle.terminal_at)
+        # Becomes terminal at t=100; TTL now starts from there.
+        handle.status.state = messages.VOD_JOB_STATE_DONE
+        servicer._prune_jobs()
+        self.assertEqual(handle.terminal_at, 100.0)
+
+        clock.now = 109.0  # before ttl relative to terminal time (100 + 10)
+        servicer._prune_jobs()
+        self.assertIn("job", servicer._jobs)
+
+        clock.now = 110.0  # at ttl
+        servicer._prune_jobs()
+        self.assertNotIn("job", servicer._jobs)
+
+    def test_listvodjobs_drops_expired_job(self):
+        clock = _FakeClock(0.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=5.0, vod_max_retained_jobs=100)
+        _insert(servicer, "done", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()  # stamps terminal_at = 0
+        clock.now = 4.0
+        listed = asyncio.run(servicer.ListVodJobs(messages.ListVodJobsRequest(), _FakeContext()))
+        self.assertEqual([job.job_id for job in listed.jobs], ["done"])
+        clock.now = 5.0
+        listed = asyncio.run(servicer.ListVodJobs(messages.ListVodJobsRequest(), _FakeContext()))
+        self.assertEqual(listed.jobs, [])
+
+    def test_cap_evicts_oldest_terminal_first(self):
+        clock = _FakeClock(1.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=1e9, vod_max_retained_jobs=2)
+        # Each job becomes terminal at a distinct clock value.
+        _insert(servicer, "a", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        clock.now = 2.0
+        _insert(servicer, "b", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        clock.now = 3.0
+        _insert(servicer, "c", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        # cap=2, three terminal jobs → the oldest (a, terminal_at=1) is evicted.
+        self.assertEqual(sorted(servicer._jobs), ["b", "c"])
+
+    def test_cap_ignores_processing_jobs(self):
+        clock = _FakeClock(1.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=1e9, vod_max_retained_jobs=2)
+        _insert(servicer, "p", messages.VOD_JOB_STATE_PROCESSING)
+        _insert(servicer, "a", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        clock.now = 2.0
+        _insert(servicer, "b", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        clock.now = 3.0
+        _insert(servicer, "c", messages.VOD_JOB_STATE_DONE)
+        servicer._prune_jobs()
+        # Only terminal jobs count toward the cap; PROCESSING "p" is never evicted.
+        self.assertEqual(sorted(servicer._jobs), ["b", "c", "p"])
+
+    def test_non_terminal_survives_ttl_and_cap(self):
+        clock = _FakeClock(0.0)
+        servicer = _make_servicer(clock, vod_job_ttl_seconds=1.0, vod_max_retained_jobs=0)
+        handle = _insert(servicer, "live", messages.VOD_JOB_STATE_PROCESSING)
+        servicer._prune_jobs()
+        clock.now = 1000.0  # far beyond ttl
+        servicer._prune_jobs()
+        self.assertIn("live", servicer._jobs)
+        self.assertIsNone(handle.terminal_at)
+
+
+class VodRetentionSettingsTests(unittest.TestCase):
+    def test_defaults(self):
+        settings = GrpcServerSettings(
+            runtime=RuntimeConfig(engine=Path("unused.engine")),
+            tracker_config=Path("unused.yaml"),
+        )
+        self.assertEqual(settings.vod_job_ttl_seconds, 86400.0)
+        self.assertEqual(settings.vod_max_retained_jobs, 100)
+
+    def test_rejects_non_positive_ttl(self):
+        for ttl in (0.0, -1.0, float("inf")):
+            with self.assertRaises(ValueError):
+                GrpcServerSettings(
+                    runtime=RuntimeConfig(engine=Path("unused.engine")),
+                    tracker_config=Path("unused.yaml"),
+                    vod_job_ttl_seconds=ttl,
+                )
+
+    def test_rejects_negative_cap(self):
+        with self.assertRaises(ValueError):
+            GrpcServerSettings(
+                runtime=RuntimeConfig(engine=Path("unused.engine")),
+                tracker_config=Path("unused.yaml"),
+                vod_max_retained_jobs=-1,
+            )
+
+    def test_parse_args_defaults_and_env_overrides(self):
+        import os
+        import sys
+        from unittest import mock
+
+        from ai_processor_server import parse_args
+
+        with mock.patch.object(sys, "argv", ["ai_processor_server"]):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VOD_JOB_TTL_SECONDS", None)
+                os.environ.pop("VOD_MAX_RETAINED_JOBS", None)
+                args = parse_args()
+                self.assertEqual(args.vod_job_ttl_seconds, 86400.0)
+                self.assertEqual(args.vod_max_retained_jobs, 100)
+            with mock.patch.dict(
+                os.environ,
+                {"VOD_JOB_TTL_SECONDS": "30", "VOD_MAX_RETAINED_JOBS": "5"},
+            ):
+                args = parse_args()
+                self.assertEqual(args.vod_job_ttl_seconds, 30.0)
+                self.assertEqual(args.vod_max_retained_jobs, 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
