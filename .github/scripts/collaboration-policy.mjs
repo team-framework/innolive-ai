@@ -15,7 +15,13 @@ function parseBody(body, headings, optionalHeadings = [], allowFormHeadings = fa
   if (typeof body !== 'string' || !body.trim()) return { errors: ['본문 필수'], sections: new Map() };
   if (body.includes('\\n')) error(errors, '문자열 \\n 대신 실제 줄바꿈 사용');
   if (body.includes('—')) error(errors, 'em dash 사용 금지');
-  const clean = body.replace(/<!--[\s\S]*?-->/gu, '').replace(/\r\n?/gu, '\n');
+  // Strip HTML comments and trailing agent/footer markup (e.g. Cursor PR <div> links)
+  // so they are not treated as 관련 이슈 lines or section-outside content.
+  const clean = body
+    .replace(/<!--[\s\S]*?-->/gu, '')
+    .replace(/<\/?[a-zA-Z][^>]*>/gu, '')
+    .replace(/&nbsp;/gu, ' ')
+    .replace(/\r\n?/gu, '\n');
   const sections = new Map();
   const found = [];
   let current;
