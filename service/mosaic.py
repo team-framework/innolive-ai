@@ -96,6 +96,27 @@ def mosaic_yuv420p(
     return _encode_yuv420p(output)
 
 
+def mosaic_bgr(
+    image: np.ndarray,
+    objects: list[dict[str, Any]],
+    *,
+    blur_radius: float = DEFAULT_BLUR_RADIUS,
+    pixel_size: int = DEFAULT_PIXEL_SIZE,
+    mask_margin: int = DEFAULT_MASK_MARGIN,
+    mask_pad: int = 0,
+) -> np.ndarray:
+    """Compose the protected-object mosaic and return the BGR frame.
+
+    Shares the exact composition path used by ``mosaic_jpeg``/``mosaic_yuv420p`` so the VOD
+    encoder and the live serving path produce identical pixels; it only skips the final encode.
+    """
+
+    if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+        raise ValueError("mosaic input must be a uint8 BGR image")
+    blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
+    return _compose_protected(image, objects, blur_radius, pixel_size, mask_margin, mask_pad)
+
+
 def _compose_protected(
     image: np.ndarray,
     objects: list[dict[str, Any]],

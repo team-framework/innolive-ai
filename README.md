@@ -192,6 +192,42 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 - `ExportWhitelist` · `ImportWhitelist`: 워커 교체 시 세션 화이트리스트 임베딩을 entry_id 그대로 이동. 인식 모델 지문(`embedding_model`)이 다르면 `FAILED_PRECONDITION`
 - Python client: `grpc_client.VideoProcessorClient`
 
+## VOD 비식별화 (`VodProcessor`)
+
+라이브 워커가 이미 올려 둔 runtime·AdaFace를 그대로 써서 업로드 영상을 파일 단위로
+비식별화하는 gRPC 서비스입니다. 같은 포트·같은 `ai_processor.proto`에 있으며, VOD 추론은 공유
+추론 lane에서 **낮은 우선순위**로 돌아 라이브 `ProcessVideo` 프레임을 절대 밀어내지 않습니다.
+세그먼트 단위 checkpoint가 진실의 원천이라, 일시정지된 잡은 공유 디스크가 보이는 어느 워커에서도
+재개됩니다. 생체 임베딩은 checkpoint에 저장하지 않습니다.
+
+- `StartVodJob`: 새 잡 시작 또는 checkpoint 재개. 경로·크기·ffprobe 검증을 통과하면 PROCESSING으로 응답
+- `WatchVodJob` · `GetVodJob`: 진행률(frames/segments/fps/eta) 스트림·단건 조회
+- `PauseVodJob` · `CancelVodJob`: 프레임 경계에서 정지(미완 세그먼트 폐기) · 부분 출력 삭제
+- `ListVodJobs`: 재시작·슬롯 전환 후 서버 재조정용 잡 목록
+- 입력 문제(없음·미지원·한도 초과·checkpoint 불일치)는 RPC 오류가 아니라 `state=FAILED` + `error_code`로 응답
+- `set_accepting(False)`(rolling replace)·종료·runtime 회복 시 잡을 스스로 PAUSED로 전환
+
+워커 플래그(env): `--vod-root`(`VOD_ROOT`, 기본 `/var/lib/innolive/vod`),
+`--vod-max-jobs`(`VOD_MAX_JOBS`, 기본 0(비활성, 모든 RPC `UNAVAILABLE`), 1 이상이면 활성),
+`--vod-segment-frames`(300), `--vod-warmup-frames`(30),
+`--vod-max-input-bytes`(`VOD_MAX_INPUT_BYTES`, 기본 2,147,483,648 B, 사용자 안내 문구는 2GB),
+`--vod-max-duration-seconds`(`VOD_MAX_DURATION_SECONDS`, 기본 3600),
+`--vod-job-ttl-seconds`(`VOD_JOB_TTL_SECONDS`, 기본 86400, DONE·FAILED·CANCELLED 잡 메모리 보관 시간),
+`--vod-max-retained-jobs`(`VOD_MAX_RETAINED_JOBS`, 기본 100, DONE·FAILED·CANCELLED 잡 보관 상한, 오래된 것부터 정리).
+PAUSED·진행 중 잡은 재개·재조정을 위해 정리하지 않고 상한 계산에도 포함하지 않습니다.
+두 플래그는 메모리의 잡 레코드만 정리하며 디스크 결과·work_dir·checkpoint는 삭제하지 않습니다.
+
+개발·테스트용 CLI(운영 미사용, 같은 코어):
+
+```bash
+python -m service.vod_cli --input IN.mp4 --output OUT.mp4 --work-dir DIR --device cpu \
+    [--whitelist-json wl.json | --reference-image face.jpg ...] \
+    [--segment-frames 300] [--resume] [--overwrite] [--encoder auto|h264_nvenc|libx264] [--quality 20]
+```
+
+stdout에 JSON line 이벤트(`started`·`progress`·`checkpoint`·`paused`·`done`·`failed`)를, 로그는
+stderr로 냅니다. SIGTERM·SIGINT는 프레임 경계에서 일시정지 후 exit 75, `--resume`으로 이어갑니다.
+
 ## 방송 중단 없는 워커 교체
 
 `deploy/rolling_replace.sh`는 GPU 서버에서 워커를 하나씩 새 릴리스로 바꿉니다. 새 릴리스로
@@ -395,6 +431,7 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 | `service/frame.py`, `service/protocol.py` | 입력 크기·형식 검증과 browser binary codec | 모델·세션 상태 |
 | `service/runtime.py`, `service/tracking.py` | detector 실행, stream-local track과 mask 안정화 | HTTP/WebSocket |
 | `service/recognition.py`, `service/mosaic.py` | whitelist 판단과 fail-closed 픽셀 보호 | gRPC/FastAPI 객체 |
+| `service/vod.py`, `service/vod_cli.py` | 파일 단위 VOD 디코드·처리·인코드·checkpoint 코어와 개발 CLI | gRPC 객체 |
 | `ai_processor_server.py` | protobuf 변환, lifecycle, bounded execution lane | browser protocol |
 | `grpc_client.py`, `server.py` | 각각 app client와 browser demo transport adapter | model 직접 로딩 |
 

@@ -8,6 +8,7 @@ import asyncio
 import logging
 import math
 import os
+import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from protos import ai_processor_pb2 as messages
 from protos import ai_processor_pb2_grpc
+from service import vod
 from service.adaface_backbones import ADAFACE_ARCHITECTURES
 from service.adaface_model import (
     DEFAULT_ADAFACE_ARCHITECTURE,
@@ -149,6 +151,14 @@ class GrpcServerSettings:
     mosaic_max_inflight: int = DEFAULT_MOSAIC_MAX_INFLIGHT
     ssl_certfile: Path | None = None
     ssl_keyfile: Path | None = None
+    vod_root: Path = Path("/var/lib/innolive/vod")
+    vod_max_jobs: int = 0
+    vod_segment_frames: int = vod.DEFAULT_SEGMENT_FRAMES
+    vod_warmup_frames: int = vod.DEFAULT_WARMUP_FRAMES
+    vod_max_input_bytes: int = vod.DEFAULT_MAX_INPUT_BYTES
+    vod_max_duration_seconds: float = vod.DEFAULT_MAX_DURATION_SECONDS
+    vod_job_ttl_seconds: float = 86400.0
+    vod_max_retained_jobs: int = 100
 
     def __post_init__(self) -> None:
         if not self.host.strip():
@@ -178,6 +188,20 @@ class GrpcServerSettings:
             raise ValueError("mosaic_max_inflight must be at least mosaic_workers")
         if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
             raise ValueError("ssl_certfile and ssl_keyfile must be provided together")
+        if self.vod_max_jobs < 0:
+            raise ValueError("vod_max_jobs cannot be negative")
+        if self.vod_segment_frames < 1:
+            raise ValueError("vod_segment_frames must be at least one")
+        if self.vod_warmup_frames < 0:
+            raise ValueError("vod_warmup_frames cannot be negative")
+        if self.vod_max_input_bytes < 1:
+            raise ValueError("vod_max_input_bytes must be positive")
+        if not math.isfinite(self.vod_max_duration_seconds) or self.vod_max_duration_seconds <= 0:
+            raise ValueError("vod_max_duration_seconds must be positive")
+        if not math.isfinite(self.vod_job_ttl_seconds) or self.vod_job_ttl_seconds <= 0:
+            raise ValueError("vod_job_ttl_seconds must be positive")
+        if self.vod_max_retained_jobs < 0:
+            raise ValueError("vod_max_retained_jobs cannot be negative")
 
 
 @dataclass(slots=True)
@@ -243,6 +267,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         self._recovery: asyncio.Task | None = None
         self._failure_generation = 0
         self._health_lock = asyncio.Lock()
+        # Set by build_grpc_server so admission/recovery can auto-pause VOD jobs.
+        self.vod_servicer: VodProcessorServicer | None = None
 
     async def ProcessVideo(self, request_iterator, context) -> AsyncIterator:
         if not self._accepting or not self.runtime.ready:
@@ -864,6 +890,10 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
 
     def set_accepting(self, accepting: bool) -> None:
         self._accepting = accepting
+        if self.vod_servicer is not None:
+            self.vod_servicer.set_accepting(accepting)
+            if not accepting:
+                self.vod_servicer.request_drain(vod.PAUSE_WORKER_DRAINING)
 
     async def _enter_recovery(self, reason: str) -> None:
         """Stop admitting streams until the runtime proves it still answers.
@@ -872,6 +902,9 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         probes readiness on that response already sees it.
         """
         self._accepting = False
+        if self.vod_servicer is not None:
+            self.vod_servicer.set_accepting(False)
+            self.vod_servicer.request_drain(vod.PAUSE_RUNTIME_RECOVERY)
         if self._closing:
             return
         self._failure_generation += 1
@@ -915,6 +948,8 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         # 동기 구간에서 회복을 끝내야 이 뒤에 들어온 실패가 새 회복을 시작한다.
         self._recovery = None
         self._accepting = True
+        if self.vod_servicer is not None:
+            self.vod_servicer.set_accepting(True)
         LOGGER.info(
             "runtime recovered from %s in %.0f ms (self-check %.0f ms); admitting streams",
             reason,
@@ -1114,12 +1149,521 @@ class AiProcessorServicer(ai_processor_pb2_grpc.AiProcessorServicer):
         )
 
 
+_VOD_STATE = {
+    vod.STATE_DONE: messages.VOD_JOB_STATE_DONE,
+    vod.STATE_PAUSED: messages.VOD_JOB_STATE_PAUSED,
+}
+_VOD_TERMINAL = frozenset(
+    {
+        messages.VOD_JOB_STATE_PAUSED,
+        messages.VOD_JOB_STATE_DONE,
+        messages.VOD_JOB_STATE_FAILED,
+        messages.VOD_JOB_STATE_CANCELLED,
+    }
+)
+# Finished states eligible for in-memory pruning. PAUSED is excluded: a paused job is still
+# resumable and must stay visible to GetVodJob/ListVodJobs for server reconciliation.
+_VOD_PRUNABLE = frozenset(
+    {
+        messages.VOD_JOB_STATE_DONE,
+        messages.VOD_JOB_STATE_FAILED,
+        messages.VOD_JOB_STATE_CANCELLED,
+    }
+)
+MAX_VOD_JOB_ID_BYTES = 256
+
+
+@dataclass(slots=True)
+class _VodJobHandle:
+    status: Any
+    job: vod.VodJob | None = None
+    task: asyncio.Task | None = None
+    output_path: str = ""
+    work_dir: str = ""
+    revision: int = 0
+    terminal_at: float | None = None
+    waiters: list[asyncio.Future] = field(default_factory=list)
+
+    def notify(self) -> None:
+        self.revision += 1
+        for waiter in self.waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+        self.waiters = []
+
+    async def wait(self) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiters.append(waiter)
+        await waiter
+
+
+class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
+    """VOD job control sharing the live worker's runtime, AdaFace, and sessions.
+
+    Job records live only for the process lifetime; the on-disk checkpoint is the source of
+    truth. VOD inference runs at low priority on the shared lane, so live frames always win.
+
+    Finished job records (DONE/FAILED/CANCELLED) are pruned so the map stays bounded: a
+    finished record is dropped once ``vod_job_ttl_seconds`` have elapsed since it finished, and
+    at most ``vod_max_retained_jobs`` finished records are kept (oldest evicted first). PAUSED
+    jobs (resumable), running jobs, and jobs with active WatchVodJob streams are never pruned
+    and do not count toward the cap.
+    Pruning is memory-only; on-disk results, work_dir, and checkpoints are never touched.
+    """
+
+    def __init__(
+        self,
+        runtime: Any,
+        settings: GrpcServerSettings,
+        *,
+        sessions: SessionRegistry,
+        adaface: Any | None,
+        tracker_factory: Callable[..., Any] = StreamTracker,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.runtime = runtime
+        self.settings = settings
+        self.sessions = sessions
+        self.adaface = adaface
+        self.tracker_factory = tracker_factory
+        self.enabled = settings.vod_max_jobs > 0
+        self.worker_target = f"{settings.host}:{settings.port}"
+        self._jobs: dict[str, _VodJobHandle] = {}
+        self._accepting = False
+        self._clock = clock
+
+    def set_accepting(self, accepting: bool) -> None:
+        self._accepting = accepting
+
+    def request_drain(self, reason: int) -> None:
+        """Ask every running job to pause at its next frame boundary (non-blocking)."""
+
+        for handle in self._jobs.values():
+            if handle.status.state == messages.VOD_JOB_STATE_PROCESSING and handle.job is not None:
+                handle.job.request_pause(reason)
+
+    async def drain(self, reason: int, *, timeout: float = 15.0) -> None:
+        """Pause running jobs and wait for them to reach a durable checkpoint."""
+
+        self.request_drain(reason)
+        tasks = [h.task for h in self._jobs.values() if h.task is not None and not h.task.done()]
+        if tasks:
+            with suppress(Exception):
+                await asyncio.wait(tasks, timeout=timeout)
+
+    async def close(self) -> None:
+        for handle in self._jobs.values():
+            if handle.task is not None and not handle.task.done():
+                handle.task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await handle.task
+
+    async def StartVodJob(self, request, context):
+        await self._require_enabled(context)
+        job_id = await self._validate_job_id(request.job_id, context)
+        self._prune_jobs()
+
+        existing = self._jobs.get(job_id)
+        if existing is not None and existing.status.state == messages.VOD_JOB_STATE_PROCESSING:
+            await context.abort(
+                grpc.StatusCode.ALREADY_EXISTS, f"job {job_id} is already processing"
+            )
+        if not self._accepting or not getattr(self.runtime, "ready", False):
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "worker is not accepting VOD jobs")
+        active = sum(
+            1
+            for handle in self._jobs.values()
+            if handle.status.state == messages.VOD_JOB_STATE_PROCESSING
+        )
+        if active >= self.settings.vod_max_jobs:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "VOD job slots are full")
+
+        config = await self._build_config(request, context)
+        try:
+            whitelist = self._resolve_whitelist(request)
+        except vod.VodError as error:
+            handle = _VodJobHandle(self._failed_status(job_id, error.code, error.message))
+            self._mark_terminal_if_needed(handle)
+            self._jobs[job_id] = handle
+            self._prune_jobs()
+            return self._clone(handle.status)
+
+        handle = _VodJobHandle(self._new_status(job_id, messages.VOD_JOB_STATE_PROCESSING))
+        handle.output_path = request.output_path
+        handle.work_dir = request.work_dir
+
+        def progress(snapshot: vod.VodProgressSnapshot, _committed: bool) -> None:
+            _apply_progress(handle.status, snapshot)
+            handle.notify()
+
+        try:
+            job = vod.VodJob(
+                job_id=job_id,
+                input_path=request.input_path,
+                output_path=request.output_path,
+                work_dir=request.work_dir,
+                runtime=self.runtime,
+                adaface=self.adaface,
+                config=config,
+                limits=self._limits(),
+                whitelist=whitelist,
+                tracker_factory=self.tracker_factory,
+                tracker_config=self.settings.tracker_config,
+                device=getattr(self.runtime, "device", self.settings.runtime.device),
+                recognition_config=self.settings.recognition,
+                worker_target=self.worker_target,
+                progress_callback=progress,
+            )
+        except vod.VodPreconditionError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+
+        handle.job = job
+        self._jobs[job_id] = handle
+        self._prune_jobs()
+        try:
+            probe = await job.validate(overwrite_output=request.overwrite_output)
+        except vod.VodError as error:
+            handle.status.state = messages.VOD_JOB_STATE_FAILED
+            handle.status.error_code = error.code
+            handle.status.error_message = error.message
+            self._mark_terminal_if_needed(handle)
+            handle.notify()
+            return self._clone(handle.status)
+        _apply_probe(handle.status, probe)
+
+        handle.task = asyncio.create_task(
+            self._run_job(
+                handle, job, request.resume, request.checkpoint_token, request.overwrite_output
+            ),
+            name=f"vod-{job_id}",
+        )
+        return self._clone(handle.status)
+
+    async def _run_job(
+        self,
+        handle: _VodJobHandle,
+        job: vod.VodJob,
+        resume: bool,
+        checkpoint_token: str,
+        overwrite: bool,
+    ) -> None:
+        try:
+            result = await job.run(
+                resume=resume, checkpoint_token=checkpoint_token, overwrite_output=overwrite
+            )
+            handle.status.state = _VOD_STATE[result.state]
+            handle.status.checkpoint_token = result.checkpoint_token
+            if result.state == vod.STATE_DONE:
+                handle.status.output_path = result.output_path
+                handle.status.progress.fraction = 1.0
+            else:
+                handle.status.pause_reason = result.pause_reason
+        except asyncio.CancelledError:
+            raise
+        except vod.VodError as error:
+            handle.status.state = messages.VOD_JOB_STATE_FAILED
+            handle.status.error_code = error.code
+            handle.status.error_message = error.message
+        except Exception as error:  # map unexpected faults to a job code, never exit the worker.
+            LOGGER.exception("VOD job %s failed unexpectedly", handle.status.job_id)
+            handle.status.state = messages.VOD_JOB_STATE_FAILED
+            handle.status.error_code = "INTERNAL"
+            handle.status.error_message = str(error)
+        finally:
+            handle.status.updated_at_unix_ms = int(time.time() * 1000)
+            self._mark_terminal_if_needed(handle)
+            handle.notify()
+
+    async def WatchVodJob(self, request, context) -> AsyncIterator:
+        await self._require_enabled(context)
+        self._prune_jobs()
+        handle = self._jobs.get(request.job_id)
+        if handle is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
+        last_revision = -1
+        while True:
+            if handle.revision != last_revision:
+                last_revision = handle.revision
+                snapshot = self._clone(handle.status)
+                yield snapshot
+                # End on the state we actually sent; the live status may already have advanced
+                # past this yield, which must still be delivered on the next loop.
+                if snapshot.state in _VOD_TERMINAL:
+                    return
+            else:
+                await handle.wait()
+
+    async def GetVodJob(self, request, context):
+        await self._require_enabled(context)
+        self._prune_jobs()
+        handle = self._jobs.get(request.job_id)
+        if handle is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
+        return self._clone(handle.status)
+
+    async def PauseVodJob(self, request, context):
+        await self._require_enabled(context)
+        self._prune_jobs()
+        handle = self._jobs.get(request.job_id)
+        if handle is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown job {request.job_id}")
+        if handle.status.state != messages.VOD_JOB_STATE_PROCESSING:
+            return self._clone(handle.status)
+        if handle.job is not None:
+            handle.job.request_pause(vod.PAUSE_REQUESTED)
+        if handle.task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await handle.task
+        return self._clone(handle.status)
+
+    async def CancelVodJob(self, request, context):
+        await self._require_enabled(context)
+        self._prune_jobs()
+        handle = self._jobs.get(request.job_id)
+        if handle is None:
+            # The worker does not know this job; nothing local to purge.
+            return self._failed_status(
+                request.job_id, "CANCELLED", "job unknown to this worker", cancelled=True
+            )
+        if handle.task is not None and not handle.task.done():
+            handle.task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await handle.task
+        await asyncio.to_thread(
+            self._cleanup_cancel, handle, request.purge_work_dir, self.settings.vod_root
+        )
+        handle.status.state = messages.VOD_JOB_STATE_CANCELLED
+        handle.status.error_code = "CANCELLED"
+        handle.status.updated_at_unix_ms = int(time.time() * 1000)
+        self._mark_terminal_if_needed(handle)
+        handle.notify()
+        return self._clone(handle.status)
+
+    async def ListVodJobs(self, request, context):
+        await self._require_enabled(context)
+        self._prune_jobs()
+        del request
+        return messages.ListVodJobsResponse(
+            jobs=[self._clone(handle.status) for handle in self._jobs.values()]
+        )
+
+    def _mark_terminal_if_needed(self, handle: _VodJobHandle) -> None:
+        """Stamp (or clear) the finish timestamp so the TTL counts from when a job finished.
+
+        Only prunable states (DONE/FAILED/CANCELLED) are stamped; PAUSED is never pruned.
+        """
+
+        if handle.status.state in _VOD_PRUNABLE:
+            if handle.terminal_at is None:
+                handle.terminal_at = self._clock()
+        else:
+            handle.terminal_at = None
+
+    def _prune_jobs(self) -> None:
+        """Bound the in-memory job map: drop finished records past the TTL or over the cap.
+
+        Only DONE/FAILED/CANCELLED records are pruned or counted toward the cap; PAUSED,
+        running, and watched jobs are always kept.
+
+        Memory-only. On-disk results, work_dir, and checkpoints are never touched here.
+        """
+
+        now = self._clock()
+        for handle in self._jobs.values():
+            self._mark_terminal_if_needed(handle)
+
+        def prunable(handle: _VodJobHandle) -> bool:
+            # Never drop a paused/running job or one with a live WatchVodJob stream.
+            if handle.status.state not in _VOD_PRUNABLE:
+                return False
+            if handle.task is not None and not handle.task.done():
+                return False
+            return not handle.waiters
+
+        ttl = self.settings.vod_job_ttl_seconds
+        expired = [
+            job_id
+            for job_id, handle in self._jobs.items()
+            if prunable(handle)
+            and handle.terminal_at is not None
+            and now - handle.terminal_at >= ttl
+        ]
+        for job_id in expired:
+            del self._jobs[job_id]
+
+        finished_count = sum(
+            1 for handle in self._jobs.values() if handle.status.state in _VOD_PRUNABLE
+        )
+        excess = finished_count - self.settings.vod_max_retained_jobs
+        if excess <= 0:
+            return
+        # Oldest first by terminal_at; dict order (insertion order) breaks ties via stable sort.
+        evictable = [(job_id, handle) for job_id, handle in self._jobs.items() if prunable(handle)]
+        evictable.sort(key=lambda item: now if item[1].terminal_at is None else item[1].terminal_at)
+        for job_id, _handle in evictable[:excess]:
+            del self._jobs[job_id]
+
+    @staticmethod
+    def _cleanup_cancel(handle: _VodJobHandle, purge_work_dir: bool, vod_root: Path) -> None:
+        # Paths come from the request and may have failed validation; only touch the VOD root.
+        def inside_root(value: str) -> Path | None:
+            try:
+                return vod._realpath_under(Path(value), vod_root)
+            except vod.VodError:
+                LOGGER.warning("refusing VOD cleanup outside the VOD root: %s", value)
+                return None
+
+        if handle.output_path:
+            part = inside_root(handle.output_path + ".part")
+            if part is not None:
+                with suppress(FileNotFoundError):
+                    part.unlink()
+        if purge_work_dir and handle.work_dir:
+            work_dir = inside_root(handle.work_dir)
+            if work_dir is not None and work_dir != vod_root.resolve():
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    async def _require_enabled(self, context) -> None:
+        if not self.enabled:
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE, "VodProcessor is disabled on this worker"
+            )
+
+    async def _validate_job_id(self, job_id: str, context) -> str:
+        if not isinstance(job_id, str) or not job_id.strip():
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "job_id must not be empty")
+        if len(job_id.encode("utf-8")) > MAX_VOD_JOB_ID_BYTES:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"job_id exceeds {MAX_VOD_JOB_ID_BYTES} bytes"
+            )
+        return job_id
+
+    async def _build_config(self, request, context) -> vod.VodConfig:
+        blur_radius = DEFAULT_BLUR_RADIUS
+        pixel_size = DEFAULT_PIXEL_SIZE
+        mask_margin = DEFAULT_MASK_MARGIN
+        if request.HasField("mosaic_config"):
+            config = request.mosaic_config
+            if config.HasField("blur_radius"):
+                blur_radius = float(config.blur_radius)
+            if config.HasField("pixel_size"):
+                pixel_size = int(config.pixel_size)
+            if config.HasField("mask_margin"):
+                mask_margin = int(config.mask_margin)
+        try:
+            blur_radius, pixel_size = validate_mosaic_params(blur_radius, pixel_size)
+            mask_margin = validate_mask_margin(mask_margin)
+        except ValueError as error:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"mosaic_config rejected: {error}"
+            )
+        segment_frames = request.segment_frames or self.settings.vod_segment_frames
+        return vod.VodConfig(
+            segment_frames=segment_frames,
+            warmup_frames=self.settings.vod_warmup_frames,
+            quality=int(request.quality),
+            anonymization_mode=int(request.anonymization_mode),
+            blur_radius=blur_radius,
+            pixel_size=pixel_size,
+            mask_margin=mask_margin,
+            output=vod.VodOutputOptions(
+                video_encoder=request.output.video_encoder or "auto",
+                quality=int(request.output.quality),
+                force_audio_aac=bool(request.output.force_audio_aac),
+            ),
+        )
+
+    def _resolve_whitelist(self, request) -> vod.VodWhitelist:
+        worker_model = getattr(self.adaface, "embedding_model", None) or ""
+        source = request.WhichOneof("whitelist_source")
+        if source == "whitelist":
+            whitelist = request.whitelist
+            if whitelist.embedding_model != worker_model:
+                raise vod.VodError(
+                    "EMBEDDING_MODEL_MISMATCH",
+                    f"whitelist embedding_model {whitelist.embedding_model!r} "
+                    f"does not match worker {worker_model!r}",
+                )
+            entries = tuple(
+                (entry.entry_id, np.asarray(entry.values, dtype=np.float32))
+                for entry in whitelist.entries
+            )
+            return vod.VodWhitelist(whitelist.embedding_model, entries)
+        if source == "whitelist_session_id":
+            session_id = request.whitelist_session_id
+            known = {summary.session_id for summary in self.sessions.list_summaries()}
+            if session_id not in known:
+                raise vod.VodError(
+                    "WHITELIST_SESSION_NOT_FOUND", f"session {session_id!r} is not on this worker"
+                )
+            snapshot = self.sessions.snapshot(session_id)
+            entries = tuple((entry.entry_id, entry.embedding) for entry in snapshot.entries)
+            return vod.VodWhitelist(worker_model, entries)
+        return vod.VodWhitelist("", ())
+
+    def _limits(self) -> vod.VodLimits:
+        return vod.VodLimits(
+            vod_root=self.settings.vod_root,
+            max_input_bytes=self.settings.vod_max_input_bytes,
+            max_duration_seconds=self.settings.vod_max_duration_seconds,
+            max_long_edge=self.settings.max_long_edge,
+        )
+
+    def _new_status(self, job_id: str, state: int):
+        return messages.VodJobStatus(
+            job_id=job_id,
+            state=state,
+            worker_target=self.worker_target,
+            updated_at_unix_ms=int(time.time() * 1000),
+        )
+
+    def _failed_status(self, job_id: str, code: str, message: str, *, cancelled: bool = False):
+        status = self._new_status(
+            job_id,
+            messages.VOD_JOB_STATE_CANCELLED if cancelled else messages.VOD_JOB_STATE_FAILED,
+        )
+        status.error_code = code
+        status.error_message = message
+        return status
+
+    @staticmethod
+    def _clone(status):
+        copy = messages.VodJobStatus()
+        copy.CopyFrom(status)
+        return copy
+
+
+def _apply_probe(status, probe: vod.VodProbe) -> None:
+    status.width = probe.width
+    status.height = probe.height
+    status.avg_frame_rate = probe.avg_frame_rate
+    status.duration_seconds = probe.duration_seconds
+    status.has_audio = probe.has_audio
+    status.input_size_bytes = probe.size_bytes
+
+
+def _apply_progress(status, snapshot: vod.VodProgressSnapshot) -> None:
+    progress = status.progress
+    progress.frames_done = snapshot.frames_done
+    progress.frames_total = snapshot.frames_total
+    progress.frames_total_estimated = snapshot.frames_total_estimated
+    progress.fraction = snapshot.fraction
+    progress.segments_done = snapshot.segments_done
+    progress.segments_total = snapshot.segments_total
+    progress.processing_fps = snapshot.processing_fps
+    progress.eta_seconds = snapshot.eta_seconds
+    if snapshot.checkpoint_token:
+        status.checkpoint_token = snapshot.checkpoint_token
+    status.updated_at_unix_ms = int(time.time() * 1000)
+
+
 @dataclass(slots=True)
 class GrpcServerBundle:
     server: grpc.aio.Server
     servicer: AiProcessorServicer
     health_servicer: health.aio.HealthServicer
     bound_port: int
+    vod_servicer: VodProcessorServicer | None = None
 
     async def set_serving(self, serving: bool) -> None:
         status = (
@@ -1166,7 +1710,16 @@ def build_grpc_server(
         publish_health=publish_health,
         exit_process=exit_process,
     )
+    vod_servicer = VodProcessorServicer(
+        runtime,
+        settings,
+        sessions=servicer.sessions,
+        adaface=adaface,
+        tracker_factory=tracker_factory,
+    )
+    servicer.vod_servicer = vod_servicer
     ai_processor_pb2_grpc.add_AiProcessorServicer_to_server(servicer, server)
+    ai_processor_pb2_grpc.add_VodProcessorServicer_to_server(vod_servicer, server)
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
     address = listen_address(settings.host, settings.port)
     if settings.ssl_certfile is not None:
@@ -1181,7 +1734,7 @@ def build_grpc_server(
         bound_port = server.add_insecure_port(address)
     if bound_port == 0:
         raise RuntimeError(f"failed to bind gRPC server to {address}")
-    return GrpcServerBundle(server, servicer, health_servicer, bound_port)
+    return GrpcServerBundle(server, servicer, health_servicer, bound_port, vod_servicer)
 
 
 async def serve(settings: GrpcServerSettings) -> None:
@@ -1244,8 +1797,13 @@ async def serve(settings: GrpcServerSettings) -> None:
         startup_gc.close()
         if bundle is not None:
             bundle.servicer.set_accepting(False)
+            if bundle.vod_servicer is not None:
+                # Pause VOD jobs to a durable checkpoint before the server stops.
+                await bundle.vod_servicer.drain(vod.PAUSE_WORKER_DRAINING)
             await bundle.health_servicer.enter_graceful_shutdown()
             await bundle.server.stop(settings.shutdown_grace_seconds)
+            if bundle.vod_servicer is not None:
+                await bundle.vod_servicer.close()
             await bundle.servicer.close()
         if adaface is not None:
             await asyncio.to_thread(adaface.close)
@@ -1415,6 +1973,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-identity-retention-frames", type=positive_int, default=30)
     parser.add_argument("--ssl-certfile", type=Path)
     parser.add_argument("--ssl-keyfile", type=Path)
+    parser.add_argument(
+        "--vod-root",
+        type=Path,
+        default=Path(os.getenv("VOD_ROOT", "/var/lib/innolive/vod")),
+        help="Shared-disk root under which VOD input/output/work_dir paths must resolve.",
+    )
+    parser.add_argument(
+        "--vod-max-jobs",
+        type=int,
+        default=int(os.getenv("VOD_MAX_JOBS", "0")),
+        help=(
+            "Concurrent VOD jobs; default 0 disables VodProcessor "
+            "(all VodProcessor RPCs return UNAVAILABLE); set >0 to enable."
+        ),
+    )
+    parser.add_argument(
+        "--vod-segment-frames", type=positive_int, default=vod.DEFAULT_SEGMENT_FRAMES
+    )
+    parser.add_argument("--vod-warmup-frames", type=int, default=vod.DEFAULT_WARMUP_FRAMES)
+    parser.add_argument(
+        "--vod-max-input-bytes",
+        type=int,
+        default=int(os.getenv("VOD_MAX_INPUT_BYTES", str(vod.DEFAULT_MAX_INPUT_BYTES))),
+    )
+    parser.add_argument(
+        "--vod-max-duration-seconds",
+        type=float,
+        default=float(os.getenv("VOD_MAX_DURATION_SECONDS", str(vod.DEFAULT_MAX_DURATION_SECONDS))),
+    )
+    parser.add_argument(
+        "--vod-job-ttl-seconds",
+        type=float,
+        default=float(os.getenv("VOD_JOB_TTL_SECONDS", "86400")),
+        help=(
+            "How long a DONE/FAILED/CANCELLED VOD job record is retained in memory "
+            "(PAUSED never pruned; disk results untouched)."
+        ),
+    )
+    parser.add_argument(
+        "--vod-max-retained-jobs",
+        type=int,
+        default=int(os.getenv("VOD_MAX_RETAINED_JOBS", "100")),
+        help=(
+            "Max DONE/FAILED/CANCELLED VOD job records kept in memory; oldest evicted first "
+            "(PAUSED never pruned or counted; disk untouched)."
+        ),
+    )
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 
@@ -1477,6 +2082,14 @@ def main() -> None:
         mosaic_max_inflight=arguments.mosaic_max_inflight,
         ssl_certfile=arguments.ssl_certfile,
         ssl_keyfile=arguments.ssl_keyfile,
+        vod_root=arguments.vod_root,
+        vod_max_jobs=arguments.vod_max_jobs,
+        vod_segment_frames=arguments.vod_segment_frames,
+        vod_warmup_frames=arguments.vod_warmup_frames,
+        vod_max_input_bytes=arguments.vod_max_input_bytes,
+        vod_max_duration_seconds=arguments.vod_max_duration_seconds,
+        vod_job_ttl_seconds=arguments.vod_job_ttl_seconds,
+        vod_max_retained_jobs=arguments.vod_max_retained_jobs,
     )
     with suppress(KeyboardInterrupt):
         asyncio.run(serve(settings))

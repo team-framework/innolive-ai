@@ -452,3 +452,304 @@ class AiProcessor:
             timeout,
             metadata,
             _registered_method=True)
+
+
+class VodProcessorStub:
+    """File-in/file-out VOD anonymization on the worker's already-loaded runtime.
+    Live ProcessVideo frames always take precedence on the shared inference lane.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.StartVodJob = channel.unary_unary(
+                '/VodProcessor/StartVodJob',
+                request_serializer=protos_dot_ai__processor__pb2.StartVodJobRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+                _registered_method=True)
+        self.WatchVodJob = channel.unary_stream(
+                '/VodProcessor/WatchVodJob',
+                request_serializer=protos_dot_ai__processor__pb2.VodJobRef.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+                _registered_method=True)
+        self.GetVodJob = channel.unary_unary(
+                '/VodProcessor/GetVodJob',
+                request_serializer=protos_dot_ai__processor__pb2.VodJobRef.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+                _registered_method=True)
+        self.PauseVodJob = channel.unary_unary(
+                '/VodProcessor/PauseVodJob',
+                request_serializer=protos_dot_ai__processor__pb2.PauseVodJobRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+                _registered_method=True)
+        self.CancelVodJob = channel.unary_unary(
+                '/VodProcessor/CancelVodJob',
+                request_serializer=protos_dot_ai__processor__pb2.CancelVodJobRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+                _registered_method=True)
+        self.ListVodJobs = channel.unary_unary(
+                '/VodProcessor/ListVodJobs',
+                request_serializer=protos_dot_ai__processor__pb2.ListVodJobsRequest.SerializeToString,
+                response_deserializer=protos_dot_ai__processor__pb2.ListVodJobsResponse.FromString,
+                _registered_method=True)
+
+
+class VodProcessorServicer:
+    """File-in/file-out VOD anonymization on the worker's already-loaded runtime.
+    Live ProcessVideo frames always take precedence on the shared inference lane.
+    """
+
+    def StartVodJob(self, request, context):
+        """Starts a new job or resumes one from its checkpoint. Returns once the job is
+        admitted (inputs probed, outputs reserved); processing continues asynchronously.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WatchVodJob(self, request, context):
+        """Streams status: first message is the current snapshot, then progress updates.
+        Ends after a PAUSED, DONE, FAILED, or CANCELLED message. Closing it never affects the job.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetVodJob(self, request, context):
+        """One-shot snapshot.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PauseVodJob(self, request, context):
+        """Stops GPU use within one frame, persists the last completed segment, returns PAUSED.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelVodJob(self, request, context):
+        """Stops the job, deletes partial output; with purge_work_dir also deletes checkpoint/segments.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListVodJobs(self, request, context):
+        """Jobs known to this worker process (for server reconciliation after restarts/slot switches).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_VodProcessorServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'StartVodJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartVodJob,
+                    request_deserializer=protos_dot_ai__processor__pb2.StartVodJobRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.VodJobStatus.SerializeToString,
+            ),
+            'WatchVodJob': grpc.unary_stream_rpc_method_handler(
+                    servicer.WatchVodJob,
+                    request_deserializer=protos_dot_ai__processor__pb2.VodJobRef.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.VodJobStatus.SerializeToString,
+            ),
+            'GetVodJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetVodJob,
+                    request_deserializer=protos_dot_ai__processor__pb2.VodJobRef.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.VodJobStatus.SerializeToString,
+            ),
+            'PauseVodJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.PauseVodJob,
+                    request_deserializer=protos_dot_ai__processor__pb2.PauseVodJobRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.VodJobStatus.SerializeToString,
+            ),
+            'CancelVodJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelVodJob,
+                    request_deserializer=protos_dot_ai__processor__pb2.CancelVodJobRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.VodJobStatus.SerializeToString,
+            ),
+            'ListVodJobs': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListVodJobs,
+                    request_deserializer=protos_dot_ai__processor__pb2.ListVodJobsRequest.FromString,
+                    response_serializer=protos_dot_ai__processor__pb2.ListVodJobsResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'VodProcessor', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('VodProcessor', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class VodProcessor:
+    """File-in/file-out VOD anonymization on the worker's already-loaded runtime.
+    Live ProcessVideo frames always take precedence on the shared inference lane.
+    """
+
+    @staticmethod
+    def StartVodJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/VodProcessor/StartVodJob',
+            protos_dot_ai__processor__pb2.StartVodJobRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WatchVodJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/VodProcessor/WatchVodJob',
+            protos_dot_ai__processor__pb2.VodJobRef.SerializeToString,
+            protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetVodJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/VodProcessor/GetVodJob',
+            protos_dot_ai__processor__pb2.VodJobRef.SerializeToString,
+            protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PauseVodJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/VodProcessor/PauseVodJob',
+            protos_dot_ai__processor__pb2.PauseVodJobRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelVodJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/VodProcessor/CancelVodJob',
+            protos_dot_ai__processor__pb2.CancelVodJobRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.VodJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListVodJobs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/VodProcessor/ListVodJobs',
+            protos_dot_ai__processor__pb2.ListVodJobsRequest.SerializeToString,
+            protos_dot_ai__processor__pb2.ListVodJobsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

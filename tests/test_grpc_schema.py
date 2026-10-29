@@ -205,6 +205,57 @@ class GrpcSchemaContractTests(unittest.TestCase):
         self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_METADATA_ONLY"].number, 1)
         self.assertEqual(output_modes["VIDEO_OUTPUT_MODE_MOSAIC_JPEG"].number, 2)
 
+    def test_vod_processor_service_is_additive_and_stable(self):
+        service = ai_processor_pb2.DESCRIPTOR.services_by_name["VodProcessor"]
+        self.assertEqual(service.full_name, "VodProcessor")
+        streaming = {
+            "StartVodJob": (False, False, "StartVodJobRequest", "VodJobStatus"),
+            "WatchVodJob": (False, True, "VodJobRef", "VodJobStatus"),
+            "GetVodJob": (False, False, "VodJobRef", "VodJobStatus"),
+            "PauseVodJob": (False, False, "PauseVodJobRequest", "VodJobStatus"),
+            "CancelVodJob": (False, False, "CancelVodJobRequest", "VodJobStatus"),
+            "ListVodJobs": (False, False, "ListVodJobsRequest", "ListVodJobsResponse"),
+        }
+        for name, (client_stream, server_stream, request, response) in streaming.items():
+            method = service.methods_by_name[name]
+            self.assertEqual(method.client_streaming, client_stream)
+            self.assertEqual(method.server_streaming, server_stream)
+            self.assertEqual(method.input_type.full_name, request)
+            self.assertEqual(method.output_type.full_name, response)
+
+        channel = Mock()
+        ai_processor_pb2_grpc.VodProcessorStub(channel)
+        self.assertEqual(
+            channel.unary_stream.call_args_list[0].args[0], "/VodProcessor/WatchVodJob"
+        )
+
+    def test_vod_messages_keep_their_field_numbers(self):
+        status_fields = {
+            field.name: field.number for field in ai_processor_pb2.VodJobStatus.DESCRIPTOR.fields
+        }
+        self.assertEqual(status_fields["job_id"], 1)
+        self.assertEqual(status_fields["state"], 2)
+        self.assertEqual(status_fields["checkpoint_token"], 4)
+        self.assertEqual(status_fields["worker_target"], 15)
+        self.assertEqual(status_fields["input_size_bytes"], 16)
+
+        request = ai_processor_pb2.StartVodJobRequest.DESCRIPTOR
+        self.assertEqual(request.fields_by_name["whitelist"].number, 5)
+        self.assertEqual(request.fields_by_name["whitelist_session_id"].number, 6)
+        self.assertEqual(request.fields_by_name["segment_frames"].number, 14)
+        self.assertEqual(
+            request.oneofs_by_name["whitelist_source"].name,
+            "whitelist_source",
+        )
+
+        states = ai_processor_pb2.VodJobState.DESCRIPTOR.values_by_name
+        self.assertEqual(states["VOD_JOB_STATE_PROCESSING"].number, 1)
+        self.assertEqual(states["VOD_JOB_STATE_CANCELLED"].number, 5)
+        self.assertEqual(ai_processor_pb2.VOD_QUALITY_HIGH, 1)
+        pause = ai_processor_pb2.VodPauseReason.DESCRIPTOR.values_by_name
+        self.assertEqual(pause["VOD_PAUSE_REASON_WORKER_DRAINING"].number, 2)
+        self.assertEqual(pause["VOD_PAUSE_REASON_RUNTIME_RECOVERY"].number, 3)
+
     def test_mask_margin_is_compatible_with_legacy_mosaic_config_readers_and_writers(self):
         file = descriptor_pb2.FileDescriptorProto(name="legacy_mosaic.proto", syntax="proto3")
         message = file.message_type.add(name="MosaicConfig")
