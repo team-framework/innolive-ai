@@ -58,6 +58,15 @@ DEFAULT_ENCODE_QUALITY = 20
 CHECKPOINT_VERSION = 1
 # Audio codecs MP4 can carry without re-encoding.
 COPYABLE_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "ac3", "eac3", "alac"})
+# Codecs we can copy or re-encode to AAC. Apple spatial (apac) and similar are skipped.
+REENCODEABLE_AUDIO_CODECS = COPYABLE_AUDIO_CODECS | {
+    "pcm_s16le",
+    "pcm_s16be",
+    "pcm_s24le",
+    "pcm_s24be",
+    "pcm_f32le",
+    "pcm_f32be",
+}
 _FPS_EWMA_ALPHA = 0.2
 
 # Run states returned by VodJob.run; FAILED surfaces as a raised VodError.
@@ -981,12 +990,18 @@ class VodJob:
         probe = self.probe
         assert probe is not None
         args: list[str] = []
+        out_index = 0
         for index, codec in enumerate(probe.audio_codecs):
+            codec_name = str(codec or "").lower()
+            # Drop Apple spatial/APAC and other tracks ffmpeg cannot remux/re-encode here.
+            if codec_name not in REENCODEABLE_AUDIO_CODECS:
+                continue
             args.extend(["-map", f"1:a:{index}"])
-            if self.config.output.force_audio_aac or codec not in COPYABLE_AUDIO_CODECS:
-                args.extend([f"-c:a:{index}", "aac", f"-b:a:{index}", "192k"])
+            if self.config.output.force_audio_aac or codec_name not in COPYABLE_AUDIO_CODECS:
+                args.extend([f"-c:a:{out_index}", "aac", f"-b:a:{out_index}", "192k"])
             else:
-                args.extend([f"-c:a:{index}", "copy"])
+                args.extend([f"-c:a:{out_index}", "copy"])
+            out_index += 1
         return args
 
     # -- progress ---------------------------------------------------------
