@@ -56,6 +56,8 @@ DEFAULT_MAX_INPUT_BYTES = 2_147_483_648  # 2 GiB (MVP)
 DEFAULT_MAX_DURATION_SECONDS = 3600.0  # 60 min (MVP)
 DEFAULT_ENCODE_QUALITY = 20
 CHECKPOINT_VERSION = 1
+# Primary camera video codecs (ignore MJPEG/PNG cover-art video tracks on iPhone MOV).
+PRIMARY_VIDEO_CODECS = frozenset({"h264", "hevc", "h265"})
 # Audio codecs MP4 can carry without re-encoding.
 COPYABLE_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "ac3", "eac3", "alac"})
 # Codecs we can copy or re-encode to AAC. Apple spatial (apac) and similar are skipped.
@@ -284,7 +286,13 @@ def probe_input(path: Path) -> VodProbe:
         raise VodError("INPUT_UNREADABLE", "ffprobe returned invalid JSON") from error
 
     streams = parsed.get("streams", [])
-    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    # iPhone .MOV often adds MJPEG preview + APAC/spatial audio + mebx metadata.
+    video_streams = [
+        s
+        for s in streams
+        if s.get("codec_type") == "video"
+        and str(s.get("codec_name", "")).casefold() in PRIMARY_VIDEO_CODECS
+    ]
     audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
 
     duration = _probe_duration(parsed, video_streams)
