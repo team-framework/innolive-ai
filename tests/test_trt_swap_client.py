@@ -41,8 +41,9 @@ from service.mosaic import (
 )
 
 
-def test_fallback_composition_matches_existing_mosaic_mechanism() -> None:
-    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape((64, 64, 3))
+@pytest.mark.parametrize("height,width", [(64, 64), (67, 99), (240, 320)])
+def test_fallback_composition_matches_existing_mosaic_mechanism(height, width) -> None:
+    image = np.arange(height * width * 3, dtype=np.uint8).reshape((height, width, 3))
     objects = [
         {
             "class_id": 0,
