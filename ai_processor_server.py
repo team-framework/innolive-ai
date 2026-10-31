@@ -1334,6 +1334,18 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             ),
             name=f"vod-{job_id}",
         )
+
+        def admission_done(task: asyncio.Task) -> None:
+            # A task cancelled before its first step never enters _run_job's finally block.
+            if not started.done() and task.cancelled():
+                handle.status.state = messages.VOD_JOB_STATE_CANCELLED
+                handle.status.error_code = "CANCELLED"
+                handle.status.updated_at_unix_ms = int(time.time() * 1000)
+                self._mark_terminal_if_needed(handle)
+                handle.notify()
+                started.set_result(self._clone(handle.status))
+
+        handle.task.add_done_callback(admission_done)
         try:
             return await asyncio.shield(started)
         except asyncio.CancelledError:

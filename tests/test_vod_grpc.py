@@ -429,6 +429,38 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(server.bundle.servicer)
 
 
+class VodAdmissionSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_before_worker_task_starts_completes_admission(self):
+        from ai_processor_server import VodProcessorServicer
+
+        settings = GrpcServerSettings(
+            runtime=RuntimeConfig(engine=Path("unused.engine")),
+            tracker_config=Path("unused.yaml"),
+            vod_max_jobs=1,
+        )
+        servicer = VodProcessorServicer(
+            SlowRuntime(),
+            settings,
+            sessions=SessionRegistry(),
+            adaface=None,
+        )
+        servicer.set_accepting(True)
+        create_task = asyncio.create_task
+
+        def cancel_before_running(coroutine, **kwargs):
+            task = create_task(coroutine, **kwargs)
+            task.cancel()
+            return task
+
+        with patch("ai_processor_server.asyncio.create_task", cancel_before_running):
+            result = await asyncio.wait_for(
+                servicer.StartVodJob(_start_request(Path("unused"), "pre-start"), _FakeContext()),
+                timeout=2,
+            )
+        self.assertEqual(result.state, messages.VOD_JOB_STATE_CANCELLED)
+        self.assertTrue(servicer._jobs["pre-start"].task.cancelled())
+
+
 class VodMaxJobsDefaultTests(unittest.TestCase):
     def test_settings_default_disables_vod(self):
         settings = GrpcServerSettings(
