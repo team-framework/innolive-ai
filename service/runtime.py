@@ -513,13 +513,10 @@ class RuntimeManager:
                 polygon = np.asarray(polygons[detection_index], dtype=np.float32)
                 if len(polygon):
                     polygon = _limit_polygon_points(polygon)
-                    points = [
-                        [
-                            round(float(np.clip(x, 0, width - 1)), 1),
-                            round(float(np.clip(y, 0, height - 1)), 1),
-                        ]
-                        for x, y in polygon
-                    ]
+                    # Clip the whole contour once. Keep Python round on Python floats:
+                    # NumPy's decimal rounding can change client-visible boundary coordinates.
+                    clipped = np.clip(polygon, (0, 0), (width - 1, height - 1))
+                    points = [[round(x, 1), round(y, 1)] for x, y in clipped.tolist()]
             x1, y1, x2, y2 = (float(value) for value in row[:4])
             area = (
                 float(cv2.contourArea(np.asarray(points, dtype=np.float32)))
