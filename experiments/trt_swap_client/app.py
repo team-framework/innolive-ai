@@ -41,7 +41,7 @@ from experiments.trt_swap_client.video_io import (
 )
 from service.adaface_model import DEFAULT_FACE_DETECTOR, AdaFaceConfig, AdaFaceRuntime
 from service.detection import is_face_object, is_number_plate_object
-from service.mosaic import DEFAULT_BLUR_RADIUS, DEFAULT_PIXEL_SIZE, MASK_FEATHER_RADIUS
+from service.mosaic import mosaic_bgr
 from service.recognition import RecognitionConfig, SessionRegistry, StreamRecognition
 from service.runtime import IMAGE_SIZE, MAX_DETECTIONS, MAX_POLYGON_POINTS
 from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
@@ -2302,46 +2302,7 @@ def _polygon_area(polygon: np.ndarray) -> float:
 def _blur_objects(image: np.ndarray, items: list[dict[str, Any]]) -> np.ndarray:
     """Apply the production fallback algorithm once, after all swap attempts."""
 
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    for item in items:
-        polygon = np.rint(np.asarray(item["mask_polygon"], dtype=np.float32)).astype(np.int32)
-        cv2.fillPoly(mask, [polygon], 255)
-    if not np.any(mask):
-        return image
-    if MASK_FEATHER_RADIUS > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (MASK_FEATHER_RADIUS * 2 + 1, MASK_FEATHER_RADIUS * 2 + 1)
-        )
-        expanded = cv2.dilate(mask, kernel)
-        distance = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        alpha_mask = np.minimum(distance / MASK_FEATHER_RADIUS, 1.0) * 255.0
-        alpha_mask = np.rint(alpha_mask).astype(np.uint8)
-        alpha_mask[mask != 0] = 255
-    else:
-        alpha_mask = mask
-    rows, columns = np.nonzero(alpha_mask)
-    padding = int(np.ceil(DEFAULT_BLUR_RADIUS * 3))
-    top = max(0, int(rows.min()) - padding)
-    bottom = min(image.shape[0], int(rows.max()) + padding + 1)
-    left = max(0, int(columns.min()) - padding)
-    right = min(image.shape[1], int(columns.max()) + padding + 1)
-    region = image[top:bottom, left:right]
-    reduced_size = (
-        max(1, int(np.ceil(region.shape[1] / DEFAULT_PIXEL_SIZE))),
-        max(1, int(np.ceil(region.shape[0] / DEFAULT_PIXEL_SIZE))),
-    )
-    reduced = cv2.resize(region, reduced_size, interpolation=cv2.INTER_AREA)
-    blurred = cv2.resize(
-        cv2.GaussianBlur(reduced, (0, 0), DEFAULT_BLUR_RADIUS / DEFAULT_PIXEL_SIZE),
-        (region.shape[1], region.shape[0]),
-        interpolation=cv2.INTER_LINEAR,
-    )
-    output = image.copy()
-    alpha = alpha_mask[top:bottom, left:right, None].astype(np.uint32)
-    output[top:bottom, left:right] = (
-        region.astype(np.uint32) * (255 - alpha) + blurred.astype(np.uint32) * alpha + 127
-    ) // 255
-    return output
+    return mosaic_bgr(image, items)
 
 
 def _iou(left: Any, right: list[float]) -> float:
