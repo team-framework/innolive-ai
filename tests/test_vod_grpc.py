@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import grpc
 import numpy as np
@@ -14,6 +15,7 @@ import numpy as np
 from ai_processor_server import GrpcServerSettings, build_grpc_server
 from protos import ai_processor_pb2 as messages
 from protos import ai_processor_pb2_grpc
+from service import vod
 from service.recognition import SessionRegistry
 from service.runtime import RuntimeConfig
 
@@ -255,6 +257,117 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
                 await server.stub.StartVodJob(_start_request(self.tmp, "job-b"))
             self.assertEqual(rejected.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
 
+    async def test_disconnected_start_releases_admission_slot(self):
+        entered, interrupted = asyncio.Event(), asyncio.Event()
+        validate = vod.VodJob.validate
+
+        async def delayed(job, **kwargs):
+            if job.job_id == "disconnected":
+                entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    interrupted.set()
+            return await validate(job, **kwargs)
+
+        async with VodLoopback(SlowRuntime(), self.tmp) as server:
+            with patch.object(vod.VodJob, "validate", delayed):
+                call = server.stub.StartVodJob(_start_request(self.tmp, "disconnected"))
+                await asyncio.wait_for(entered.wait(), 2)
+                call.cancel()
+                await asyncio.wait_for(interrupted.wait(), 2)
+                cancelled = await _poll_until(
+                    server.stub,
+                    "disconnected",
+                    lambda status: status.state == messages.VOD_JOB_STATE_CANCELLED,
+                )
+                self.assertEqual(cancelled.error_code, "CANCELLED")
+                self.assertFalse((self.tmp / "disconnected-work").exists())
+                replacement = await server.stub.StartVodJob(_start_request(self.tmp, "replacement"))
+                self.assertEqual(replacement.state, messages.VOD_JOB_STATE_PROCESSING)
+                final = await _watch_to_terminal(server.stub, "replacement")
+                self.assertEqual(final.state, messages.VOD_JOB_STATE_DONE)
+
+    async def test_cancel_rpc_during_validation_never_starts_processing(self):
+        entered = asyncio.Event()
+
+        async def delayed(_job, **_kwargs):
+            entered.set()
+            await asyncio.Future()
+
+        async with VodLoopback(SlowRuntime(), self.tmp) as server:
+            with patch.object(vod.VodJob, "validate", delayed):
+                start = server.stub.StartVodJob(_start_request(self.tmp, "cancel-admission"))
+                await asyncio.wait_for(entered.wait(), 2)
+                cancelled = await server.stub.CancelVodJob(
+                    messages.CancelVodJobRequest(job_id="cancel-admission", purge_work_dir=True),
+                    timeout=2,
+                )
+                initial = await asyncio.wait_for(start, 2)
+                self.assertEqual(initial.state, messages.VOD_JOB_STATE_CANCELLED)
+                self.assertEqual(cancelled.state, messages.VOD_JOB_STATE_CANCELLED)
+                self.assertFalse((self.tmp / "cancel-admission.mp4").exists())
+                self.assertFalse((self.tmp / "cancel-admission-work").exists())
+
+    async def test_pause_during_validation_remains_resumable(self):
+        await self._pause_during_validation(drain=False)
+
+    async def test_drain_during_validation_remains_resumable(self):
+        await self._pause_during_validation(drain=True)
+
+    async def _pause_during_validation(self, *, drain):
+        entered, release, pause_requested = (asyncio.Event(), asyncio.Event(), asyncio.Event())
+        validate, request_pause = vod.VodJob.validate, vod.VodJob.request_pause
+
+        async def delayed(job, **kwargs):
+            entered.set()
+            await release.wait()
+            return await validate(job, **kwargs)
+
+        def pause(job, reason=vod.PAUSE_REQUESTED):
+            request_pause(job, reason)
+            pause_requested.set()
+
+        job_id = f"pause-admission-{drain}"
+        async with VodLoopback(SlowRuntime(), self.tmp) as server:
+            with (
+                patch.object(vod.VodJob, "validate", delayed),
+                patch.object(vod.VodJob, "request_pause", pause),
+            ):
+                start = server.stub.StartVodJob(_start_request(self.tmp, job_id))
+                await asyncio.wait_for(entered.wait(), 2)
+                if drain:
+                    server.bundle.servicer.set_accepting(False)
+                    pause_call = None
+                else:
+                    pause_call = server.stub.PauseVodJob(messages.PauseVodJobRequest(job_id=job_id))
+                await asyncio.wait_for(pause_requested.wait(), 2)
+                release.set()
+                initial = await asyncio.wait_for(start, 2)
+                self.assertEqual(initial.state, messages.VOD_JOB_STATE_PROCESSING)
+                self.assertEqual((initial.width, initial.height), (320, 240))
+                paused = await _watch_to_terminal(server.stub, job_id)
+                self.assertEqual(paused.state, messages.VOD_JOB_STATE_PAUSED)
+                expected = vod.PAUSE_WORKER_DRAINING if drain else vod.PAUSE_REQUESTED
+                self.assertEqual(paused.pause_reason, expected)
+                if pause_call is not None:
+                    self.assertEqual((await pause_call).state, messages.VOD_JOB_STATE_PAUSED)
+            server.bundle.servicer.set_accepting(True)
+            await server.stub.StartVodJob(_start_request(self.tmp, job_id, resume=True))
+            self.assertEqual(
+                (await _watch_to_terminal(server.stub, job_id)).state,
+                messages.VOD_JOB_STATE_DONE,
+            )
+
+    async def test_unexpected_validation_error_releases_slot(self):
+        async with VodLoopback(SlowRuntime(), self.tmp) as server:
+            with patch.object(vod.VodJob, "validate", side_effect=OSError("probe failed")):
+                failed = await server.stub.StartVodJob(_start_request(self.tmp, "probe-error"))
+            self.assertEqual(failed.state, messages.VOD_JOB_STATE_FAILED)
+            self.assertEqual(failed.error_code, "INTERNAL")
+            replacement = await server.stub.StartVodJob(_start_request(self.tmp, "after-error"))
+            self.assertEqual(replacement.state, messages.VOD_JOB_STATE_PROCESSING)
+
     async def test_draining_auto_pauses_and_rejects_new_jobs(self):
         async with VodLoopback(SlowRuntime(0.01), self.tmp) as server:
             await server.stub.StartVodJob(_start_request(self.tmp, "job-drain"))
@@ -314,6 +427,38 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
 
             # The live AiProcessor service stays healthy on a disabled worker.
             self.assertIsNotNone(server.bundle.servicer)
+
+
+class VodAdmissionSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_before_worker_task_starts_completes_admission(self):
+        from ai_processor_server import VodProcessorServicer
+
+        settings = GrpcServerSettings(
+            runtime=RuntimeConfig(engine=Path("unused.engine")),
+            tracker_config=Path("unused.yaml"),
+            vod_max_jobs=1,
+        )
+        servicer = VodProcessorServicer(
+            SlowRuntime(),
+            settings,
+            sessions=SessionRegistry(),
+            adaface=None,
+        )
+        servicer.set_accepting(True)
+        create_task = asyncio.create_task
+
+        def cancel_before_running(coroutine, **kwargs):
+            task = create_task(coroutine, **kwargs)
+            task.cancel()
+            return task
+
+        with patch("ai_processor_server.asyncio.create_task", cancel_before_running):
+            result = await asyncio.wait_for(
+                servicer.StartVodJob(_start_request(Path("unused"), "pre-start"), _FakeContext()),
+                timeout=2,
+            )
+        self.assertEqual(result.state, messages.VOD_JOB_STATE_CANCELLED)
+        self.assertTrue(servicer._jobs["pre-start"].task.cancelled())
 
 
 class VodMaxJobsDefaultTests(unittest.TestCase):
