@@ -47,7 +47,7 @@ jobs:
       OMP_NUM_THREADS: '1'
       MKL_NUM_THREADS: '1'
       OPENBLAS_NUM_THREADS: '1'
-      YOLO_CONFIG_DIR: ${{ runner.temp }}/ultralytics
+      YOLO_CONFIG_DIR: /tmp/innolive-ci-ultralytics
     steps:
       - uses: actions/checkout@v4
         with:
