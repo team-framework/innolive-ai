@@ -2,4 +2,5 @@
 -r requirements-webrtc.txt
 httpx2>=2.9,<3
 grpcio-tools>=1.81.1,<1.82
+pytest>=9.1,<10
 ruff>=0.12,<1

@@ -1,0 +1,81 @@
+name: Pipeline Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Pipeline / lint and browser contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install lint tooling
+        run: python -m pip install 'ruff>=0.12,<1'
+      - name: Lint product code and tests
+        run: python -m ruff check server.py ai_processor_server.py grpc_client.py service scripts tests
+      - name: Check browser wire compatibility
+        run: node --test tests/test_web.mjs
+
+  cpu-tests:
+    name: Pipeline / CPU tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
+    env:
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      YOLO_CONFIG_DIR: ${{ runner.temp }}/ultralytics
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+            requirements-webrtc.txt
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Install CPU runtime and test dependencies
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --constraint requirements.txt torch torchvision
+          python -m pip install -r requirements-test.txt
+          python -m pip check
+      - name: Test live, VOD, client and protocol compatibility
+        run: python -m pytest tests -q -ra --junitxml=test-results.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-tests-python-${{ matrix.python-version }}
+          path: test-results.xml
+          if-no-files-found: warn
+          retention-days: 14
