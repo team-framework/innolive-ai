@@ -17,12 +17,13 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 
@@ -56,6 +57,9 @@ DEFAULT_MAX_INPUT_BYTES = 2_147_483_648  # 2 GiB (MVP)
 DEFAULT_MAX_DURATION_SECONDS = 3600.0  # 60 min (MVP)
 DEFAULT_ENCODE_QUALITY = 20
 CHECKPOINT_VERSION = 1
+FFPROBE_TIMEOUT_SECONDS = 30.0
+FFMPEG_EXIT_TIMEOUT_SECONDS = 30.0
+MAX_FFMPEG_ERROR_BYTES = 65_536
 # Audio codecs MP4 can carry without re-encoding.
 COPYABLE_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "ac3", "eac3", "alac"})
 _FPS_EWMA_ALPHA = 0.2
@@ -261,12 +265,16 @@ def probe_input(path: Path) -> VodProbe:
     """Run ffprobe and return source facts, raising VodError with a §6 code on failure."""
 
     ffprobe = _require_binary("ffprobe")
-    completed = subprocess.run(
-        [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise VodError("INPUT_UNREADABLE", "ffprobe timed out") from error
     if completed.returncode != 0:
         raise VodError("INPUT_UNREADABLE", f"ffprobe failed: {completed.stderr.strip()}")
     try:
@@ -364,6 +372,23 @@ def _displayed_dimensions(video: dict[str, Any]) -> tuple[int, int]:
     return width, height
 
 
+def _spawn_ffmpeg(command: list[str], **kwargs: Any) -> tuple[subprocess.Popen[bytes], BinaryIO]:
+    # A pipe drained only at EOF can fill while raw frames are still being transferred.
+    # An anonymous file keeps stderr off that flow-control path and is closed with the child.
+    stderr = tempfile.TemporaryFile()  # noqa: SIM115 - ownership transfers to the decoder/encoder
+    try:
+        return subprocess.Popen(command, stderr=stderr, **kwargs), stderr
+    except BaseException:
+        stderr.close()
+        raise
+
+
+def _read_ffmpeg_stderr(stderr: BinaryIO) -> str:
+    stderr.seek(0, os.SEEK_END)
+    stderr.seek(max(0, stderr.tell() - MAX_FFMPEG_ERROR_BYTES))
+    return stderr.read().decode("utf-8", errors="replace")
+
+
 class _FfmpegDecoder:
     """Decode the input to a sequential bgr24 pipe (autorotate applied)."""
 
@@ -371,7 +396,7 @@ class _FfmpegDecoder:
         self.width = width
         self.height = height
         self._frame_bytes = width * height * 3
-        self._process = subprocess.Popen(
+        self._process, self._stderr = _spawn_ffmpeg(
             [
                 ffmpeg,
                 "-nostdin",
@@ -389,7 +414,6 @@ class _FfmpegDecoder:
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
         )
 
     def read(self) -> np.ndarray | None:
@@ -404,20 +428,25 @@ class _FfmpegDecoder:
     def finish(self) -> None:
         """Wait for a clean EOF; raise DECODER_FAILED on a non-zero exit."""
 
-        if self._process.stdout is not None:
-            self._process.stdout.close()
-        returncode = self._process.wait()
-        stderr = self._read_stderr()
-        if returncode not in (0, None):
-            _raise_ffmpeg("DECODER_FAILED", returncode, stderr)
+        try:
+            if self._process.stdout is not None:
+                self._process.stdout.close()
+            returncode = self._process.wait(timeout=FFMPEG_EXIT_TIMEOUT_SECONDS)
+            if returncode not in (0, None):
+                _raise_ffmpeg("DECODER_FAILED", returncode, self._read_stderr())
+        except subprocess.TimeoutExpired as error:
+            raise VodError("DECODER_FAILED", "decoder did not exit after EOF") from error
+        finally:
+            self.close()
 
     def close(self) -> None:
-        _terminate(self._process)
+        try:
+            _terminate(self._process)
+        finally:
+            self._stderr.close()
 
     def _read_stderr(self) -> str:
-        if self._process.stderr is None:
-            return ""
-        return self._process.stderr.read().decode("utf-8", errors="replace")
+        return _read_ffmpeg_stderr(self._stderr)
 
 
 class _FfmpegSegmentEncoder:
@@ -440,7 +469,7 @@ class _FfmpegSegmentEncoder:
             codec_args = ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", str(quality)]
         else:
             codec_args = ["-c:v", "libx264", "-preset", "medium", "-crf", str(quality)]
-        self._process = subprocess.Popen(
+        self._process, self._stderr = _spawn_ffmpeg(
             [
                 ffmpeg,
                 "-nostdin",
@@ -467,7 +496,6 @@ class _FfmpegSegmentEncoder:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
         )
 
     def write(self, frame: np.ndarray) -> None:
@@ -482,26 +510,32 @@ class _FfmpegSegmentEncoder:
             ) from error
 
     def finish(self) -> None:
-        if self._process.stdin is not None:
-            self._process.stdin.close()
-        returncode = self._process.wait()
-        if returncode not in (0, None):
-            _raise_ffmpeg("ENCODER_FAILED", returncode, self._read_stderr())
+        try:
+            if self._process.stdin is not None:
+                self._process.stdin.close()
+            returncode = self._process.wait(timeout=FFMPEG_EXIT_TIMEOUT_SECONDS)
+            if returncode not in (0, None):
+                _raise_ffmpeg("ENCODER_FAILED", returncode, self._read_stderr())
+        except subprocess.TimeoutExpired as error:
+            raise VodError("ENCODER_FAILED", "encoder did not exit after EOF") from error
+        except BrokenPipeError as error:
+            raise _ffmpeg_error(
+                "ENCODER_FAILED", self._process.poll(), self._read_stderr()
+            ) from error
+        finally:
+            self.close()
 
     def close(self) -> None:
-        _terminate(self._process)
+        try:
+            _terminate(self._process)
+        finally:
+            self._stderr.close()
 
     def _read_stderr(self) -> str:
-        if self._process.stderr is None:
-            return ""
-        return self._process.stderr.read().decode("utf-8", errors="replace")
+        return _read_ffmpeg_stderr(self._stderr)
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            with contextlib.suppress(OSError):
-                stream.close()
     if process.poll() is None:
         process.terminate()
         try:
@@ -509,6 +543,11 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=2)
+    # Stop the child before closing buffered pipes: another thread may be blocked in read/write.
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
 
 
 def _ffmpeg_error(code: str, returncode: int | None, stderr: str) -> VodError:
@@ -767,7 +806,7 @@ class VodJob:
             while True:
                 if self._stop.is_set():
                     if encoder is not None:
-                        encoder.close()
+                        await asyncio.to_thread(encoder.close)
                         _unlink(segments_dir / f"{segment_index:06d}.mp4")
                     await asyncio.to_thread(decoder.close)
                     return VodRunResult(
@@ -827,7 +866,7 @@ class VodJob:
                 encoder = None
                 self._emit_progress(frames_done, state, committed_token, committed=True)
             elif encoder is not None:
-                encoder.close()
+                await asyncio.to_thread(encoder.close)
 
             await asyncio.to_thread(
                 self._finalize, ffmpeg, input_path, output_path, segments_dir, state
@@ -844,7 +883,7 @@ class VodJob:
             return VodRunResult(STATE_DONE, committed_token, output_path=str(output_path))
         finally:
             if encoder is not None:
-                encoder.close()
+                await asyncio.to_thread(encoder.close)
             await asyncio.to_thread(decoder.close)
             recognition.close()
             with contextlib.suppress(Exception):

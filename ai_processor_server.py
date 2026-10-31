@@ -1320,24 +1320,30 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         handle.job = job
         self._jobs[job_id] = handle
         self._prune_jobs()
-        try:
-            probe = await job.validate(overwrite_output=request.overwrite_output)
-        except vod.VodError as error:
-            handle.status.state = messages.VOD_JOB_STATE_FAILED
-            handle.status.error_code = error.code
-            handle.status.error_message = error.message
-            self._mark_terminal_if_needed(handle)
-            handle.notify()
-            return self._clone(handle.status)
-        _apply_probe(handle.status, probe)
-
+        started = asyncio.get_running_loop().create_future()
+        # The worker owns admission as well as processing, so control RPCs can cancel or
+        # pause a job while ffprobe is still running.
         handle.task = asyncio.create_task(
             self._run_job(
-                handle, job, request.resume, request.checkpoint_token, request.overwrite_output
+                handle,
+                job,
+                request.resume,
+                request.checkpoint_token,
+                request.overwrite_output,
+                started,
             ),
             name=f"vod-{job_id}",
         )
-        return self._clone(handle.status)
+        try:
+            return await asyncio.shield(started)
+        except asyncio.CancelledError:
+            # A disconnected caller must not leave an unstarted job occupying a slot.
+            # Once admission completed, the job has the usual independent lifetime.
+            if not started.done():
+                handle.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await handle.task
+            raise
 
     async def _run_job(
         self,
@@ -1346,8 +1352,12 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
         resume: bool,
         checkpoint_token: str,
         overwrite: bool,
+        started: asyncio.Future,
     ) -> None:
         try:
+            probe = await job.validate(overwrite_output=overwrite)
+            _apply_probe(handle.status, probe)
+            started.set_result(self._clone(handle.status))
             result = await job.run(
                 resume=resume, checkpoint_token=checkpoint_token, overwrite_output=overwrite
             )
@@ -1359,6 +1369,8 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             else:
                 handle.status.pause_reason = result.pause_reason
         except asyncio.CancelledError:
+            handle.status.state = messages.VOD_JOB_STATE_CANCELLED
+            handle.status.error_code = "CANCELLED"
             raise
         except vod.VodError as error:
             handle.status.state = messages.VOD_JOB_STATE_FAILED
@@ -1373,6 +1385,8 @@ class VodProcessorServicer(ai_processor_pb2_grpc.VodProcessorServicer):
             handle.status.updated_at_unix_ms = int(time.time() * 1000)
             self._mark_terminal_if_needed(handle)
             handle.notify()
+            if not started.done():
+                started.set_result(self._clone(handle.status))
 
     async def WatchVodJob(self, request, context) -> AsyncIterator:
         await self._require_enabled(context)
