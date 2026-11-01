@@ -207,6 +207,11 @@ PORT=9090 SOURCE_IMAGE=~/Documents/input.png ./run.sh
 - 입력 문제(없음·미지원·한도 초과·checkpoint 불일치)는 RPC 오류가 아니라 `state=FAILED` + `error_code`로 응답
 - `set_accepting(False)`(rolling replace)·종료·runtime 회복 시 잡을 스스로 PAUSED로 전환
 
+진행 중 `progress.fraction`은 최대 `0.99`이며, 최종 파일 저장과 정리가 끝나 `DONE`으로
+전환될 때만 `1.0`이 됩니다. 프레임 수·FPS·ETA 필드의 계산 방식은 유지합니다.
+작업 폴더 생성·checkpoint 저장·출력 파일 확정 중 Python 파일 작업의 `ENOSPC`도
+FFmpeg 공간 부족과 같은 `DISK_FULL` 코드로 보고합니다.
+
 워커 플래그(env): `--vod-root`(`VOD_ROOT`, 기본 `/var/lib/innolive/vod`),
 `--vod-max-jobs`(`VOD_MAX_JOBS`, 기본 0(비활성, 모든 RPC `UNAVAILABLE`), 1 이상이면 활성),
 `--vod-segment-frames`(300), `--vod-warmup-frames`(30),
