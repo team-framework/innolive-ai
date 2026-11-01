@@ -330,7 +330,9 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
                     next_id = f"job-after-{error_number}"
                     await server.stub.StartVodJob(_start_request(self.tmp, next_id))
                     recovered = await _watch_to_terminal(server.stub, next_id)
-                    self.assertEqual(recovered.state, messages.VOD_JOB_STATE_DONE)
+                    self.assertEqual(
+                        recovered.state, messages.VOD_JOB_STATE_DONE, recovered.error_message
+                    )
                     self.assertEqual(recovered.progress.fraction, 1.0)
                     self.assertEqual(_frame_count(Path(recovered.output_path)), self.input_frames)
 
