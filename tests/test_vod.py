@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -171,6 +172,8 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
         frames = [snapshot.frames_done for snapshot in snapshots]
         self.assertEqual(frames, sorted(frames))
         self.assertGreaterEqual(len([s for s in snapshots if s.segments_done]), 1)
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots[:-1]))
+        self.assertEqual(snapshots[-1].fraction, 1.0)
 
     async def test_resume_without_committed_checkpoint_starts_fresh(self):
         runtime = FakeRuntime()
@@ -179,6 +182,23 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.state, vod.STATE_DONE)
         self.assertEqual(_video_frame_count(Path(result.output_path)), self.input_frames)
+
+    async def test_pause_after_last_frame_does_not_report_completion(self):
+        snapshots = []
+        job = _job(self.tmp, FakeRuntime(), input_path=self.sample)
+
+        def progress(snapshot, committed):
+            snapshots.append(snapshot)
+            if committed and snapshot.frames_done == self.input_frames:
+                job.request_pause()
+
+        job._progress_callback = progress
+        result = await job.run()
+        self.assertEqual(result.state, vod.STATE_PAUSED)
+        self.assertTrue(result.checkpoint_token)
+        self.assertEqual(snapshots[-1].frames_done, self.input_frames)
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
+        self.assertFalse((self.tmp / "out.mp4").exists())
 
     async def test_pause_then_resume_completes_with_exact_frame_count(self):
         runtime = FakeRuntime()
@@ -306,6 +326,28 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
                 tracker_config=Path("unused.yaml"),
                 device="cpu",
             )
+
+
+class VodProgressTests(unittest.TestCase):
+    def test_estimated_total_never_completes_progress_before_finalization(self):
+        snapshots = []
+        job = _job(
+            Path("unused"),
+            FakeRuntime(),
+            input_path=Path("unused.mp4"),
+            progress_callback=lambda snapshot, _committed: snapshots.append(snapshot),
+        )
+        state = SimpleNamespace(frames_total=100, frames_total_estimated=True, segments=[])
+        for frames in (0, 25, 99, 100, 120):
+            job._emit_progress(frames, state, "token", committed=False)
+        self.assertEqual(snapshots[1].fraction, 0.25)
+        self.assertEqual([s.fraction for s in snapshots], sorted(s.fraction for s in snapshots))
+        self.assertTrue(all(round(s.fraction * 100) < 100 for s in snapshots))
+        self.assertEqual(snapshots[-1].frames_done, 120)
+        self.assertEqual(snapshots[-1].frames_total, 100)
+        self.assertTrue(snapshots[-1].frames_total_estimated)
+        job._emit_progress(120, state, "token", committed=False, done=True)
+        self.assertEqual(snapshots[-1].fraction, 1.0)
 
 
 if __name__ == "__main__":

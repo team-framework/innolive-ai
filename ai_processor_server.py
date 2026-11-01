@@ -1673,7 +1673,9 @@ def _apply_progress(status, snapshot: vod.VodProgressSnapshot) -> None:
     progress.frames_done = snapshot.frames_done
     progress.frames_total = snapshot.frames_total
     progress.frames_total_estimated = snapshot.frames_total_estimated
-    progress.fraction = snapshot.fraction
+    # The core's final callback precedes cleanup and the RPC state transition.
+    # Publish 100% only when _run_job atomically sets DONE and the output path.
+    progress.fraction = min(vod.MAX_PROCESSING_FRACTION, snapshot.fraction)
     progress.segments_done = snapshot.segments_done
     progress.segments_total = snapshot.segments_total
     progress.processing_fps = snapshot.processing_fps

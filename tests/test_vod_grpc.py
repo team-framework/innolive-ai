@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -237,6 +238,57 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
             final = await _watch_to_terminal(server.stub, "job-pause")
             self.assertEqual(final.state, messages.VOD_JOB_STATE_DONE)
             self.assertEqual(_frame_count(Path(final.output_path)), self.input_frames)
+
+    async def test_progress_reaches_completion_only_with_done_and_output_path(self):
+        for phase in ("mux", "cleanup"):
+            with self.subTest(phase=phase):
+                entered = asyncio.Event()
+                release = threading.Event()
+                loop = asyncio.get_running_loop()
+                target = vod.VodJob if phase == "mux" else FakeTracker
+                method = "_finalize" if phase == "mux" else "reset"
+                original = getattr(target, method)
+
+                def blocked(
+                    *args, original=original, loop=loop, entered=entered, release=release, **kwargs
+                ):
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("test did not release finalization")
+                    return original(*args, **kwargs)
+
+                async with VodLoopback(SlowRuntime(0), self.tmp) as server:
+                    job_id = f"job-{phase}"
+                    with patch.object(target, method, blocked):
+                        await server.stub.StartVodJob(_start_request(self.tmp, job_id))
+                        watch = server.stub.WatchVodJob(messages.VodJobRef(job_id=job_id))
+                        try:
+                            await asyncio.wait_for(entered.wait(), timeout=10)
+                            current = await server.stub.GetVodJob(messages.VodJobRef(job_id=job_id))
+                            listed = await server.stub.ListVodJobs(messages.ListVodJobsRequest())
+                            first = await asyncio.wait_for(watch.read(), timeout=2)
+                            for status in (current, listed.jobs[0], first):
+                                self.assertEqual(status.state, messages.VOD_JOB_STATE_PROCESSING)
+                                self.assertLess(round(status.progress.fraction * 100), 100)
+                                self.assertFalse(status.output_path)
+                        finally:
+                            release.set()
+                        statuses = []
+                        while (
+                            status := await asyncio.wait_for(watch.read(), timeout=10)
+                        ) is not grpc.aio.EOF:
+                            statuses.append(status)
+                        self.assertTrue(statuses)
+                        for status in statuses:
+                            if status.state == messages.VOD_JOB_STATE_DONE:
+                                self.assertEqual(status.progress.fraction, 1.0)
+                                self.assertTrue(Path(status.output_path).is_file())
+                            else:
+                                self.assertLess(status.progress.fraction, 1.0)
+                        self.assertEqual(statuses[-1].state, messages.VOD_JOB_STATE_DONE)
+                        self.assertEqual(
+                            _frame_count(Path(statuses[-1].output_path)), self.input_frames
+                        )
 
     async def test_cancel_removes_partial_output_and_purges_work_dir(self):
         async with VodLoopback(SlowRuntime(0.02), self.tmp) as server:

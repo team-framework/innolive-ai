@@ -63,6 +63,8 @@ MAX_FFMPEG_ERROR_BYTES = 65_536
 # Audio codecs MP4 can carry without re-encoding.
 COPYABLE_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "ac3", "eac3", "alac"})
 _FPS_EWMA_ALPHA = 0.2
+# Leave the final percent for muxing, output publication, and job completion.
+MAX_PROCESSING_FRACTION = 0.99
 
 # Run states returned by VodJob.run; FAILED surfaces as a raised VodError.
 STATE_DONE = "done"
@@ -1055,7 +1057,9 @@ class VodJob:
         if self._progress_callback is None:
             return
         total = state.frames_total or 0
-        fraction = 1.0 if done else (min(1.0, frames_done / total) if total else 0.0)
+        fraction = (
+            1.0 if done else (min(MAX_PROCESSING_FRACTION, frames_done / total) if total else 0.0)
+        )
         eta = (total - frames_done) / self._fps if self._fps > 0 and total else -1.0
         snapshot = VodProgressSnapshot(
             frames_done=frames_done,
