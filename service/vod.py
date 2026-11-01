@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -681,24 +682,24 @@ class VodJob:
         segments_dir = self.work_dir / "segments"
         checkpoint_path = self.work_dir / "checkpoint.json"
 
-        # Paused before the first segment committed: nothing durable exists, so start over.
-        if resume and not checkpoint_token and not checkpoint_path.exists():
-            resume = False
-        if resume:
-            state = self._load_checkpoint(
-                checkpoint_path, checkpoint_token, input_path, segments_dir
-            )
-        else:
-            self.work_dir.mkdir(parents=True, exist_ok=True)
-            if segments_dir.exists():
-                shutil.rmtree(segments_dir)
-            segments_dir.mkdir(parents=True, exist_ok=True)
-            state = _CheckpointState.new(input_path, probe, self.config)
-            state.job_id = self.job_id
-            state.whitelist_fingerprint = self._whitelist_fingerprint
-            state.embedding_model = self.whitelist.embedding_model
-
         try:
+            # Paused before the first segment committed: nothing durable exists, so start over.
+            if resume and not checkpoint_token and not checkpoint_path.exists():
+                resume = False
+            if resume:
+                state = self._load_checkpoint(
+                    checkpoint_path, checkpoint_token, input_path, segments_dir
+                )
+            else:
+                self.work_dir.mkdir(parents=True, exist_ok=True)
+                if segments_dir.exists():
+                    shutil.rmtree(segments_dir)
+                segments_dir.mkdir(parents=True, exist_ok=True)
+                state = _CheckpointState.new(input_path, probe, self.config)
+                state.job_id = self.job_id
+                state.whitelist_fingerprint = self._whitelist_fingerprint
+                state.embedding_model = self.whitelist.embedding_model
+
             return await self._process(
                 ffmpeg,
                 input_path,
@@ -712,6 +713,8 @@ class VodJob:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # map unexpected failures to a job code.
+            if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                raise VodError("DISK_FULL", str(error)) from error
             raise VodError("INTERNAL", f"unexpected VOD failure: {error}") from error
 
     # -- checkpoint -------------------------------------------------------

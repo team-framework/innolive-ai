@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -182,6 +184,82 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.state, vod.STATE_DONE)
         self.assertEqual(_video_frame_count(Path(result.output_path)), self.input_frames)
+
+    async def test_work_directory_disk_full_is_reported_before_inference(self):
+        runtime = FakeRuntime()
+        job = _job(self.tmp, runtime, input_path=self.sample)
+        with (
+            patch.object(Path, "mkdir", side_effect=OSError(errno.ENOSPC, "disk full")),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run()
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual(runtime.calls, 0)
+        self.assertFalse((self.tmp / "out.mp4").exists())
+
+    async def test_checkpoint_disk_full_preserves_durable_state_for_resume(self):
+        job = _job(self.tmp, FakeRuntime(), input_path=self.sample)
+        snapshots = []
+        durable = {}
+
+        def progress(snapshot, committed):
+            snapshots.append(snapshot)
+            if committed:
+                durable["token"] = snapshot.checkpoint_token
+                durable["bytes"] = (job.work_dir / "checkpoint.json").read_bytes()
+
+        job._progress_callback = progress
+        original_fsync = vod.os.fsync
+
+        def fail_after_first_commit(fd):
+            if durable:
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_fsync(fd)
+
+        with (
+            patch("service.vod.os.fsync", side_effect=fail_after_first_commit),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run()
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual((job.work_dir / "checkpoint.json").read_bytes(), durable["bytes"])
+        self.assertEqual(vod.read_checkpoint_token(job.work_dir), durable["token"])
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
+        self.assertFalse((self.tmp / "out.mp4").exists())
+
+        resumed = await _job(self.tmp, FakeRuntime(), input_path=self.sample).run(
+            resume=True, checkpoint_token=durable["token"]
+        )
+        self.assertEqual(resumed.state, vod.STATE_DONE)
+        self.assertEqual(_video_frame_count(Path(resumed.output_path)), self.input_frames)
+        self.assertEqual(_audio_streams(Path(resumed.output_path)), _audio_streams(self.sample))
+
+    async def test_output_publish_disk_full_keeps_existing_output_and_incomplete_progress(self):
+        output = self.tmp / "out.mp4"
+        output.write_bytes(b"existing output")
+        snapshots = []
+        job = _job(
+            self.tmp,
+            FakeRuntime(),
+            input_path=self.sample,
+            progress_callback=lambda snapshot, _committed: snapshots.append(snapshot),
+        )
+        original_replace = vod.os.replace
+
+        def fail_output_publish(source, destination):
+            if Path(destination) == output.resolve():
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_replace(source, destination)
+
+        with (
+            patch("service.vod.os.replace", side_effect=fail_output_publish),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run(overwrite_output=True)
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual(output.read_bytes(), b"existing output")
+        self.assertTrue(vod.read_checkpoint_token(job.work_dir))
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
 
     async def test_pause_after_last_frame_does_not_report_completion(self):
         snapshots = []
