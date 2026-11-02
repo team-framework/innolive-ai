@@ -382,9 +382,10 @@ def test_apply_many_batches_faces_with_order_and_timing() -> None:
     assert set(swapper.last_generator_timing) == {"prepare", "forward", "paste"}
     timing = swapper.last_call_timing()
     assert timing["generator_ms"] >= 0
-    assert timing["prepare_ms"] + timing["forward_ms"] + timing["paste_ms"] <= timing[
-        "generator_ms"
-    ] + 5.0
+    assert (
+        timing["prepare_ms"] + timing["forward_ms"] + timing["paste_ms"]
+        <= timing["generator_ms"] + 5.0
+    )
     swapper.close()
 
 
