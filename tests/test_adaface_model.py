@@ -155,15 +155,16 @@ class AdaFaceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         image = np.zeros((112, 112, 3), dtype=np.uint8)
         try:
             runtime._detector = FixedDetector(np.asarray([face(0.65)]))
-            aligned = runtime._aligned_face(
+            aligned, keypoints = runtime._prepared_face(
                 image,
                 score_threshold=0.6,
                 min_face_size=24,
             )
             self.assertEqual(aligned.shape, (112, 112, 3))
+            self.assertIsNone(keypoints)
 
             with self.assertRaises(FaceCountError):
-                runtime._aligned_face(
+                runtime._prepared_face(
                     image,
                     score_threshold=0.9,
                     min_face_size=40,
@@ -171,7 +172,7 @@ class AdaFaceRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             runtime._detector = FixedDetector(np.asarray([face(0.95)]))
             with self.assertRaises(FaceTooSmallError):
-                runtime._aligned_face(
+                runtime._prepared_face(
                     image,
                     score_threshold=0.9,
                     min_face_size=40,
@@ -179,7 +180,7 @@ class AdaFaceRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             runtime._detector = FixedDetector(np.asarray([face(0.7), face(0.8)]))
             with self.assertRaises(FaceCountError):
-                runtime._aligned_face(
+                runtime._prepared_face(
                     image,
                     score_threshold=0.6,
                     min_face_size=24,

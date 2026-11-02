@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from mosaic_reference import mosaic_masked_region, protected_mask
 
 from experiments.trt_swap_client.app import (
     FrameJob,
@@ -36,8 +37,6 @@ from service.mosaic import (
     DEFAULT_BLUR_RADIUS,
     DEFAULT_PIXEL_SIZE,
     _feathered_mask,
-    _mosaic_masked_region,
-    _protected_mask,
 )
 
 
@@ -57,9 +56,9 @@ def test_fallback_composition_matches_existing_mosaic_mechanism(height, width) -
             "mask_polygon": [[45, 45], [59, 45], [59, 54], [45, 54]],
         },
     ]
-    expected = _mosaic_masked_region(
+    expected = mosaic_masked_region(
         image,
-        _feathered_mask(_protected_mask(image.shape[:2], objects)),
+        _feathered_mask(protected_mask(image.shape[:2], objects)),
         DEFAULT_BLUR_RADIUS,
         DEFAULT_PIXEL_SIZE,
     )

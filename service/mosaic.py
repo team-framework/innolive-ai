@@ -151,21 +151,6 @@ def _compose_protected(
     return _blend_layers(image, layers, blur_radius, pixel_size)
 
 
-def _mosaic_masked_region(
-    image: np.ndarray,
-    blend_mask: np.ndarray,
-    blur_radius: float,
-    pixel_size: int,
-) -> np.ndarray:
-    """Blend the frame-anchored blur into the protected bounds of one whole-frame mask."""
-
-    mask_left, mask_top, mask_width, mask_height = cv2.boundingRect(blend_mask)
-    if not mask_width:
-        return image
-    alpha = blend_mask[mask_top : mask_top + mask_height, mask_left : mask_left + mask_width]
-    return _blend_layers(image, [(mask_left, mask_top, alpha)], blur_radius, pixel_size)
-
-
 def _blend_layers(
     image: np.ndarray,
     layers: list[tuple[int, int, np.ndarray]],
@@ -304,17 +289,6 @@ def _encode_jpeg(image: np.ndarray, max_bytes: int) -> bytes:
     if len(jpeg) > max_bytes:
         raise ValueError(f"mosaic JPEG exceeds the {max_bytes} byte limit")
     return jpeg
-
-
-def _protected_mask(
-    dimensions: tuple[int, int],
-    objects: list[dict[str, Any]],
-    pad: int = 0,
-) -> np.ndarray:
-    """Fill protected polygons, then widen them by ``pad`` fully opaque pixels."""
-    _validate_mask_pad(pad)
-    height, width = dimensions
-    return _fill_polygons(dimensions, _protected_polygons(objects, width, height), pad)
 
 
 def _validate_mask_pad(pad: Any) -> None:

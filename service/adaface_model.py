@@ -298,20 +298,6 @@ class AdaFaceRuntime:
             return _square_face_crop(image, face)
         return _align_face(image, face), None
 
-    def _aligned_face(
-        self,
-        image: np.ndarray,
-        *,
-        score_threshold: float = _ENROLLMENT_SCORE_THRESHOLD,
-        min_face_size: int | None = None,
-    ) -> np.ndarray:
-        face = self._detected_face(
-            image,
-            score_threshold=score_threshold,
-            min_face_size=self.config.min_face_size if min_face_size is None else min_face_size,
-        )
-        return _align_face(image, face)
-
     def _detected_face(
         self,
         image: np.ndarray,

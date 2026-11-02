@@ -875,33 +875,6 @@ def _build_aligned_mask(
     return aligned_mask
 
 
-def _render_face_layer(
-    fake: np.ndarray,
-    aligned_shape: tuple[int, int],
-    seg_mask_aligned: np.ndarray | None,
-    roi_inverse: np.ndarray,
-    roi_size: tuple[int, int],
-    projected_size: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Warp one face to its ROI; thread-safe on per-face buffers only.
-
-    Raises on an empty post-warp mask so the caller skips the face
-    (fail-closed to blur) instead of counting a no-op blend as success.
-    Kept for parallel-render experiments; the live path keeps warps
-    sequential (warpAffine did not scale across threads on this build).
-    """
-
-    aligned_mask = _build_aligned_mask(aligned_shape, projected_size, seg_mask_aligned)
-    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
-    mask = warped[:, :, 3:4].astype(np.float32) / 255.0
-    if float(mask.max(initial=0.0)) <= 0:
-        raise RuntimeError("empty warped swap mask")
-    return (
-        warped[:, :, :3],
-        mask,
-    )
-
-
 def _merge_layer(
     canvas: np.ndarray,
     left: int,
@@ -1068,22 +1041,6 @@ class PreparedFace:
     blob: np.ndarray
     latent: np.ndarray
     seg_mask_aligned: np.ndarray | None = None
-
-
-@dataclass(slots=True)
-class StageTiming:
-    """Wall-clock stage breakdown for one apply_many call.
-
-    All fields are wall times (not worker sums), so
-    ``generator_ms ~= prepare + forward + paste`` holds for both single-face
-    and multi-face frames. ``batch_size`` is TRT rows attempted.
-    """
-
-    prepare_ms: float = 0.0
-    forward_ms: float = 0.0
-    paste_ms: float = 0.0
-    generator_ms: float = 0.0
-    batch_size: int = 0
 
 
 def _load_yunet_trt(yunet_engine: Path | None) -> Any | None:
@@ -1619,17 +1576,6 @@ class InSwapper:
             batch_size=attempted,
         )
         return output, succeeded
-
-    def _apply_many_pipelined(
-        self,
-        frame: np.ndarray,
-        targets: dict[int, Any],
-        mask_polygons_by_index: dict[int, Any] | None,
-        latents_by_index: dict[int, np.ndarray] | None,
-    ) -> tuple[np.ndarray, set[int]]:
-        """Backward-compatible alias for the batched pipeline."""
-
-        return self._apply_many_batched(frame, targets, mask_polygons_by_index, latents_by_index)
 
     def _apply_many_legacy(
         self, frame: np.ndarray, targets: dict[int, Any]

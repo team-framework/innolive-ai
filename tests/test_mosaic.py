@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+from mosaic_reference import mosaic_masked_region, protected_mask
 
 import service.mosaic as mosaic
 from service.frame import raw_yuv420p_size
@@ -214,7 +215,7 @@ class MosaicTests(unittest.TestCase):
             ],
             [],
         ):
-            mask = mosaic._protected_mask(image.shape[:2], objects)
+            mask = protected_mask(image.shape[:2], objects)
             expected = _full_frame_mosaic(
                 image, _full_frame_feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, DEFAULT_CELL
             )
@@ -254,7 +255,7 @@ class MosaicTests(unittest.TestCase):
     def test_bright_pixels_do_not_overflow_at_any_blend_weight(self):
         image = np.full((32, 256, 3), 255, np.uint8)
         mask = np.tile(np.arange(256, dtype=np.uint8), (32, 1))
-        output = mosaic._mosaic_masked_region(image, mask, 24.0, 2)
+        output = mosaic_masked_region(image, mask, 24.0, 2)
         np.testing.assert_array_equal(output, image)
 
 
@@ -284,7 +285,7 @@ class GroupedComposeTests(unittest.TestCase):
                 margin = int(rng.choice([0, 3, 8, 20]))
                 pad = int(rng.integers(0, 4))
                 try:
-                    mask = mosaic._protected_mask((height, width), objects, pad)
+                    mask = protected_mask((height, width), objects, pad)
                 except ValueError:
                     continue
                 cell = max(pixel_size, math.ceil(radius / mosaic.MAX_REDUCED_SIGMA))
@@ -304,7 +305,7 @@ class GroupedComposeTests(unittest.TestCase):
             {"mask_polygon": _ellipse(903.7, 1688.9, 105, 130)},
             {"mask_polygon": _ellipse(1070, 900, 60, 80)},
         ]
-        mask = mosaic._protected_mask(image.shape[:2], objects, 3)
+        mask = protected_mask(image.shape[:2], objects, 3)
         expected = _full_frame_mosaic(
             image, _feathered_mask(mask), mosaic.DEFAULT_BLUR_RADIUS, DEFAULT_CELL
         )
@@ -348,7 +349,7 @@ class GroupedComposeTests(unittest.TestCase):
             )
 
         self.assertEqual(blur.call_count, 1)
-        mask = mosaic._protected_mask(image.shape[:2], objects, 2)
+        mask = protected_mask(image.shape[:2], objects, 2)
         np.testing.assert_array_equal(
             output,
             _full_frame_mosaic(
@@ -377,7 +378,7 @@ class ReductionCellTests(unittest.TestCase):
             {"mask_polygon": _ellipse(80.3, 90.7, 40, 52)},
             {"mask_polygon": _ellipse(300, 230, 30, 40)},
         ]
-        self.alpha = _feathered_mask(mosaic._protected_mask(self.image.shape[:2], self.objects, 2))
+        self.alpha = _feathered_mask(protected_mask(self.image.shape[:2], self.objects, 2))
 
     def _compose(self, radius, pixel_size):
         return mosaic._compose_protected(self.image, self.objects, radius, pixel_size, 8, 2)
@@ -534,7 +535,7 @@ class MaskMarginTests(unittest.TestCase):
         image[:, ::2] = 255
         mask = np.zeros(image.shape[:2], np.uint8)
         mask[60:100, 60:100] = 255
-        output = mosaic._mosaic_masked_region(
+        output = mosaic_masked_region(
             image, _feathered_mask(mask, 0), mosaic.DEFAULT_BLUR_RADIUS, mosaic.DEFAULT_PIXEL_SIZE
         )
         np.testing.assert_array_equal(output[mask == 0], image[mask == 0])
@@ -598,8 +599,8 @@ class MaskPadTests(unittest.TestCase):
     def test_zero_pad_keeps_the_polygon_mask(self):
         objects = [{"mask_polygon": [[30, 20], [90, 25], [80, 70], [25, 60]]}]
         np.testing.assert_array_equal(
-            mosaic._protected_mask((120, 160), objects, 0),
-            mosaic._protected_mask((120, 160), objects),
+            protected_mask((120, 160), objects, 0),
+            protected_mask((120, 160), objects),
         )
 
     def test_pad_matches_full_frame_dilation(self):
@@ -611,20 +612,20 @@ class MaskPadTests(unittest.TestCase):
                     {"mask_polygon": cv2.convexHull(np.array(points)).reshape(-1, 2).tolist()}
                 ]
                 try:
-                    base = mosaic._protected_mask((height, width), objects)
+                    base = protected_mask((height, width), objects)
                 except ValueError:
                     continue
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
                 with self.subTest(size=(height, width), pad=pad):
                     np.testing.assert_array_equal(
-                        mosaic._protected_mask((height, width), objects, pad),
+                        protected_mask((height, width), objects, pad),
                         cv2.dilate(base, kernel),
                     )
 
     def test_pad_widens_the_fully_blurred_area_before_the_feather_band(self):
         objects = [{"mask_polygon": [[60, 40], [100, 40], [100, 80], [60, 80]]}]
-        plain = _feathered_mask(mosaic._protected_mask((120, 160), objects))
-        padded = _feathered_mask(mosaic._protected_mask((120, 160), objects, 3))
+        plain = _feathered_mask(protected_mask((120, 160), objects))
+        padded = _feathered_mask(protected_mask((120, 160), objects, 3))
         for line_plain, line_padded in ((plain[60], padded[60]), (plain[:, 80], padded[:, 80])):
             opaque_plain = np.flatnonzero(line_plain == 255)
             opaque_padded = np.flatnonzero(line_padded == 255)
@@ -636,21 +637,21 @@ class MaskPadTests(unittest.TestCase):
         objects = [
             {"mask_polygon": [[10, 10], [40, 10], [40, 40], [10, 40]], "whitelisted": True},
         ]
-        mask = mosaic._protected_mask((60, 60), objects, 3)
+        mask = protected_mask((60, 60), objects, 3)
         self.assertFalse(mask.any())
 
     def test_invalid_pad_fails_closed(self):
         objects = [{"mask_polygon": [[10, 10], [40, 10], [40, 40], [10, 40]]}]
         for pad in (-1, mosaic.MAX_MASK_PAD + 1, 1.5, True):
             with self.subTest(pad=pad), self.assertRaisesRegex(ValueError, "mask pad"):
-                mosaic._protected_mask((60, 60), objects, pad)
+                protected_mask((60, 60), objects, pad)
 
     def test_raw_and_jpeg_compose_with_the_padded_mask(self):
         image = np.random.default_rng(3).integers(0, 256, (120, 160, 3), dtype=np.uint8)
         objects = [{"mask_polygon": [[60, 40], [100, 40], [100, 80], [60, 80]]}]
-        expected = mosaic._mosaic_masked_region(
+        expected = mosaic_masked_region(
             image,
-            _feathered_mask(mosaic._protected_mask(image.shape[:2], objects, 2)),
+            _feathered_mask(protected_mask(image.shape[:2], objects, 2)),
             mosaic.DEFAULT_BLUR_RADIUS,
             mosaic.DEFAULT_PIXEL_SIZE,
         )
