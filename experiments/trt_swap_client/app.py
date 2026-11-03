@@ -12,10 +12,11 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import cv2
 import numpy as np
@@ -163,7 +164,7 @@ class SwapVideoTrack(VideoStreamTrack):
 
     kind = "video"
 
-    def __init__(self, source: MediaStreamTrack, lab: "SwapLab", stream: StreamState) -> None:
+    def __init__(self, source: MediaStreamTrack, lab: SwapLab, stream: StreamState) -> None:
         super().__init__()
         self.source = source
         self.lab = lab
@@ -180,6 +181,7 @@ class SwapVideoTrack(VideoStreamTrack):
         if self._reader is None:
             self._reader = asyncio.create_task(self._read_latest(), name="webrtc-video-reader")
             self._worker = asyncio.create_task(self._process_latest(), name="webrtc-video-worker")
+
     async def _read_latest(self) -> None:
         try:
             while self.readyState == "live":
@@ -363,17 +365,25 @@ class TensorRtInSwapperGenerator:
         self.inputs = [
             self.engine.get_tensor_name(index)
             for index in range(self.engine.num_io_tensors)
-            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index)) == trt.TensorIOMode.INPUT
+            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index))
+            == trt.TensorIOMode.INPUT
         ]
         self.outputs = [
             self.engine.get_tensor_name(index)
             for index in range(self.engine.num_io_tensors)
-            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index)) == trt.TensorIOMode.OUTPUT
+            if self.engine.get_tensor_mode(self.engine.get_tensor_name(index))
+            == trt.TensorIOMode.OUTPUT
         ]
-        image_inputs = [name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 4]
-        latent_inputs = [name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 2]
+        image_inputs = [
+            name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 4
+        ]
+        latent_inputs = [
+            name for name in self.inputs if len(self.engine.get_tensor_shape(name)) == 2
+        ]
         if len(image_inputs) != 1 or len(latent_inputs) != 1 or len(self.outputs) != 1:
-            raise RuntimeError(f"unexpected InSwapper TensorRT bindings: {self.inputs} -> {self.outputs}")
+            raise RuntimeError(
+                f"unexpected InSwapper TensorRT bindings: {self.inputs} -> {self.outputs}"
+            )
         self.image_input, self.latent_input, self.output = (
             image_inputs[0],
             latent_inputs[0],
@@ -403,11 +413,17 @@ class TensorRtInSwapperGenerator:
         output_shape = tuple(self.engine.get_tensor_shape(self.output))
         expected_tail = (3, self.metadata.input_size[1], self.metadata.input_size[0])
         if len(image_shape) != 4 or tuple(image_shape[1:]) != expected_tail:
-            raise RuntimeError(f"unexpected TensorRT image shape: {image_shape}, expected (N, {expected_tail})")
+            raise RuntimeError(
+                f"unexpected TensorRT image shape: {image_shape}, expected (N, {expected_tail})"
+            )
         if len(latent_shape) != 2 or tuple(latent_shape[1:]) != (512,):
-            raise RuntimeError(f"unexpected TensorRT latent shape: {latent_shape}, expected (N, 512)")
+            raise RuntimeError(
+                f"unexpected TensorRT latent shape: {latent_shape}, expected (N, 512)"
+            )
         if len(output_shape) != 4 or tuple(output_shape[1:]) != expected_tail:
-            raise RuntimeError(f"unexpected TensorRT output shape: {output_shape}, expected (N, {expected_tail})")
+            raise RuntimeError(
+                f"unexpected TensorRT output shape: {output_shape}, expected (N, {expected_tail})"
+            )
         for shape in (image_shape, latent_shape, output_shape):
             if shape[0] == 0 or any(dimension < -1 for dimension in shape):
                 raise RuntimeError(f"unexpected TensorRT dims: {shape}")
@@ -470,7 +486,9 @@ class TensorRtInSwapperGenerator:
         try:
             return mapping[trt_dtype]
         except KeyError as error:
-            raise RuntimeError(f"unsupported TensorRT InSwapper tensor dtype: {trt_dtype}") from error
+            raise RuntimeError(
+                f"unsupported TensorRT InSwapper tensor dtype: {trt_dtype}"
+            ) from error
 
     def _forward(self, image: np.ndarray, latent: np.ndarray) -> np.ndarray:
         import torch
@@ -586,7 +604,9 @@ class TensorRtInSwapperGenerator:
         with self._forward_lock:
             return self._forward_chunk_locked(images, mapped, torch)
 
-    def _forward_chunk_locked(self, images: np.ndarray, mapped: np.ndarray, torch: Any) -> np.ndarray:
+    def _forward_chunk_locked(
+        self, images: np.ndarray, mapped: np.ndarray, torch: Any
+    ) -> np.ndarray:
         image_dtype = self._torch_dtype(self.image_dtype, torch)
         latent_dtype = self._torch_dtype(self.latent_dtype, torch)
         output_dtype = self._torch_dtype(self.output_dtype, torch)
@@ -807,7 +827,17 @@ def _paste_roi(
 
     inverse = cv2.invertAffineTransform(matrix)
     corners = cv2.transform(
-        np.asarray([[[0, 0], [aligned_shape[1], 0], [aligned_shape[1], aligned_shape[0]], [0, aligned_shape[0]]]], dtype=np.float32),
+        np.asarray(
+            [
+                [
+                    [0, 0],
+                    [aligned_shape[1], 0],
+                    [aligned_shape[1], aligned_shape[0]],
+                    [0, aligned_shape[0]],
+                ]
+            ],
+            dtype=np.float32,
+        ),
         inverse,
     )[0]
     minimum = np.floor(corners.min(axis=0)).astype(np.int32)
@@ -873,33 +903,6 @@ def _build_aligned_mask(
     if int(aligned_mask.max(initial=0)) <= 0:
         raise RuntimeError("empty YOLO-constrained swap mask")
     return aligned_mask
-
-
-def _render_face_layer(
-    fake: np.ndarray,
-    aligned_shape: tuple[int, int],
-    seg_mask_aligned: np.ndarray | None,
-    roi_inverse: np.ndarray,
-    roi_size: tuple[int, int],
-    projected_size: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Warp one face to its ROI; thread-safe on per-face buffers only.
-
-    Raises on an empty post-warp mask so the caller skips the face
-    (fail-closed to blur) instead of counting a no-op blend as success.
-    Kept for parallel-render experiments; the live path keeps warps
-    sequential (warpAffine did not scale across threads on this build).
-    """
-
-    aligned_mask = _build_aligned_mask(aligned_shape, projected_size, seg_mask_aligned)
-    warped = cv2.warpAffine(np.dstack((fake, aligned_mask)), roi_inverse, roi_size, borderValue=0.0)
-    mask = warped[:, :, 3:4].astype(np.float32) / 255.0
-    if float(mask.max(initial=0.0)) <= 0:
-        raise RuntimeError("empty warped swap mask")
-    return (
-        warped[:, :, :3],
-        mask,
-    )
 
 
 def _merge_layer(
@@ -1027,7 +1030,9 @@ class SwapDebugDumper:
         landmark_image = original.copy()
         for x, y in landmarks:
             cv2.circle(landmark_image, (round(float(x)), round(float(y))), 3, (0, 0, 255), -1)
-        reconstructed = np.clip(blob[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)[:, :, ::-1]
+        reconstructed = np.clip(blob[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)[
+            :, :, ::-1
+        ]
         self._write(self.directory / "00_original.png", original)
         self._write(self.directory / "02_landmarks.png", landmark_image)
         self._write(self.directory / "03_aligned_target.png", aligned)
@@ -1041,7 +1046,9 @@ class SwapDebugDumper:
                 self._write(self.directory / f"{prefix}_{name}.png", image)
         self._write(self.directory / "10_after_blend.png", final)
         self._write(self.directory / "11_final_frame.png", final)
-        diff = np.asarray(trt_prediction, dtype=np.float32) - np.asarray(ort_prediction, dtype=np.float32)
+        diff = np.asarray(trt_prediction, dtype=np.float32) - np.asarray(
+            ort_prediction, dtype=np.float32
+        )
         report = {
             "input": self._stats(blob),
             "mapped_latent": {**self._stats(latent), "norm": float(np.linalg.norm(latent))},
@@ -1052,7 +1059,9 @@ class SwapDebugDumper:
                 "rmse": float(np.sqrt(np.mean(diff**2))),
                 "max_error": float(np.max(np.abs(diff))),
             },
-            "mask": self._stats(artifacts["swap_mask"] / 255.0) if "swap_mask" in artifacts else None,
+            "mask": self._stats(artifacts["swap_mask"] / 255.0)
+            if "swap_mask" in artifacts
+            else None,
         }
         (self.directory / "debug.json").write_text(json.dumps(report, indent=2) + "\n")
 
@@ -1068,22 +1077,6 @@ class PreparedFace:
     blob: np.ndarray
     latent: np.ndarray
     seg_mask_aligned: np.ndarray | None = None
-
-
-@dataclass(slots=True)
-class StageTiming:
-    """Wall-clock stage breakdown for one apply_many call.
-
-    All fields are wall times (not worker sums), so
-    ``generator_ms ~= prepare + forward + paste`` holds for both single-face
-    and multi-face frames. ``batch_size`` is TRT rows attempted.
-    """
-
-    prepare_ms: float = 0.0
-    forward_ms: float = 0.0
-    paste_ms: float = 0.0
-    generator_ms: float = 0.0
-    batch_size: int = 0
 
 
 def _load_yunet_trt(yunet_engine: Path | None) -> Any | None:
@@ -1211,7 +1204,9 @@ class InSwapper:
             self.generator.get(source, self.source_face, self.source_face, paste_back=False)
         finally:
             self.generator.debug_dumper = debug_dumper
-        print(f"InSwapper TensorRT warm-up completed in {(time.perf_counter() - started) * 1_000:.1f}ms")
+        print(
+            f"InSwapper TensorRT warm-up completed in {(time.perf_counter() - started) * 1_000:.1f}ms"
+        )
 
     def close(self) -> None:
         """Shut down the shared face-pipeline pool, if one was created."""
@@ -1383,7 +1378,9 @@ class InSwapper:
                 continue
             try:
                 prepared.append(
-                    self._prepare_one(frame, index, target, mask_polygons_by_index, latents_by_index)
+                    self._prepare_one(
+                        frame, index, target, mask_polygons_by_index, latents_by_index
+                    )
                 )
             except Exception:
                 continue
@@ -1620,17 +1617,6 @@ class InSwapper:
         )
         return output, succeeded
 
-    def _apply_many_pipelined(
-        self,
-        frame: np.ndarray,
-        targets: dict[int, Any],
-        mask_polygons_by_index: dict[int, Any] | None,
-        latents_by_index: dict[int, np.ndarray] | None,
-    ) -> tuple[np.ndarray, set[int]]:
-        """Backward-compatible alias for the batched pipeline."""
-
-        return self._apply_many_batched(frame, targets, mask_polygons_by_index, latents_by_index)
-
     def _apply_many_legacy(
         self, frame: np.ndarray, targets: dict[int, Any]
     ) -> tuple[np.ndarray, set[int]]:
@@ -1677,8 +1663,7 @@ class InSwapper:
                 runner is not None
                 and rois
                 and all(
-                    roi is not None
-                    and max(roi[2] - roi[0], roi[3] - roi[1]) <= runner.max_side
+                    roi is not None and max(roi[2] - roi[0], roi[3] - roi[1]) <= runner.max_side
                     for _, roi in rois
                 )
             ):
@@ -2228,7 +2213,9 @@ class SwapLab:
             "fallback_blurs": fallback,
             "small_face_fallbacks": small_face_fallbacks,
             "swap_ms": round(swap_ms, 2),
-            "swap_alignment_ms": round(call_timing.get("alignment_ms", self.swapper.last_alignment_ms), 2),
+            "swap_alignment_ms": round(
+                call_timing.get("alignment_ms", self.swapper.last_alignment_ms), 2
+            ),
             "swap_generator_ms": round(call_timing.get("generator_ms", 0.0), 2),
             "swap_generator_timing_ms": {
                 "prepare": round(call_timing.get("prepare_ms", 0.0), 2),
@@ -2422,9 +2409,7 @@ def create_app(settings: Settings) -> FastAPI:
                 stream.tracker.reset()
                 await peer.close()
 
-        await peer.setRemoteDescription(
-            RTCSessionDescription(sdp=offer["sdp"], type=offer["type"])
-        )
+        await peer.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
         answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)
         local = peer.localDescription
@@ -2507,9 +2492,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swapper-engine", type=Path, default=DEFAULT_SWAPPER_ENGINE)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--device", default="0")
-    parser.add_argument("--max-batch", type=int, default=1, help="latency-first default; raise only after throughput measurement")
-    parser.add_argument("--batch-wait-ms", type=float, default=0.0, help="do not delay a live frame for batching by default")
-    parser.add_argument("--max-queue", type=int, default=2, help="drop stale live frames instead of accumulating latency")
+    parser.add_argument(
+        "--max-batch",
+        type=int,
+        default=1,
+        help="latency-first default; raise only after throughput measurement",
+    )
+    parser.add_argument(
+        "--batch-wait-ms",
+        type=float,
+        default=0.0,
+        help="do not delay a live frame for batching by default",
+    )
+    parser.add_argument(
+        "--max-queue",
+        type=int,
+        default=2,
+        help="drop stale live frames instead of accumulating latency",
+    )
     parser.add_argument(
         "--swap-ort-mem-gib",
         type=float,
