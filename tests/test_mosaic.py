@@ -455,6 +455,25 @@ class MosaicParamTests(unittest.TestCase):
             }
         ]
 
+    def test_large_integer_radius_fails_closed_for_every_output_format(self):
+        for render in (mosaic.mosaic_bgr, mosaic_jpeg, mosaic_yuv420p):
+            for radius in (10**400, -(10**400)):
+                with (
+                    self.subTest(render=render.__name__, radius=radius),
+                    patch("service.mosaic.cv2.GaussianBlur") as blur,
+                    self.assertRaisesRegex(ValueError, r"blur_radius must be in \(0, 64\.0\]"),
+                ):
+                    render(self.image, self.objects, blur_radius=radius)
+                blur.assert_not_called()
+
+    def test_valid_radius_is_normalized_without_changing_its_value(self):
+        for radius in (0.5, 1, 24, 64, 64.0):
+            with self.subTest(radius=radius):
+                validated, pixel_size = mosaic.validate_mosaic_params(radius, 2)
+                self.assertIs(type(validated), float)
+                self.assertEqual(validated, radius)
+                self.assertEqual(pixel_size, 2)
+
     def test_defaults_are_stronger_than_the_legacy_sigma(self):
         self.assertEqual(mosaic.DEFAULT_BLUR_RADIUS, 24.0)
         self.assertEqual(mosaic.DEFAULT_PIXEL_SIZE, 2)

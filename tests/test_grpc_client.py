@@ -584,7 +584,22 @@ class GrpcClientTests(unittest.IsolatedAsyncioTestCase):
             ["session-a", "session-a", "session-b", "session-b"],
         )
 
+    def test_mosaic_config_rejects_large_integer_radius_as_a_range_error(self):
+        for radius in (10**400, -(10**400)):
+            with (
+                self.subTest(radius=radius),
+                self.assertRaisesRegex(
+                    ValueError, r"MosaicConfig\.blur_radius must be in \(0, 64\.0\]"
+                ),
+            ):
+                MosaicConfig(blur_radius=radius)
+
     def test_mosaic_config_validates_ranges_and_types(self):
+        for radius in (0.5, 1, 24, 64, 64.0):
+            with self.subTest(radius=radius):
+                config = MosaicConfig(blur_radius=radius)
+                self.assertIs(type(config.blur_radius), float)
+                self.assertEqual(config.blur_radius, radius)
         self.assertEqual(
             MosaicConfig(blur_radius=1, pixel_size=8),
             MosaicConfig(blur_radius=1.0, pixel_size=8),
