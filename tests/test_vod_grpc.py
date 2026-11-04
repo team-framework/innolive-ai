@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -238,6 +240,57 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final.state, messages.VOD_JOB_STATE_DONE)
             self.assertEqual(_frame_count(Path(final.output_path)), self.input_frames)
 
+    async def test_progress_reaches_completion_only_with_done_and_output_path(self):
+        for phase in ("mux", "cleanup"):
+            with self.subTest(phase=phase):
+                entered = asyncio.Event()
+                release = threading.Event()
+                loop = asyncio.get_running_loop()
+                target = vod.VodJob if phase == "mux" else FakeTracker
+                method = "_finalize" if phase == "mux" else "reset"
+                original = getattr(target, method)
+
+                def blocked(
+                    *args, original=original, loop=loop, entered=entered, release=release, **kwargs
+                ):
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("test did not release finalization")
+                    return original(*args, **kwargs)
+
+                async with VodLoopback(SlowRuntime(0), self.tmp) as server:
+                    job_id = f"job-{phase}"
+                    with patch.object(target, method, blocked):
+                        await server.stub.StartVodJob(_start_request(self.tmp, job_id))
+                        watch = server.stub.WatchVodJob(messages.VodJobRef(job_id=job_id))
+                        try:
+                            await asyncio.wait_for(entered.wait(), timeout=10)
+                            current = await server.stub.GetVodJob(messages.VodJobRef(job_id=job_id))
+                            listed = await server.stub.ListVodJobs(messages.ListVodJobsRequest())
+                            first = await asyncio.wait_for(watch.read(), timeout=2)
+                            for status in (current, listed.jobs[0], first):
+                                self.assertEqual(status.state, messages.VOD_JOB_STATE_PROCESSING)
+                                self.assertLess(round(status.progress.fraction * 100), 100)
+                                self.assertFalse(status.output_path)
+                        finally:
+                            release.set()
+                        statuses = []
+                        while (
+                            status := await asyncio.wait_for(watch.read(), timeout=10)
+                        ) is not grpc.aio.EOF:
+                            statuses.append(status)
+                        self.assertTrue(statuses)
+                        for status in statuses:
+                            if status.state == messages.VOD_JOB_STATE_DONE:
+                                self.assertEqual(status.progress.fraction, 1.0)
+                                self.assertTrue(Path(status.output_path).is_file())
+                            else:
+                                self.assertLess(status.progress.fraction, 1.0)
+                        self.assertEqual(statuses[-1].state, messages.VOD_JOB_STATE_DONE)
+                        self.assertEqual(
+                            _frame_count(Path(statuses[-1].output_path)), self.input_frames
+                        )
+
     async def test_cancel_removes_partial_output_and_purges_work_dir(self):
         async with VodLoopback(SlowRuntime(0.02), self.tmp) as server:
             await server.stub.StartVodJob(_start_request(self.tmp, "job-cancel"))
@@ -249,6 +302,39 @@ class VodProcessorGrpcTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((self.tmp / "job-cancel.mp4.part").exists())
             self.assertFalse((self.tmp / "job-cancel.mp4").exists())
             self.assertFalse((self.tmp / "job-cancel-work").exists())
+
+    async def test_storage_failure_codes_and_job_slot_recovery(self):
+        for error_number, expected_code in (
+            (errno.ENOSPC, "DISK_FULL"),
+            (errno.EACCES, "INTERNAL"),
+        ):
+            with self.subTest(error_number=error_number):
+                async with VodLoopback(SlowRuntime(0), self.tmp) as server:
+                    job_id = f"job-error-{error_number}"
+                    with patch(
+                        "service.vod._atomic_write_json",
+                        side_effect=OSError(error_number, "injected storage error"),
+                    ):
+                        await server.stub.StartVodJob(_start_request(self.tmp, job_id))
+                        final = await _watch_to_terminal(server.stub, job_id)
+                    current = await server.stub.GetVodJob(messages.VodJobRef(job_id=job_id))
+                    listed = await server.stub.ListVodJobs(messages.ListVodJobsRequest())
+                    for status in (final, current, listed.jobs[0]):
+                        self.assertEqual(status.state, messages.VOD_JOB_STATE_FAILED)
+                        self.assertEqual(status.error_code, expected_code)
+                        self.assertTrue(status.error_message)
+                        self.assertLess(status.progress.fraction, 1.0)
+                        self.assertFalse(status.output_path)
+                    self.assertFalse((self.tmp / f"{job_id}.mp4").exists())
+
+                    next_id = f"job-after-{error_number}"
+                    await server.stub.StartVodJob(_start_request(self.tmp, next_id))
+                    recovered = await _watch_to_terminal(server.stub, next_id)
+                    self.assertEqual(
+                        recovered.state, messages.VOD_JOB_STATE_DONE, recovered.error_message
+                    )
+                    self.assertEqual(recovered.progress.fraction, 1.0)
+                    self.assertEqual(_frame_count(Path(recovered.output_path)), self.input_frames)
 
     async def test_second_job_is_resource_exhausted(self):
         async with VodLoopback(SlowRuntime(0.02), self.tmp, vod_max_jobs=1) as server:

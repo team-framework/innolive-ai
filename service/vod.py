@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -63,6 +64,8 @@ MAX_FFMPEG_ERROR_BYTES = 65_536
 # Audio codecs MP4 can carry without re-encoding.
 COPYABLE_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "ac3", "eac3", "alac"})
 _FPS_EWMA_ALPHA = 0.2
+# Leave the final percent for muxing, output publication, and job completion.
+MAX_PROCESSING_FRACTION = 0.99
 
 # Run states returned by VodJob.run; FAILED surfaces as a raised VodError.
 STATE_DONE = "done"
@@ -679,24 +682,24 @@ class VodJob:
         segments_dir = self.work_dir / "segments"
         checkpoint_path = self.work_dir / "checkpoint.json"
 
-        # Paused before the first segment committed: nothing durable exists, so start over.
-        if resume and not checkpoint_token and not checkpoint_path.exists():
-            resume = False
-        if resume:
-            state = self._load_checkpoint(
-                checkpoint_path, checkpoint_token, input_path, segments_dir
-            )
-        else:
-            self.work_dir.mkdir(parents=True, exist_ok=True)
-            if segments_dir.exists():
-                shutil.rmtree(segments_dir)
-            segments_dir.mkdir(parents=True, exist_ok=True)
-            state = _CheckpointState.new(input_path, probe, self.config)
-            state.job_id = self.job_id
-            state.whitelist_fingerprint = self._whitelist_fingerprint
-            state.embedding_model = self.whitelist.embedding_model
-
         try:
+            # Paused before the first segment committed: nothing durable exists, so start over.
+            if resume and not checkpoint_token and not checkpoint_path.exists():
+                resume = False
+            if resume:
+                state = self._load_checkpoint(
+                    checkpoint_path, checkpoint_token, input_path, segments_dir
+                )
+            else:
+                self.work_dir.mkdir(parents=True, exist_ok=True)
+                if segments_dir.exists():
+                    shutil.rmtree(segments_dir)
+                segments_dir.mkdir(parents=True, exist_ok=True)
+                state = _CheckpointState.new(input_path, probe, self.config)
+                state.job_id = self.job_id
+                state.whitelist_fingerprint = self._whitelist_fingerprint
+                state.embedding_model = self.whitelist.embedding_model
+
             return await self._process(
                 ffmpeg,
                 input_path,
@@ -710,6 +713,8 @@ class VodJob:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # map unexpected failures to a job code.
+            if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                raise VodError("DISK_FULL", str(error)) from error
             raise VodError("INTERNAL", f"unexpected VOD failure: {error}") from error
 
     # -- checkpoint -------------------------------------------------------
@@ -1055,7 +1060,9 @@ class VodJob:
         if self._progress_callback is None:
             return
         total = state.frames_total or 0
-        fraction = 1.0 if done else (min(1.0, frames_done / total) if total else 0.0)
+        fraction = (
+            1.0 if done else (min(MAX_PROCESSING_FRACTION, frames_done / total) if total else 0.0)
+        )
         eta = (total - frames_done) / self._fps if self._fps > 0 and total else -1.0
         snapshot = VodProgressSnapshot(
             frames_done=frames_done,

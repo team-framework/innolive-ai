@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -171,6 +174,8 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
         frames = [snapshot.frames_done for snapshot in snapshots]
         self.assertEqual(frames, sorted(frames))
         self.assertGreaterEqual(len([s for s in snapshots if s.segments_done]), 1)
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots[:-1]))
+        self.assertEqual(snapshots[-1].fraction, 1.0)
 
     async def test_resume_without_committed_checkpoint_starts_fresh(self):
         runtime = FakeRuntime()
@@ -179,6 +184,99 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.state, vod.STATE_DONE)
         self.assertEqual(_video_frame_count(Path(result.output_path)), self.input_frames)
+
+    async def test_work_directory_disk_full_is_reported_before_inference(self):
+        runtime = FakeRuntime()
+        job = _job(self.tmp, runtime, input_path=self.sample)
+        with (
+            patch.object(Path, "mkdir", side_effect=OSError(errno.ENOSPC, "disk full")),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run()
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual(runtime.calls, 0)
+        self.assertFalse((self.tmp / "out.mp4").exists())
+
+    async def test_checkpoint_disk_full_preserves_durable_state_for_resume(self):
+        job = _job(self.tmp, FakeRuntime(), input_path=self.sample)
+        snapshots = []
+        durable = {}
+
+        def progress(snapshot, committed):
+            snapshots.append(snapshot)
+            if committed:
+                durable["token"] = snapshot.checkpoint_token
+                durable["bytes"] = (job.work_dir / "checkpoint.json").read_bytes()
+
+        job._progress_callback = progress
+        original_fsync = vod.os.fsync
+
+        def fail_after_first_commit(fd):
+            if durable:
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_fsync(fd)
+
+        with (
+            patch("service.vod.os.fsync", side_effect=fail_after_first_commit),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run()
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual((job.work_dir / "checkpoint.json").read_bytes(), durable["bytes"])
+        self.assertEqual(vod.read_checkpoint_token(job.work_dir), durable["token"])
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
+        self.assertFalse((self.tmp / "out.mp4").exists())
+
+        resumed = await _job(self.tmp, FakeRuntime(), input_path=self.sample).run(
+            resume=True, checkpoint_token=durable["token"]
+        )
+        self.assertEqual(resumed.state, vod.STATE_DONE)
+        self.assertEqual(_video_frame_count(Path(resumed.output_path)), self.input_frames)
+        self.assertEqual(_audio_streams(Path(resumed.output_path)), _audio_streams(self.sample))
+
+    async def test_output_publish_disk_full_keeps_existing_output_and_incomplete_progress(self):
+        output = self.tmp / "out.mp4"
+        output.write_bytes(b"existing output")
+        snapshots = []
+        job = _job(
+            self.tmp,
+            FakeRuntime(),
+            input_path=self.sample,
+            progress_callback=lambda snapshot, _committed: snapshots.append(snapshot),
+        )
+        original_replace = vod.os.replace
+
+        def fail_output_publish(source, destination):
+            if Path(destination) == output.resolve():
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_replace(source, destination)
+
+        with (
+            patch("service.vod.os.replace", side_effect=fail_output_publish),
+            self.assertRaises(vod.VodError) as caught,
+        ):
+            await job.run(overwrite_output=True)
+        self.assertEqual(caught.exception.code, "DISK_FULL")
+        self.assertEqual(output.read_bytes(), b"existing output")
+        self.assertTrue(vod.read_checkpoint_token(job.work_dir))
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
+
+    async def test_pause_after_last_frame_does_not_report_completion(self):
+        snapshots = []
+        job = _job(self.tmp, FakeRuntime(), input_path=self.sample)
+
+        def progress(snapshot, committed):
+            snapshots.append(snapshot)
+            if committed and snapshot.frames_done == self.input_frames:
+                job.request_pause()
+
+        job._progress_callback = progress
+        result = await job.run()
+        self.assertEqual(result.state, vod.STATE_PAUSED)
+        self.assertTrue(result.checkpoint_token)
+        self.assertEqual(snapshots[-1].frames_done, self.input_frames)
+        self.assertTrue(all(snapshot.fraction < 1.0 for snapshot in snapshots))
+        self.assertFalse((self.tmp / "out.mp4").exists())
 
     async def test_pause_then_resume_completes_with_exact_frame_count(self):
         runtime = FakeRuntime()
@@ -306,6 +404,28 @@ class VodCoreTests(unittest.IsolatedAsyncioTestCase):
                 tracker_config=Path("unused.yaml"),
                 device="cpu",
             )
+
+
+class VodProgressTests(unittest.TestCase):
+    def test_estimated_total_never_completes_progress_before_finalization(self):
+        snapshots = []
+        job = _job(
+            Path("unused"),
+            FakeRuntime(),
+            input_path=Path("unused.mp4"),
+            progress_callback=lambda snapshot, _committed: snapshots.append(snapshot),
+        )
+        state = SimpleNamespace(frames_total=100, frames_total_estimated=True, segments=[])
+        for frames in (0, 25, 99, 100, 120):
+            job._emit_progress(frames, state, "token", committed=False)
+        self.assertEqual(snapshots[1].fraction, 0.25)
+        self.assertEqual([s.fraction for s in snapshots], sorted(s.fraction for s in snapshots))
+        self.assertTrue(all(round(s.fraction * 100) < 100 for s in snapshots))
+        self.assertEqual(snapshots[-1].frames_done, 120)
+        self.assertEqual(snapshots[-1].frames_total, 100)
+        self.assertTrue(snapshots[-1].frames_total_estimated)
+        job._emit_progress(120, state, "token", committed=False, done=True)
+        self.assertEqual(snapshots[-1].fraction, 1.0)
 
 
 if __name__ == "__main__":
