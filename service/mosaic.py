@@ -33,9 +33,9 @@ def validate_mosaic_params(
     """Validate client-supplied mosaic strength and return (radius, size)."""
     if isinstance(blur_radius, bool) or not isinstance(blur_radius, (int, float)):
         raise ValueError("blur_radius must be a number of pixels")
-    radius = float(blur_radius)
-    if not math.isfinite(radius) or not 0 < radius <= MAX_BLUR_RADIUS:
+    if not 0 < blur_radius <= MAX_BLUR_RADIUS:
         raise ValueError(f"blur_radius must be in (0, {MAX_BLUR_RADIUS}]")
+    radius = float(blur_radius)
     if (
         isinstance(pixel_size, bool)
         or not isinstance(pixel_size, int)

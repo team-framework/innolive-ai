@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
@@ -74,11 +73,11 @@ class MosaicConfig:
             radius = self.blur_radius
             if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                 raise TypeError("MosaicConfig.blur_radius must be a number of pixels")
-            radius = float(radius)
-            if not math.isfinite(radius) or not 0 < radius <= MAX_MOSAIC_BLUR_RADIUS:
+            if not 0 < radius <= MAX_MOSAIC_BLUR_RADIUS:
                 raise ValueError(
                     f"MosaicConfig.blur_radius must be in (0, {MAX_MOSAIC_BLUR_RADIUS}]"
                 )
+            radius = float(radius)
             object.__setattr__(self, "blur_radius", radius)
         if self.pixel_size is not None:
             size = self.pixel_size
