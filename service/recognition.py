@@ -212,8 +212,15 @@ class SessionRegistry:
     ) -> tuple[WhitelistEntry, int, int]:
         validated = validate_session_id(session_id)
         with self._lock:
-            session = self._get_or_create_locked(validated)
-            return session.append(embedding)
+            session = self._sessions.get(validated)
+            if session is not None:
+                return session.append(embedding)
+            self._ensure_capacity_locked()
+            session = SessionState(validated, self.max_entries_per_session)
+            result = session.append(embedding)
+            self._sessions[validated] = session
+            self._active_stream_counts[validated] = 0
+            return result
 
     def import_entries(
         self,
@@ -222,8 +229,15 @@ class SessionRegistry:
     ) -> tuple[int, int, int]:
         validated = validate_session_id(session_id)
         with self._lock:
-            session = self._get_or_create_locked(validated)
-            return session.import_entries(entries)
+            session = self._sessions.get(validated)
+            if session is not None:
+                return session.import_entries(entries)
+            self._ensure_capacity_locked()
+            session = SessionState(validated, self.max_entries_per_session)
+            result = session.import_entries(entries)
+            self._sessions[validated] = session
+            self._active_stream_counts[validated] = 0
+            return result
 
     def delete_whitelist_entry(
         self,
