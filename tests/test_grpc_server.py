@@ -992,6 +992,50 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rejected.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
         self.assertEqual(stored, ())
 
+    async def test_rejected_whitelist_requests_leave_capacity_for_a_new_session(self):
+        for operation in ("append", "invalid_embedding", "invalid_id", "overflow"):
+            with self.subTest(operation=operation):
+                adaface = FakeAdaFace()
+                async with LoopbackServer(FakeRuntime(), adaface=adaface, max_sessions=1) as server:
+                    expected = grpc.StatusCode.INVALID_ARGUMENT
+                    if operation == "append":
+                        adaface.embedding = np.zeros(2, dtype=np.float32)
+                        expected = grpc.StatusCode.INTERNAL
+                        call = server.stub.AddWhitelist(
+                            ai_processor_pb2.FaceData(data=_jpeg(), session_id="rejected")
+                        )
+                    else:
+                        entries = [
+                            ai_processor_pb2.WhitelistEmbedding(
+                                entry_id="   " if operation == "invalid_id" else "entry-a",
+                                values=[0, 0] if operation == "invalid_embedding" else [1, 0],
+                            )
+                        ]
+                        if operation == "overflow":
+                            expected = grpc.StatusCode.RESOURCE_EXHAUSTED
+                            entries.extend(
+                                ai_processor_pb2.WhitelistEmbedding(
+                                    entry_id=f"entry-{index}", values=[1, 0]
+                                )
+                                for index in range(server.sessions.max_entries_per_session)
+                            )
+                        call = server.stub.ImportWhitelist(
+                            ai_processor_pb2.ImportWhitelistRequest(
+                                session_id="rejected", embedding_model="fake:1", entries=entries
+                            )
+                        )
+                    with self.assertRaises(grpc.aio.AioRpcError) as rejected:
+                        await call
+                    self.assertEqual(rejected.exception.code(), expected)
+
+                    listed = await server.stub.ListSessions(ai_processor_pb2.ListSessionsRequest())
+                    self.assertEqual(list(listed.sessions), [])
+                    created = await server.stub.CreateSession(
+                        ai_processor_pb2.CreateSessionRequest()
+                    )
+                    self.assertEqual(created.entry_count, 0)
+                    self.assertEqual(created.active_stream_count, 0)
+
     async def test_whitelist_transfer_requires_an_available_adaface_model(self):
         async with LoopbackServer(FakeRuntime()) as server:
             with self.assertRaises(grpc.aio.AioRpcError) as rejected:

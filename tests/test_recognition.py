@@ -152,6 +152,67 @@ class StreamRecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(sessions.snapshot("session-a").entries), 1)
 
+    async def test_rejected_append_does_not_consume_a_new_session(self):
+        for embedding in ([], [0.0, 0.0], [float("nan"), 1.0], [float("inf"), 1.0]):
+            with self.subTest(embedding=embedding):
+                sessions = SessionRegistry(max_sessions=1)
+                with self.assertRaises(ValueError):
+                    sessions.append("rejected", np.asarray(embedding))
+
+                self.assertEqual(sessions.list_summaries(), ())
+                created = sessions.create()
+                self.assertEqual(created.entry_count, 0)
+
+    async def test_rejected_import_does_not_consume_a_new_session(self):
+        valid = ("entry-a", np.asarray([1.0, 0.0]))
+        cases = (
+            ([valid, ("entry-b", np.asarray([0.0, 0.0]))], ValueError),
+            ([("   ", np.asarray([1.0, 0.0]))], ValueError),
+            ([valid, ("entry-b", np.asarray([0.0, 1.0]))], WhitelistLimitError),
+        )
+        for entries, error in cases:
+            with self.subTest(entries=entries):
+                sessions = SessionRegistry(max_sessions=1, max_entries_per_session=1)
+                with self.assertRaises(error):
+                    sessions.import_entries("rejected", entries)
+
+                self.assertEqual(sessions.list_summaries(), ())
+                self.assertEqual(sessions.import_entries("valid", [valid]), (1, 1, 1))
+                self.assertEqual(sessions.list_summaries()[0].active_stream_count, 0)
+
+    async def test_rejected_whitelist_changes_preserve_an_existing_stream_session(self):
+        sessions = SessionRegistry(max_sessions=1, max_entries_per_session=1)
+        first, _, _ = sessions.append("session-a", np.asarray([1.0, 0.0]))
+        lease = sessions.acquire_stream("session-a")
+        before = sessions.list_summaries()
+
+        for embedding, error in (
+            (np.asarray([0.0, 0.0]), ValueError),
+            (np.asarray([0.0, 1.0]), WhitelistLimitError),
+        ):
+            with self.subTest(embedding=embedding):
+                with self.assertRaises(error):
+                    sessions.append("session-a", embedding)
+                with self.assertRaises(error):
+                    sessions.import_entries("session-a", [("entry-b", embedding)])
+
+        self.assertEqual(sessions.list_summaries(), before)
+        self.assertIs(sessions.snapshot("session-a").entries[0], first)
+        self.assertIs(sessions.get_or_create("session-a"), lease)
+        sessions.release_stream(lease)
+        self.assertEqual(sessions.delete("session-a").entry_count, 1)
+
+    async def test_empty_import_still_creates_a_session_and_preserves_its_lease(self):
+        sessions = SessionRegistry(max_sessions=1)
+        self.assertEqual(sessions.import_entries("session-a", []), (0, 0, 0))
+        lease = sessions.acquire_stream("session-a")
+        before = sessions.list_summaries()
+        self.assertEqual(sessions.import_entries("session-a", []), (0, 0, 0))
+        self.assertEqual(sessions.list_summaries(), before)
+        self.assertEqual(before[0].active_stream_count, 1)
+        sessions.release_stream(lease)
+        self.assertEqual(sessions.delete("session-a").entry_count, 0)
+
     async def test_status_lookup_does_not_create_a_session(self):
         sessions = SessionRegistry(max_sessions=1)
 
