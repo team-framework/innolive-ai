@@ -49,6 +49,24 @@ def percentile(values, fraction):
     return sorted(values)[min(len(values) - 1, int(len(values) * fraction))]
 
 
+def video_rate(before, after, kind, field):
+    """Count decoded/encoded frames independently of tab presentation callbacks."""
+    previous = {s["id"]: s for s in before if s["type"] == kind and s.get("kind") == "video"}
+    rates = []
+    for sample in after:
+        initial = previous.get(sample["id"])
+        if initial is None or field not in initial or field not in sample:
+            continue
+        seconds = (sample["timestamp"] - initial["timestamp"]) / 1000
+        frames = sample[field] - initial[field]
+        if seconds <= 0 or frames < 0:
+            raise ValueError("WebRTC stats counter reset during measurement")
+        rates.append(frames / seconds)
+    if not rates:
+        raise ValueError(f"missing WebRTC video stats: {kind}/{field}")
+    return sum(rates)
+
+
 async def measure(args):
     args.output.mkdir(parents=True, exist_ok=True)
     results = {}
@@ -105,6 +123,13 @@ async def measure(args):
                     "seconds": args.seconds,
                     "frames": len(rows),
                     "fps": (len(rows) - 1) * 1000 / (rows[-1]["now"] - rows[0]["now"]),
+                    # Keep the original marker FPS for historical comparisons;
+                    # background tabs can miss source markers despite decoding
+                    # every RTP frame. Use these rates for transport throughput.
+                    "rtp_decoded_fps": video_rate(before, after, "inbound-rtp", "framesDecoded"),
+                    "source_encoded_fps": video_rate(
+                        before, after, "outbound-rtp", "framesEncoded"
+                    ),
                     "preview_to_output_p50_ms": statistics.median(latency),
                     "preview_to_output_p95_ms": percentile(latency, 0.95),
                     "interval_p95_ms": percentile(intervals, 0.95),

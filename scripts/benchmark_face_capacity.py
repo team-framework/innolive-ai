@@ -207,6 +207,7 @@ async def run_case(args, images, faces, sessions):
             "input_faces": faces,
             "sessions": sessions,
             "seconds": args.seconds,
+            "measurement_monotonic": [clock["measure"], clock["end"]],
             "resolution": [args.width, args.height],
             "transport": args.transport,
             "window": args.window,
