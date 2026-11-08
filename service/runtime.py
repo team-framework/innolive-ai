@@ -233,6 +233,8 @@ def select_runtime(config: RuntimeConfig) -> RuntimeSelection:
         return _select_tensorrt(config)
     if config.backend == "pytorch":
         return _select_pytorch(config)
+    if config.device in {"cpu", "mps"}:
+        return _select_pytorch(config)
 
     if _tensorrt_supported() and config.engine.is_file():
         return _select_tensorrt(config)

@@ -98,6 +98,16 @@ class RuntimeContractTests(unittest.TestCase):
         ):
             select_runtime(config)
 
+    def test_auto_respects_explicit_cpu_even_when_a_cuda_engine_is_installed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine = self.engine(root)
+            config = RuntimeConfig(checkpoint=root / "best.pt", engine=engine, device="cpu")
+            with patch("service.runtime._tensorrt_supported", return_value=True):
+                selection = select_runtime(config)
+            self.assertEqual((selection.backend, selection.device), ("pytorch", "cpu"))
+            self.assertEqual(selection.artifact, config.checkpoint)
+
     def test_normalizes_backend_and_device_options(self):
         config = RuntimeConfig(backend=" PyTorch ", device=" MPS ")
         self.assertEqual((config.backend, config.device), ("pytorch", "mps"))
