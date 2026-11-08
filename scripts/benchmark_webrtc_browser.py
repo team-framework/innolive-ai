@@ -194,7 +194,7 @@ if __name__ == "__main__":
         if (
             not separator
             or not label.replace("-", "").replace("_", "").isalnum()
-            or not url.startswith("https://")
+            or not url.startswith(("https://", "http://localhost:", "http://127.0.0.1:"))
         ):
-            parser.error("url must be label=https://host:port")
+            parser.error("url must use HTTPS or HTTP on localhost/127.0.0.1")
     asyncio.run(measure(args))
