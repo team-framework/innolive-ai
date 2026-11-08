@@ -201,6 +201,7 @@ ssh gorani@gpu 'systemctl --user stop innolive-mobilefsgan-100.service'
 
 ## 참고
 
+- [GPU·CPU 자원 사용량과 추가 최적화 점검](mobilefsgan-resource-audit.md)
 - 전달 묶음의 `docs/INFERENCE_ARCHITECTURE.md`, `model_manifest.json`, `licenses/`에 원본 모델·정렬·전처리·출처 기록 보존
 - [NVIDIA TensorRT CUDA Graph 및 context/workspace 규칙](https://docs.nvidia.com/deeplearning/tensorrt/11.4.1/performance/optimization.html)
 - [TensorRT 11의 명시적 tensor precision](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/precision-control.html)
