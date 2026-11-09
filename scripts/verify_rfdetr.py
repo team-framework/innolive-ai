@@ -91,7 +91,10 @@ def main():
         b: RFDETRDetector(p, b, "0")
         for b, p in [("pytorch", args.checkpoint), ("tensorrt", args.engine)]
     }
-    report = {"manifest": manifest, "inputs": []}
+    # RF-DETR's import changes the default to TF32; make this reference explicit.
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.allow_tf32 = False
+    report = {"manifest": manifest, "reference_precision": "fp32_tf32_disabled", "inputs": []}
     for path in args.images:
         frame = cv2.imread(str(path))
         if frame is None:
