@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from service.detection import EXPECTED_CLASS_NAMES
-from service.rfdetr import MODEL_NAME, checkpoint_metadata
+from service.rfdetr import MODEL_NAME, checkpoint_metadata, load_checkpoint_model
 from service.runtime import (
     DEFAULT_CHECKPOINT,
     DEFAULT_ENGINE,
@@ -41,8 +41,6 @@ def build(checkpoint, output, device="0", workspace=4.0, force=False):
 
     import tensorrt as trt
     import torch
-    from rfdetr import RFDETR
-    from rfdetr.export._tensorrt.exporter import fp16_source_graph
 
     if platform.system() != "Linux" or not torch.cuda.is_available():
         raise RuntimeError("export requires Linux and a CUDA GPU")
@@ -51,7 +49,9 @@ def build(checkpoint, output, device="0", workspace=4.0, force=False):
     torch.cuda.set_device(index)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".rfdetr-export-", dir=output.parent) as temporary:
-        model = RFDETR.from_checkpoint(str(checkpoint), device=f"cuda:{index}")
+        model = load_checkpoint_model(checkpoint, f"cuda:{index}")
+        from rfdetr.export._tensorrt.exporter import fp16_source_graph
+
         onnx = model.export(output_dir=temporary, format="onnx", verbose=False)
         del model
         torch.cuda.empty_cache()

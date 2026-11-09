@@ -1,11 +1,13 @@
 """RF-DETR model-independent decoding and tracker lifecycle contracts."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from service.detection import Boxes
-from service.rfdetr import RESOLUTION, decode
+from service.rfdetr import RESOLUTION, decode, load_checkpoint_model
 from service.tracking import StreamTracker
 
 
@@ -57,6 +59,37 @@ class RFDETRDecodeTests(unittest.TestCase):
         masks.fill(-10)
         self.assertGreater(len(result.masks.xy[0]), 3)
         self.assertEqual(len(result.masks.xy.cache), 1)
+
+
+class RFDETRLoadTests(unittest.TestCase):
+    def test_checkpoint_load_preserves_process_precision_on_success_and_failure(self):
+        import torch
+
+        previous = torch.get_float32_matmul_precision()
+        try:
+            for original in ("highest", "medium"):
+                for failure in (False, True):
+                    with self.subTest(original=original, failure=failure):
+                        torch.set_float32_matmul_precision(original)
+
+                        def load(*args, failure=failure, **kwargs):
+                            if failure:
+                                raise ValueError("invalid checkpoint")
+                            return "model"
+
+                        def import_rfdetr(name):
+                            torch.set_float32_matmul_precision("high")
+                            return SimpleNamespace(RFDETR=SimpleNamespace(from_checkpoint=load))
+
+                        with patch("service.rfdetr.import_module", side_effect=import_rfdetr):
+                            if failure:
+                                with self.assertRaisesRegex(ValueError, "invalid checkpoint"):
+                                    load_checkpoint_model("model.pth", "cpu")
+                            else:
+                                self.assertEqual(load_checkpoint_model("model.pth", "cpu"), "model")
+                        self.assertEqual(torch.get_float32_matmul_precision(), original)
+        finally:
+            torch.set_float32_matmul_precision(previous)
 
 
 class IndependentBoTSORTTests(unittest.TestCase):

@@ -8,6 +8,7 @@ backends share the same score decoding and contour conversion.
 from __future__ import annotations
 
 from collections import OrderedDict
+from importlib import import_module
 from pathlib import Path
 
 import cv2
@@ -20,6 +21,18 @@ RESOLUTION = 624
 MODEL_NAME = "RFDETRSegSmall"
 NORMALIZATION_MEAN = (0.485, 0.456, 0.406)
 NORMALIZATION_STD = (0.229, 0.224, 0.225)
+
+
+def load_checkpoint_model(path, device):
+    """Load RF-DETR without changing precision for other models in the process."""
+    import torch
+
+    precision = torch.get_float32_matmul_precision()
+    try:
+        # RF-DETR 1.11.2 sets process-wide matmul precision to 'high' at import.
+        return import_module("rfdetr").RFDETR.from_checkpoint(str(path), device=str(device))
+    finally:
+        torch.set_float32_matmul_precision(precision)
 
 
 def selected_pairs(logits, threshold, max_detections):
@@ -140,10 +153,8 @@ class RFDETRDetector:
         if backend == "tensorrt":
             self._init_trt(artifact)
         else:
-            from rfdetr import RFDETR
-
             checkpoint_metadata(artifact)
-            self.wrapper = RFDETR.from_checkpoint(str(artifact), device=str(self.device))
+            self.wrapper = load_checkpoint_model(artifact, self.device)
             self.model = self.wrapper.model.model.eval().to(self.device)
             self.model.export()
 
@@ -194,6 +205,7 @@ class RFDETRDetector:
             queries = self.selected_host.shape[0]
             self.indices_host = torch.empty(queries, dtype=torch.int64, pin_memory=True)
             self.indices_device = torch.empty(queries, dtype=torch.int64, device=self.device)
+            self.stream.wait_stream(torch.cuda.current_stream(self.device))
 
     def _preprocess(self, pixels):
         torch = self.torch
