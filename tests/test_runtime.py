@@ -23,6 +23,48 @@ from service.runtime import (
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_early_startup_failure_releases_runtime_reservation(self):
+        from types import SimpleNamespace
+
+        selection = SimpleNamespace(
+            backend="pytorch", device="cpu", artifact=Path("checkpoint.pth"), manifest=None
+        )
+        model = SimpleNamespace(names={0: "face", 1: "number_plate"}, predict=lambda *a, **k: None)
+        for failing_stage in ("hash", "executor", "motion_executor"):
+            with (
+                self.subTest(stage=failing_stage),
+                patch("service.runtime.select_runtime", return_value=selection),
+            ):
+                from concurrent.futures import ThreadPoolExecutor
+
+                executor = ThreadPoolExecutor(max_workers=1)
+                self.addCleanup(executor.shutdown)
+                with (
+                    patch(
+                        "service.runtime.sha256_file",
+                        side_effect=OSError("unreadable") if failing_stage == "hash" else None,
+                        return_value="digest",
+                    ),
+                    patch(
+                        "service.runtime.ThreadPoolExecutor",
+                        side_effect=[executor, OSError("worker unavailable")]
+                        if failing_stage == "motion_executor"
+                        else OSError("worker unavailable"),
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    RuntimeManager(RuntimeConfig())
+                self.assertEqual(RuntimeManager._live_instances, 0)
+                with (
+                    patch("service.runtime.sha256_file", return_value="digest"),
+                    patch("service.rfdetr.RFDETRDetector", return_value=model),
+                ):
+                    runtime = RuntimeManager(RuntimeConfig())
+                    try:
+                        self.assertTrue(runtime.ready)
+                    finally:
+                        runtime.close()
+
     def engine(self, root: Path, **overrides) -> Path:
         engine = root / "rfdetr_seg_s_b1.engine"
         engine.write_bytes(b"engine")

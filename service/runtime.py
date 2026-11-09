@@ -333,18 +333,19 @@ class RuntimeManager:
 
         self.backend = self.selection.backend
         self.device = self.selection.device
-        self.artifact_sha256 = sha256_file(self.selection.artifact)
         self.ready = False
         self._closed = False
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
-        # GMC는 화면만 쓰므로 같은 프레임의 GPU 추론과 동시에 계산한다. 추론 줄이 한 번에 한 프레임만
-        # 처리하므로 스레드 하나로 충분하다.
-        self._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
         self._lane: PriorityLane | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
         self.warmup_ms: float | None = None
         try:
+            self.artifact_sha256 = sha256_file(self.selection.artifact)
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
+            # GMC only reads this frame, so one worker can overlap motion with inference.
+            self._motion_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="b1-motion"
+            )
             from service.rfdetr import RFDETRDetector
 
             started = time.perf_counter()
@@ -566,7 +567,8 @@ class RuntimeManager:
             return
         self.ready = False
         self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_motion_executor"):
             self._motion_executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_model"):
