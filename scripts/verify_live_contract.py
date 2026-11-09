@@ -195,11 +195,40 @@ async def verify(target, image_path):
                 pb.GetWhitelistStatusRequest(session_id=replica), timeout=10
             )
             assert list(status.entry_ids) == [added.entry_id]
-            removed = await stub.DeleteWhitelist(
-                pb.DeleteWhitelistRequest(session_id=sid, entry_id=added.entry_id), timeout=10
-            )
-            assert removed.entry_count == 0
+            approved_call = stub.ProcessVideo(timeout=30)
+            try:
+                for frame in range(30):
+                    await approved_call.write(
+                        pb.VideoChunk(data=jpeg, session_id=sid, frame_id=frame)
+                    )
+                    response = await approved_call.read()
+                    if response.faces and all(f.whitelisted for f in response.faces):
+                        break
+                else:
+                    raise AssertionError("registered face was never approved")
+                approved_id = response.faces[0].track_id
+                for frame in range(3):
+                    await approved_call.write(
+                        pb.VideoChunk(data=jpeg, session_id=sid, frame_id=frame)
+                    )
+                    response = await approved_call.read()
+                    assert response.faces[0].whitelisted
+                    assert response.faces[0].track_id == approved_id
+                    assert response.data == jpeg
+                removed = await stub.DeleteWhitelist(
+                    pb.DeleteWhitelistRequest(session_id=sid, entry_id=added.entry_id), timeout=10
+                )
+                assert removed.entry_count == 0
+                await approved_call.write(pb.VideoChunk(data=jpeg, session_id=sid))
+                response = await approved_call.read()
+                assert response.faces and not any(f.whitelisted for f in response.faces)
+                assert response.data and response.data != jpeg
+                await approved_call.done_writing()
+                assert await approved_call.read() is grpc.aio.EOF
+            finally:
+                approved_call.cancel()
             checks.append("whitelist-add-export-import-delete")
+            checks.append("whitelist-approval-passthrough-and-live-revocation")
             # Cancel an RPC that has acquired its tracker/session lease, then reconnect.
             call = stub.ProcessVideo(timeout=30)
             await call.write(pb.VideoChunk(data=jpeg, session_id=sid))
