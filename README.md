@@ -335,6 +335,12 @@ AdaFace 오승인이나 추적 중 ID 오연결이 생기면 해당 ID의 승인
 
 ## experimental metadata 프리셋 합성
 
+**MobileFSGAN K22741 CUDA**는 제공된 추론 묶음을 `models/face_swap/mobilefsgan`에
+설치한 뒤 `bash scripts/run_mobilefsgan_cuda.sh`로 실행합니다. 기존 gRPC 경로에
+TensorRT 혼합 FP16·다얼굴 배치·CUDA Graph·GPU YuNet을 연결하며, 원본 FP32와
+최적화 엔진 선택, 테스트 클라이언트와 RTX 3090 측정 결과는
+[MobileFSGAN 실행 가이드](docs/mobilefsgan-cuda.md)를 참고합니다.
+
 메인 gRPC 파이프라인은 기본 Gaussian blur(`pixel_size=2`)를 사용합니다.
 `VideoChunk.anonymization_mode`에 `FACE_ANONYMIZATION_MODE_FACE_SWAP`을 명시한 경우에만
 metadata 기반 프리셋 매칭과 InSwapper-128 합성을 실행합니다. 동일 BoT-SORT 트랙의

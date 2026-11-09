@@ -24,6 +24,7 @@ from service.face_presets import (
 )
 from service.inswapper import DEFAULT_ARCFACE, DEFAULT_SWAPPER, DEFAULT_YUNET, InSwapperRenderer
 from service.mobilefaceswap import DEFAULT_MODEL_DIR
+from service.mobilefsgan import DEFAULT_BUNDLE
 from service.mosaic import (
     DEFAULT_MASK_MARGIN,
     _compose_protected,
@@ -48,11 +49,19 @@ class FaceAnonymizationConfig:
     swap_backend: str = "inswapper"
     mobilefaceswap_dir: Path = DEFAULT_MODEL_DIR
     mobilefaceswap_precision: str = "fp32"
+    mobilefsgan_dir: Path = DEFAULT_BUNDLE
+    mobilefsgan_engine_dir: Path | None = None
+    mobilefsgan_max_batch: int = 8
+    mobilefsgan_cuda_graphs: bool = True
     warmup: bool = False
 
     def __post_init__(self) -> None:
-        if self.swap_backend not in {"inswapper", "mobilefaceswap"}:
-            raise ValueError("swap_backend must be inswapper or mobilefaceswap")
+        if self.swap_backend not in {"inswapper", "mobilefaceswap", "mobilefsgan"}:
+            raise ValueError("swap_backend must be inswapper, mobilefaceswap or mobilefsgan")
+        if self.swap_backend == "mobilefsgan" and self.swap_provider != "cuda":
+            raise ValueError("MobileFSGAN requires the CUDA provider")
+        if not 1 <= self.mobilefsgan_max_batch <= 8:
+            raise ValueError("mobilefsgan_max_batch must be 1..8")
         if self.swap_provider not in {"cpu", "mps", "cuda"}:
             raise ValueError("swap_provider must be cpu, mps or cuda")
         if self.swap_backend == "inswapper" and self.swap_provider == "mps":
@@ -109,7 +118,16 @@ class FaceAnonymizationRuntime:
         if self.renderer is not None:
             return
         try:
-            if self.config.swap_backend == "mobilefaceswap":
+            if self.config.swap_backend == "mobilefsgan":
+                from service.mobilefsgan import MobileFSGANRenderer
+
+                self.renderer = MobileFSGANRenderer(
+                    self.config.mobilefsgan_dir,
+                    engine_dir=self.config.mobilefsgan_engine_dir,
+                    max_batch=self.config.mobilefsgan_max_batch,
+                    cuda_graphs=self.config.mobilefsgan_cuda_graphs,
+                )
+            elif self.config.swap_backend == "mobilefaceswap":
                 if self.config.swap_provider == "cpu":
                     from service.mobilefaceswap import MobileFaceSwapRenderer
 
@@ -238,7 +256,7 @@ class FaceAnonymizationRuntime:
             if self.renderer_error:
                 info["reason"] = "swapper_unavailable"
                 continue
-            if self.config.swap_backend == "mobilefaceswap":
+            if self.config.swap_backend in {"mobilefaceswap", "mobilefsgan"}:
                 mobile_jobs.append((item, preset))
                 continue
             try:
@@ -259,10 +277,10 @@ class FaceAnonymizationRuntime:
                     output, mobile_jobs, target=self.renderer.prepare_frame(image)
                 )
                 if len(errors) != len(mobile_jobs):
-                    raise ValueError("MobileFaceSwap result count mismatch")
+                    raise ValueError("face swap result count mismatch")
             except Exception as error:
                 errors = [error] * len(mobile_jobs)
-                LOGGER.warning("MobileFaceSwap frame failed; applying blur", exc_info=True)
+                LOGGER.warning("face swap frame failed; applying blur", exc_info=True)
             swapped = set()
             for (item, _), error in zip(mobile_jobs, errors, strict=True):
                 info = item["anonymization"]

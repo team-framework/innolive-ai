@@ -1,0 +1,7 @@
+# Install after the repository runtime requirements in a dedicated CUDA environment.
+# The supplied K22741 engines require this exact TensorRT version.
+tensorrt-cu12==11.4.0.106; platform_system == "Linux" and platform_machine == "x86_64"
+# Optional ONNX reference verification and target-device engine rebuild.
+onnx>=1.17,<2
+onnxruntime-gpu>=1.29,<2
+onnxconverter-common==1.16.0

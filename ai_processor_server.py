@@ -1978,10 +1978,16 @@ def parse_args() -> argparse.Namespace:
     )
     experimental = FaceAnonymizationConfig()
     parser.add_argument(
-        "--face-swap-backend", choices=("inswapper", "mobilefaceswap"), default="inswapper"
+        "--face-swap-backend",
+        choices=("inswapper", "mobilefaceswap", "mobilefsgan"),
+        default="inswapper",
     )
     parser.add_argument("--mobilefaceswap-dir", type=Path, default=experimental.mobilefaceswap_dir)
     parser.add_argument("--mobilefaceswap-precision", choices=("fp32", "fp16"), default="fp32")
+    parser.add_argument("--mobilefsgan-dir", type=Path, default=experimental.mobilefsgan_dir)
+    parser.add_argument("--mobilefsgan-engine-dir", type=Path)
+    parser.add_argument("--mobilefsgan-max-batch", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--mobilefsgan-no-cuda-graphs", action="store_true")
     parser.add_argument("--face-metadata-model", type=Path, default=experimental.metadata_model)
     parser.add_argument("--face-preset-manifest", type=Path, default=experimental.preset_manifest)
     parser.add_argument("--face-swap-model", type=Path, default=experimental.swapper_model)
@@ -2068,6 +2074,10 @@ def main() -> None:
             swap_backend=arguments.face_swap_backend,
             mobilefaceswap_dir=arguments.mobilefaceswap_dir,
             mobilefaceswap_precision=arguments.mobilefaceswap_precision,
+            mobilefsgan_dir=arguments.mobilefsgan_dir,
+            mobilefsgan_engine_dir=arguments.mobilefsgan_engine_dir,
+            mobilefsgan_max_batch=arguments.mobilefsgan_max_batch,
+            mobilefsgan_cuda_graphs=not arguments.mobilefsgan_no_cuda_graphs,
             metadata_model=arguments.face_metadata_model,
             preset_manifest=arguments.face_preset_manifest,
             swapper_model=arguments.face_swap_model,

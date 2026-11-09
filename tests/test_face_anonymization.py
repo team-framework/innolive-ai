@@ -236,6 +236,43 @@ class AnonymizationTests(unittest.TestCase):
         self.assertEqual(objects[2]["anonymization"]["reason"], "held_face")
         self.assertEqual(result, mosaic_jpeg(self.image, objects))
 
+    def test_mobilefsgan_batch_keeps_held_whitelist_and_partial_failure_contract(self):
+        self.presets()
+        self.runtime.config = FaceAnonymizationConfig(
+            swap_backend="mobilefsgan", swap_provider="cuda"
+        )
+        renderer = self.runtime.renderer = Mock()
+        self.runtime.extractor.predict.return_value *= 2
+        renderer.swap_many.return_value = [None, ValueError("invalid output")]
+        objects = [face(1), face(2), face(3, whitelisted=True), face(4, held=True)]
+        with self.assertLogs("innolive.face_swap", level="WARNING"):
+            self.process(objects)
+        self.assertEqual(
+            [item["track_id"] for item, _ in renderer.swap_many.call_args.args[1]], [1, 2]
+        )
+        self.assertIs(renderer.prepare_frame.call_args.args[0], self.image)
+        self.assertEqual(objects[0]["anonymization"]["status"], "swapped")
+        self.assertEqual(objects[1]["anonymization"]["reason"], "swap_failed")
+        self.assertNotIn("anonymization", objects[2])
+        self.assertEqual(objects[3]["anonymization"]["reason"], "held_face")
+
+    def test_mobilefsgan_unavailable_returns_exact_blur(self):
+        self.presets()
+        self.runtime.config = FaceAnonymizationConfig(
+            swap_backend="mobilefsgan", swap_provider="cuda"
+        )
+        self.runtime.renderer = None
+        objects = [face()]
+        with (
+            patch(
+                "service.mobilefsgan.MobileFSGANRenderer", side_effect=ValueError("bad engine hash")
+            ),
+            self.assertLogs("innolive.face_swap", level="WARNING"),
+        ):
+            result = self.process(objects)
+        self.assertEqual(result, mosaic_jpeg(self.image, objects))
+        self.assertEqual(objects[0]["anonymization"]["reason"], "swapper_unavailable")
+
     def test_tracks_refresh_on_independent_schedules_and_batch_only_due_faces(self):
         self.process([face(1)], mode=2)
         self.runtime.extractor.predict.return_value = [AttributePrediction(CHANGED, {})]

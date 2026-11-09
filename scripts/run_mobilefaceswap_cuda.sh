@@ -9,6 +9,9 @@ export GRPC_PORT="${GRPC_PORT:-50061}"
 export WEB_PORT="${WEB_PORT:-8443}"
 export AI_BACKEND="${AI_BACKEND:-tensorrt}"
 export AI_ENGINE="${AI_ENGINE:-$PROJECT_ROOT/models/best_b1.engine}"
+export FACE_SWAP_BACKEND="${FACE_SWAP_BACKEND:-mobilefaceswap}"
+export MOBILEFSGAN_DIR="${MOBILEFSGAN_DIR:-$PROJECT_ROOT/models/face_swap/mobilefsgan}"
+export MOBILEFSGAN_MAX_BATCH="${MOBILEFSGAN_MAX_BATCH:-8}"
 export MOBILEFACESWAP_CUDA_GRAPHS="${MOBILEFACESWAP_CUDA_GRAPHS:-1}"
 export MOBILEFACESWAP_PRECISION="${MOBILEFACESWAP_PRECISION:-fp16}"
 export MOBILEFACESWAP_CACHE_DIR="${MOBILEFACESWAP_CACHE_DIR:-$PROJECT_ROOT/.runtime/mobilefaceswap-cache}"
@@ -32,17 +35,23 @@ import os
 import socket
 from pathlib import Path
 import torch
-import onnxruntime as ort
 from service.runtime import RuntimeConfig, select_runtime
 from service.face_presets import PresetCatalog, DEFAULT_PRESET_MANIFEST
 if not torch.cuda.is_available():
     raise SystemExit("PyTorch CUDA is unavailable")
-if "CUDAExecutionProvider" not in ort.get_available_providers():
-    raise SystemExit("Install requirements-mobilefaceswap-cuda.txt without CPU onnxruntime")
 select_runtime(RuntimeConfig(backend=os.environ["AI_BACKEND"], device="0", engine=Path(os.environ["AI_ENGINE"])))
-for name in ("MobileFaceSwap_224.pdparams", "arcface.pdparams", "landmarks/scrfd_10g_bnkps.onnx"):
-    if not (Path("models/mobilefaceswap") / name).is_file():
-        raise SystemExit(f"Missing MobileFaceSwap artifact: {name}")
+if os.environ["FACE_SWAP_BACKEND"] == "mobilefaceswap":
+    import onnxruntime as ort
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        raise SystemExit("Install requirements-mobilefaceswap-cuda.txt without CPU onnxruntime")
+    for name in ("MobileFaceSwap_224.pdparams", "arcface.pdparams", "landmarks/scrfd_10g_bnkps.onnx"):
+        if not (Path("models/mobilefaceswap") / name).is_file():
+            raise SystemExit(f"Missing MobileFaceSwap artifact: {name}")
+elif os.environ["FACE_SWAP_BACKEND"] == "mobilefsgan":
+    if not (Path(os.environ["MOBILEFSGAN_DIR"]) / "model_manifest.json").is_file():
+        raise SystemExit("Install the MobileFSGAN inference bundle in MOBILEFSGAN_DIR")
+else:
+    raise SystemExit("FACE_SWAP_BACKEND must be mobilefaceswap or mobilefsgan")
 catalog = PresetCatalog(DEFAULT_PRESET_MANIFEST)
 if not catalog.presets or any(not p.image.is_file() for p in catalog.presets.values()):
     raise SystemExit("Install the preset images referenced by config/face_presets.json")
@@ -65,10 +74,17 @@ if [[ -n "${SSL_CERTFILE:-}" || -n "${SSL_KEYFILE:-}" ]]; then
   TLS_ARGS=(--ssl-certfile "$SSL_CERTFILE" --ssl-keyfile "$SSL_KEYFILE")
 fi
 
+SWAP_ARGS=(--mobilefaceswap-precision "$MOBILEFACESWAP_PRECISION")
+if [[ "$FACE_SWAP_BACKEND" == "mobilefsgan" ]]; then
+  SWAP_ARGS=(--mobilefsgan-dir "$MOBILEFSGAN_DIR" --mobilefsgan-max-batch "$MOBILEFSGAN_MAX_BATCH")
+  if [[ -n "${MOBILEFSGAN_ENGINE_DIR:-}" ]]; then SWAP_ARGS+=(--mobilefsgan-engine-dir "$MOBILEFSGAN_ENGINE_DIR"); fi
+  if [[ "${MOBILEFSGAN_CUDA_GRAPHS:-1}" == "0" ]]; then SWAP_ARGS+=(--mobilefsgan-no-cuda-graphs); fi
+fi
+
 "$PYTHON" -u ai_processor_server.py --host 127.0.0.1 --port "$GRPC_PORT" \
   --backend "$AI_BACKEND" --engine "$AI_ENGINE" --model models/best.pt --device 0 \
-  --face-metadata-device cuda:0 --face-swap-backend mobilefaceswap --face-swap-provider cuda \
-  --mobilefaceswap-precision "$MOBILEFACESWAP_PRECISION" --face-swap-warmup &
+  --face-metadata-device cuda:0 --face-swap-backend "$FACE_SWAP_BACKEND" --face-swap-provider cuda \
+  "${SWAP_ARGS[@]}" --face-swap-warmup &
 GRPC_PID=$!
 WEB_PID=""
 cleanup() {
