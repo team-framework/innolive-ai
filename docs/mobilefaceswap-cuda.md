@@ -1,5 +1,7 @@
 # MobileFaceSwap 224 CUDA 서버
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 기존 `best.pt`·추적·metadata·화이트리스트·blur 계약을 유지하고 합성 renderer만
 `--face-swap-backend mobilefaceswap`으로 선택한다. 기본 renderer는 InSwapper,
 기본 요청 모드는 blur이며 protobuf 필드는 추가하지 않는다.
@@ -27,7 +29,7 @@ Torch 2.13 CUDA 13 / cuDNN 9와 ORT GPU 1.30을 조합한다.
 MobileFaceSwap 세 파일의 [공식 다운로드·압축 해제·해시 검증 명령](../models/README.md#mobilefaceswap-224)을
 실행한 뒤 아래 공통 모델과 프리셋도 준비한다.
 
-- Git LFS의 `models/best.pt`, `models/face_metadata_extracter.pt` 실제 파일
+- Git LFS의 `models/rfdetr_seg_s.pth`, `models/face_metadata_extracter.pt` 실제 파일
 - 기존 AdaFace checkpoint와 YuNet: [모델 가이드](face-swap-model-download.md)
 - `models/mobilefaceswap/MobileFaceSwap_224.pdparams`
 - `models/mobilefaceswap/arcface.pdparams`
@@ -41,7 +43,7 @@ GPU별 TensorRT engine은 대상 서버에서 생성하며 다른 호스트에�
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python scripts/export_tensorrt.py \
-  --checkpoint models/best.pt --output models/best_b1.engine --device 0
+  --checkpoint models/rfdetr_seg_s.pth --output models/rfdetr_seg_s_b1.engine --device 0
 .venv/bin/python scripts/prepare_mobilefaceswap_cache.py --workers 4
 ./scripts/run_mobilefaceswap_cuda.sh
 ```
@@ -87,7 +89,7 @@ export MOBILEFACESWAP_SCRFD_ENGINE="$PWD/.runtime/scrfd-b8-fp16.engine"
 export FACE_METADATA_WARMUP_MAX_BATCH=8
 OMP_NUM_THREADS=1 .venv/bin/python ai_processor_server.py \
   --host 127.0.0.1 --port 50051 --backend tensorrt \
-  --engine models/best_b1.engine --device 0 --face-metadata-device cuda:0 \
+  --engine models/rfdetr_seg_s_b1.engine --device 0 --face-metadata-device cuda:0 \
   --face-swap-backend mobilefaceswap --face-swap-provider cuda \
   --mobilefaceswap-precision fp16 --face-swap-warmup
 ```

@@ -1,6 +1,8 @@
 # Mac에서 MobileFaceSwap 224 테스트
 
-`models/best.pt`는 그대로 탐지·segmentation에 사용하고, 얼굴 합성 renderer만
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
+`models/rfdetr_seg_s.pth`는 그대로 탐지·segmentation에 사용하고, 얼굴 합성 renderer만
 MobileFaceSwap 224로 선택한다. 기존 추적, metadata, 프리셋 선택, whitelist,
 번호판 blur, 합성 실패 시 blur 처리를 유지한다. protobuf 변경은 없다.
 
@@ -24,7 +26,7 @@ Apple Silicon Mac에서 저장소 루트를 기준으로 실행한다.
 
 | 단계 | 실행 장치 / 파일 |
 | --- | --- |
-| 얼굴·번호판 탐지 및 segmentation | PyTorch MPS / `models/best.pt` |
+| 얼굴·번호판 탐지 및 segmentation | PyTorch MPS / `models/rfdetr_seg_s.pth` |
 | 얼굴 속성 분류 | PyTorch MPS / `models/face_metadata_extracter.pt` |
 | 얼굴 정렬 | ONNX Runtime CoreML CPU/GPU / `landmarks/scrfd_10g_bnkps.onnx` |
 | source identity·특징 추출 | Paddle CPU / `arcface.pdparams` |
@@ -50,7 +52,7 @@ macOS arm64에서 확인했다. `landmarks/glintr100.onnx`는 수정하지 않�
 
 ```bash
 OMP_NUM_THREADS=1 .venv/bin/python ai_processor_server.py \
-  --backend pytorch --model models/best.pt --device mps \
+  --backend pytorch --model models/rfdetr_seg_s.pth --device mps \
   --face-metadata-device mps \
   --face-swap-backend mobilefaceswap --face-swap-provider mps
 ```

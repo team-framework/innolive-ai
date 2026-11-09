@@ -1,5 +1,7 @@
 # metadata 프리셋 기반 얼굴 합성
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 메인 `ProcessVideo`에서 YOLO segmentation과 BoT-SORT, AdaFace whitelist 처리를 마친
 얼굴에 metadata 추출과 프리셋 매칭을 연결한다. 프리셋이 아직 없는 상태에서도
 metadata와 identity 할당 결과를 확인할 수 있다.

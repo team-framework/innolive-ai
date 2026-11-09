@@ -1,5 +1,7 @@
 # 얼굴 합성 모델 다운로드와 설치
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 `main`의 gRPC 얼굴 합성 기능 기준이다. 기본 InSwapper와 선택형 MobileFaceSwap 224를 지원한다.
 아래 작업은 **AI 서버의 저장소 루트**에서 실행한다. Go 서버는 [gRPC 요청 필드](go-face-swap-grpc.md)만 설정한다.
 서버는 모델을 자동 다운로드하지 않는다.
@@ -8,7 +10,7 @@
 
 | 저장 위치 | 용도 | 확보 방법 |
 | --- | --- | --- |
-| `models/best.pt` | 얼굴·번호판 탐지 | Git LFS에 포함, 최신 `main`에서 `git lfs pull`로 확보 |
+| `models/rfdetr_seg_s.pth` | 얼굴·번호판 탐지 | Git LFS에 포함, 최신 `main`에서 `git lfs pull`로 확보 |
 | `models/face_metadata_extracter.pt` | 성별·나이·안경·표정 분석 | Git LFS에 포함, 최신 `main`에서 `git lfs pull`로 확보 |
 | `models/face_swap/inswapper_128.onnx` | InSwapper 얼굴 합성 | 아래 공식 다운로드 명령 |
 | `models/face_swap/w600k_r50.onnx` | InSwapper source identity 추출 | 공식 `buffalo_l.zip`에서 추출 |

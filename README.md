@@ -3,7 +3,7 @@
 실시간 영상의 얼굴과 차량 번호판을 **세그멘테이션·추적**하고, 세션별 whitelist에
 등록된 인물의 얼굴만 제외해 서버에서 모자이크 JPEG를 반환하는 gRPC AI 서버입니다.
 
-`YOLO26n-seg`가 얼굴·번호판 mask를 만들고 `BoT-SORT`가 object track을 유지합니다.
+`RF-DETR-Seg Small`가 얼굴·번호판 mask를 만들고 `BoT-SORT`가 object track을 유지합니다.
 face track만 `YuNet + AdaFace`로 whitelist와 비교하며, number_plate와 확인되지 않은
 얼굴은 서버에서 fail-closed 방식으로 보호됩니다.
 
@@ -13,7 +13,7 @@ face track만 `YuNet + AdaFace`로 whitelist와 비교하며, number_plate와 �
 - **안정적인 실시간 추적**: stream별 BoT-SORT와 1-frame mask hold로 탐지 공백 완화
 - **선택적 모자이크**: 세션별 AdaFace whitelist와 track cache를 이용해 등록 인물만 제외
 - **Fail-closed 처리**: 인식·합성·전송 실패 시 원본 frame으로 되돌아가지 않음
-- **환경별 가속**: YOLO는 TensorRT FP16 또는 PyTorch CUDA/MPS/CPU runtime 자동 선택
+- **환경별 가속**: RF-DETR는 TensorRT FP16 또는 PyTorch CUDA/MPS/CPU runtime 자동 선택
 - **Streaming backpressure**: client W5 window, serialized inference, bounded AdaFace·mosaic lane
 
 ## 아키텍처
@@ -21,7 +21,7 @@ face track만 `YuNet + AdaFace`로 whitelist와 비교하며, number_plate와 �
 ```mermaid
 flowchart LR
     Client["클라이언트<br/>JPEG frame"] -->|gRPC 양방향 stream| Decode["검증 · decode"]
-    Decode --> Detect["YOLO26n-seg<br/>얼굴·번호판 mask 탐지"]
+    Decode --> Detect["RF-DETR-Seg Small<br/>얼굴·번호판 mask 탐지"]
     Detect --> Track["BoT-SORT<br/>object track 유지"]
     Track --> Type{"class"}
     Type -->|number_plate| Mosaic["mask 기반 모자이크"]
@@ -43,13 +43,13 @@ App client는 gRPC를 직접 호출하고, 브라우저 demo만 `server.py`의 W
 
 ## 기술 스택
 
-- **데이터 구축 · 외부 학습 pipeline**
+- **기존 YOLO 모델의 데이터 구축 · 외부 학습 pipeline**
   - WIDER FACE bbox dataset
   - CVAT 기반 annotation 검수·가공
   - SAM 3.1을 이용한 bbox → segmentation mask 변환
-  - 데이터 구축·학습 pipeline은 외부에서 관리하며, 이 저장소는 serving checkpoint와 runtime을 다룹니다.
+  - 위 내용은 기존 모델의 기록입니다. 새 RF-DETR 체크포인트의 학습 데이터 구성은 이 저장소에서 검증하지 않았습니다.
 - **객체 탐지 · 추적**
-  - YOLO26n-seg: 640px, face·number_plate 2-class instance segmentation
+  - RF-DETR-Seg Small: 624px, face·number_plate 2-class instance segmentation
   - BoT-SORT: stream-local multi-object tracking과 temporal mask hold
 - **얼굴 인식 · 정렬**
   - AdaFace ViT-Base KP-RPE, WebFace12M: 512차원 face embedding과 cosine matching
@@ -74,7 +74,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-`models/best.pt`만으로 face/number_plate segmentation과 보호 모자이크를 실행할 수 있습니다.
+제공받은 RF-DETR EMA 체크포인트를 `models/rfdetr_seg_s.pth`에 설치하면 face/number_plate segmentation과 보호 모자이크를 실행할 수 있습니다.
 Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 [`models/README.md`](models/README.md)의 안내에 따라 준비합니다. Artifact가 없으면 서버는
 모든 얼굴과 번호판을 계속 보호하고 whitelist 등록 요청만 거부합니다.
@@ -124,7 +124,7 @@ gRPC 서버를 실행한 상태에서 새 terminal을 엽니다.
 ### NVIDIA TensorRT
 
 TensorRT engine과 검증 manifest는 Git에 포함하지 않습니다. 실제 배포 대상인
-Linux x86_64 NVIDIA 장비에서 저장소의 `models/best.pt`로 매번 생성합니다. 이렇게
+Linux x86_64 NVIDIA 장비에서 저장소의 `models/rfdetr_seg_s.pth`로 매번 생성합니다. 이렇게
 해야 GPU와 TensorRT version이 다른 환경의 engine을 잘못 재사용하지 않습니다.
 
 ```bash
@@ -133,14 +133,14 @@ Linux x86_64 NVIDIA 장비에서 저장소의 `models/best.pt`로 매번 생성�
 .venv/bin/python ai_processor_server.py --backend tensorrt --device 0
 ```
 
-Export 단계가 `best_b1.engine`과 `best_b1.engine.json`을 생성하고, runtime은 local
+Export 단계가 `rfdetr_seg_s_b1.engine`과 `rfdetr_seg_s_b1.engine.json`을 생성하고, runtime은 local
 manifest의 serving profile·engine/checkpoint hash와 TensorRT version을 검증합니다.
 두 파일은 배포 호스트에서만 유지되며 기존 engine을 교체할 때는 `--force`를 사용합니다.
 
 ### FHD TensorRT 얼굴 합성 실험
 
 `experiments/trt_swap_client`는 기존 gRPC 비식별화 서버와 분리된 얼굴 합성 실험 서버입니다.
-카메라의 1920×1080 프레임을 WebRTC로 받고 YOLO26-seg TensorRT FP16으로 얼굴/번호판 mask를
+카메라의 1920×1080 프레임을 WebRTC로 받고 RF-DETR-Seg Small TensorRT FP16으로 얼굴/번호판 mask를
 검출한 뒤, 얼굴 mask가 기본 `5,625px²`(약 75×75) 이상인 얼굴에 InSwapper 128 TensorRT FP32를
 적용합니다. 그보다 작은 얼굴과 번호판, 합성 실패 영역은 Gaussian blur로 보호합니다.
 
@@ -163,8 +163,8 @@ Linux NVIDIA GPU에서 전용 의존성과 엔진을 준비합니다. TensorRT �
 ```bash
 python -m pip install -r requirements-trt-swap-client.txt
 python -m experiments.trt_swap_client.export_detector \
-  --checkpoint models/best.pt --output models/best_swap_b4.engine \
-  --max-batch 4 --workspace 4 --device 0 --force
+  --checkpoint models/rfdetr_seg_s.pth --output models/rfdetr_seg_s_b1.engine \
+  --workspace 4 --device 0 --force
 python -m experiments.trt_swap_client.export_swapper \
   --onnx models/face_swap/inswapper_128.onnx \
   --output models/face_swap/inswapper_128_trt11_fp32.engine \
@@ -363,7 +363,7 @@ importer로 설치합니다. `FACE_ANONYMIZATION_MODE_FACE_METADATA`로 속성�
 Go 서버의 요청 필드와 값별 동작은 [Go 연동 가이드](docs/go-face-swap-grpc.md),
 모델 다운로드와 프리셋 설치는 [모델 준비 가이드](docs/face-swap-model-download.md)를 참고합니다.
 
-Mac에서 `best.pt`를 유지하면서 **MobileFaceSwap 224**를 테스트하려면
+Mac에서 `rfdetr_seg_s.pth`를 유지하면서 **MobileFaceSwap 224**를 테스트하려면
 [공식 사전학습 모델 다운로드·설치](models/README.md#mobilefaceswap-224)를 마친 뒤
 [실행 가이드](docs/mobilefaceswap-mac.md)의 `./scripts/run_mobilefaceswap.sh`를 사용합니다.
 메인 `ai_processor_server.py`에서 `--face-swap-backend mobilefaceswap`을 선택할 수 있습니다.
@@ -410,7 +410,7 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 ├── server.py                # browser ↔ gRPC demo gateway
 ├── run.sh                   # 독립 TensorRT 얼굴 합성 실험 실행기
 ├── service/
-│   ├── runtime.py           # YOLO 및 TensorRT/PyTorch backend 선택
+│   ├── runtime.py           # RF-DETR 및 TensorRT/PyTorch backend 선택
 │   ├── tracking.py          # stream-local BoT-SORT
 │   ├── adaface_*.py         # AdaFace backbone과 YuNet runtime
 │   ├── recognition.py       # session whitelist와 track decision cache
@@ -444,17 +444,15 @@ validation video와 배포 환경에서 다시 측정해야 합니다.
 공개 API·protobuf 계약을 바꾸지 않는 정리는 해당 계층 안의 private helper로 제한하고,
 경계가 바뀌는 변경은 protocol test와 transport test를 함께 갱신합니다.
 
+## RF-DETR 전환 검증
+
+모델 준비·TensorRT 내보내기·기존 대비 성능과 검증 범위는
+[RF-DETR 전환 가이드](docs/rfdetr-migration.md)를 참고하세요.
+
 ## 라이선스
 
-별도 표시된 제3자 구성요소를 제외하고, 이 저장소에서 자체 작성한 source code는
-[GNU Affero General Public License v3.0 only](LICENSE)로 배포합니다. Ultralytics runtime과
-YOLO 학습 checkpoint도 upstream의 기본 AGPL-3.0 조건을 따릅니다. 수정본을 network
-service로 운영할 때에는 AGPL v3 제13조에 따라 원격 사용자에게 해당 version의
-Corresponding Source를 받을 수 있는 방법을 제공해야 합니다.
-
-모델과 학습 데이터의 권리는 source code 라이선스와 별도로 확인해야 합니다. 특히
-`models/best.pt`는 WIDER FACE 기반 학습 이력이 있으므로, 이 저장소의 AGPL 표시는 해당
-checkpoint의 상업적 이용 가능성을 보증하지 않습니다. 상업 배포 전에는 WIDER FACE 관련
-권리를 별도로 검토하거나, 용도가 명확히 허용된 데이터로 다시 학습한 checkpoint로
-교체해야 합니다. Ultralytics, WIDER FACE, SAM 3.1, AdaFace, YuNet 관련 범위와 고지는
+별도 표시된 제3자 구성요소를 제외하고 자체 작성한 source code의
+[GNU Affero General Public License v3.0 only](LICENSE) 라이선스는 유지합니다.
+현재 탐지 경로는 RF-DETR, 추적 경로는 독립 BoT-SORT이며 Ultralytics 패키지를 사용하지 않습니다.
+RF-DETR 및 BoT-SORT의 원본·수정 범위와 과거 모델 고지는
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.

@@ -1,5 +1,7 @@
 # MobileFSGAN K22741 CUDA 실행
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 `mobilefsgan_k22741_inference_20261108.tar.gz`의 BN 보정 K22741 G와 자체
 MobileFaceNet C_04000을 기존 gRPC 얼굴 합성 경로에 연결한다. RF-DETR 및
 `models/inno_fs.pth`는 이 기능에서 사용하지 않는다. 탐지·추적은 기존 YOLO를 사용한다.
@@ -26,7 +28,7 @@ tar -xzf /path/to/mobilefsgan_k22741_inference_20261108.tar.gz \
 
 ```bash
 .venv/bin/python scripts/export_tensorrt.py \
-  --checkpoint models/best.pt --output models/best_b1.engine
+  --checkpoint models/rfdetr_seg_s.pth --output models/rfdetr_seg_s_b1.engine
 
 # 원본을 보존한 별도 출력 디렉터리. 기존 디렉터리 덮어쓰기 금지.
 .venv/bin/python scripts/build_mobilefsgan_engines.py \
