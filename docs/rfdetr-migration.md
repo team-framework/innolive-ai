@@ -3,6 +3,9 @@
 2026-11-09, RTX 3090의 `gorani@gpu`에서 검증했다. 이 문서의 성능은 해당 GPU의
 loopback 테스트이며, 외부 네트워크·실제 카메라·Mac 성능 보장은 아니다.
 
+**추가 검증에서 기존 모델 대비 번호판 품질과 얼굴 마스크 재현율 저하를 확인했다.**
+[정답 라벨·API·안정성 추가 검증](rfdetr-compatibility-audit.md)을 함께 확인한다.
+
 ## 적용 모델과 경로
 
 | 항목 | 값 |
@@ -128,7 +131,8 @@ MOBILEFSGAN_ENGINE_DIR=.runtime/mobilefsgan-fast \
 정규화·attention·head를 FP32로 유지한 mixed precision과 FP32/TF32 엔진도 비교했지만,
 모든 스트레스 입력의 일치를 확보하지 못했고 지연이 늘었다. 현재 기본은 검증한
 upstream FP16 변환이다. 얼굴 테스트 통과를 모든 실제 장면의 FP32 동등성이나
-탐지 정확도 유지로 해석하면 안 된다. 배포용 face/plate 정답 데이터셋의 recall·mAP와
+탐지 정확도 유지로 해석하면 안 된다. 이후 얼굴 416프레임·번호판 220장 정답셋의
+recall·mAP를 평가했고 [추가 검증](rfdetr-compatibility-audit.md)에 품질 저하를 기록했다.
 실제 이동 영상의 IDF1/HOTA는 아직 검증하지 않았다. `--backend pytorch`로 FP32 원본을
 직접 사용할 수 있다.
 
