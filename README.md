@@ -75,6 +75,8 @@ python3 -m venv .venv
 ```
 
 제공받은 RF-DETR EMA 체크포인트를 `models/rfdetr_seg_s.pth`에 설치하면 face/number_plate segmentation과 보호 모자이크를 실행할 수 있습니다.
+RF-DETR·MobileFSGAN·합성용 얼굴 프리셋은 [팀 Google Drive 배포 폴더](https://drive.google.com/drive/folders/1B4ZWbUPJp-t6mzJpSYqhkOxTRM1eH0i1?usp=sharing)에서 받습니다.
+파일별 링크·설치 위치·SHA-256은 [모델 다운로드 가이드](docs/face-swap-model-download.md)에 정리되어 있습니다.
 Whitelist 기능에 필요한 AdaFace와 YuNet artifact는
 [`models/README.md`](models/README.md)의 안내에 따라 준비합니다. Artifact가 없으면 서버는
 모든 얼굴과 번호판을 계속 보호하고 whitelist 등록 요청만 거부합니다.

@@ -1,6 +1,11 @@
 # Runtime model files
 
-Install the supplied `checkpoint_best_ema.pth` as `models/rfdetr_seg_s.pth`.
+Download `checkpoint_best_ema.pth` from the
+[team Google Drive folder](https://drive.google.com/drive/folders/1B4ZWbUPJp-t6mzJpSYqhkOxTRM1eH0i1?usp=sharing)
+and install it as `models/rfdetr_seg_s.pth`.
+The same folder contains the MobileFSGAN bundle, `face_presets.zip`, and
+`face_presets.json`. See the [download and installation guide](../docs/face-swap-model-download.md)
+for individual links, destination paths, and SHA-256 checks.
 The serving model is RF-DETR-Seg Small, resolution 624, checkpoint class IDs
 `0=face`, `1=plate`, final background slot `2`. The public API preserves
 `0=face`, `1=number_plate`. Both classes remain protected; only faces enter

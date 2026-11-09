@@ -66,6 +66,9 @@ mask 경계 padding은 624 기준으로 계산하므로 FHD에서 4px이다.
 ## 설치와 재현
 
 저장소 루트에서 실행한다. NVIDIA GPU가 있는 Linux에서 엔진을 새로 생성한다.
+`checkpoint_best_ema.pth`는 [팀 Google Drive 배포 폴더](https://drive.google.com/drive/folders/1B4ZWbUPJp-t6mzJpSYqhkOxTRM1eH0i1?usp=sharing)에서 받는다.
+함께 제공되는 MobileFSGAN·프리셋의 파일별 링크와 설치 방법은
+[모델 다운로드 가이드](face-swap-model-download.md)를 따른다.
 
 ```bash
 cp /path/to/checkpoint_best_ema.pth models/rfdetr_seg_s.pth
