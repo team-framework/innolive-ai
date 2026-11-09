@@ -124,7 +124,7 @@ class InSwapperRenderer:
         return latent
 
     def swap(self, image: np.ndarray, item: dict[str, Any], preset: FacePreset) -> np.ndarray:
-        # Detect within a padded YOLO ROI to associate landmarks with this track.
+        # Detect within a padded RF-DETR ROI to associate landmarks with this track.
         x1, y1, x2, y2 = np.asarray(item["bbox"], dtype=float)
         pad = max(x2 - x1, y2 - y1) * 0.3
         left, top = max(0, int(x1 - pad)), max(0, int(y1 - pad))

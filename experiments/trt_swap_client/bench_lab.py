@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput benchmark for the batched YOLO face-swap lab (issue #21).
+"""Throughput benchmark for the batched RF-DETR face-swap lab (issue #21).
 
 Drives SwapLab in-process with synthetic multi-face frames and concurrent
 sessions, then reports FPS, swaps/sec, p50/p95 latency, stage breakdown and

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mac: best.pt + metadata + MobileFaceSwap on MPS, SCRFD on CoreML CPU/GPU.
+# Mac: RF-DETR + metadata + MobileFaceSwap on MPS, SCRFD on CoreML CPU/GPU.
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PROJECT_ROOT}/.venv/bin/python"
@@ -16,7 +16,7 @@ for module in ("paddle", "onnxruntime"):
     if importlib.util.find_spec(module) is None:
         raise SystemExit("Install: .venv/bin/python -m pip install -r requirements-mobilefaceswap.txt")
 for name in (
-    "models/best.pt", "models/face_metadata_extracter.pt", "config/face_presets.json",
+    "models/rfdetr_seg_s.pth", "models/face_metadata_extracter.pt", "config/face_presets.json",
     "models/mobilefaceswap/MobileFaceSwap_224.pdparams",
     "models/mobilefaceswap/arcface.pdparams",
     "models/mobilefaceswap/landmarks/scrfd_10g_bnkps.onnx",
@@ -37,7 +37,7 @@ for port in 50051 8001; do
 done
 
 "$PYTHON" -u ai_processor_server.py --host 127.0.0.1 --backend pytorch \
-  --model models/best.pt --device mps --face-metadata-device mps \
+  --model models/rfdetr_seg_s.pth --device mps --face-metadata-device mps \
   --face-swap-backend mobilefaceswap --face-swap-provider mps &
 GRPC_PID=$!
 WEB_PID=""
@@ -62,7 +62,7 @@ done
 if [[ "$ready" != 1 ]]; then echo "AI server startup timed out." >&2; exit 1; fi
 
 echo "MobileFaceSwap-224: http://127.0.0.1:8001 (image / video / camera)"
-echo "best.pt + metadata + synthesis: MPS | SCRFD: CoreML | Ctrl+C stops both servers"
+echo "RF-DETR + metadata + synthesis: MPS | SCRFD: CoreML | Ctrl+C stops both servers"
 "$PYTHON" -u server.py --host 127.0.0.1 --port 8001 \
   --grpc-target 127.0.0.1:50051 --anonymization-mode face_swap &
 WEB_PID=$!

@@ -149,7 +149,9 @@ def verify(args):
         "torch_provider": args.torch_provider,
         "torch_precision": args.torch_precision,
         "torch_generator_only_ms": torch_times,
-        "best_pt_sha256": hashlib.sha256((ROOT / "models/best.pt").read_bytes()).hexdigest(),
+        "detector_checkpoint_sha256": hashlib.sha256(
+            (ROOT / "models/rfdetr_seg_s.pth").read_bytes()
+        ).hexdigest(),
         "upstream": str(args.upstream),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)

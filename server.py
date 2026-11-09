@@ -39,6 +39,7 @@ from service.recognition import validate_entry_id, validate_session_id
 from service.runtime import IMAGE_SIZE, STANDARD_PROFILE
 from service.visualization import annotate_detections, encode_jpeg
 
+DEMO_LONG_EDGE = 640  # Preserve browser/API input sizing independently of detector resolution.
 LOGGER = logging.getLogger("innolive.demo")
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
@@ -352,7 +353,7 @@ class GrpcDemoGateway:
                 FrameLimits(max_jpeg_bytes=self.settings.max_jpeg_bytes),
             )
             source_height, source_width = source.shape[:2]
-            model_input = resize_long_edge(source, IMAGE_SIZE)
+            model_input = resize_long_edge(source, DEMO_LONG_EDGE)
             model_input_jpeg = encode_jpeg(model_input, JPEG_QUALITY)
             if len(model_input_jpeg) > self.settings.max_jpeg_bytes:
                 raise PayloadTooLarge(
@@ -419,7 +420,7 @@ class GrpcDemoGateway:
                 "model_input": {
                     "width": int(input_width),
                     "height": int(input_height),
-                    "long_edge": IMAGE_SIZE,
+                    "long_edge": DEMO_LONG_EDGE,
                     "jpeg_base64": base64.b64encode(model_input_jpeg).decode("ascii"),
                 },
                 "visualization": {
@@ -529,7 +530,7 @@ class GrpcDemoGateway:
             "serving_profile": {
                 "engine_batch": 1,
                 "image_size": IMAGE_SIZE,
-                "max_long_edge": IMAGE_SIZE,
+                "max_long_edge": DEMO_LONG_EDGE,
                 "jpeg_quality": JPEG_QUALITY,
                 "client_window": self.settings.client_window
                 or (REQUEST_WINDOW if self.settings.anonymization_mode == "blur" else 1),
