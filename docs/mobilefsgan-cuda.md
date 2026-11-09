@@ -1,11 +1,17 @@
 # MobileFSGAN K22741 CUDA 실행
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 `mobilefsgan_k22741_inference_20261108.tar.gz`의 BN 보정 K22741 G와 자체
-MobileFaceNet C_04000을 기존 gRPC 얼굴 합성 경로에 연결한다. RF-DETR 및
-`models/inno_fs.pth`는 이 기능에서 사용하지 않는다. 탐지·추적은 기존 YOLO를 사용한다.
+MobileFaceNet C_04000을 기존 gRPC 얼굴 합성 경로에 연결한다.
+탐지는 RF-DETR-Seg Small, 추적은 BoT-SORT를 사용한다. `models/inno_fs.pth`는 사용하지 않는다.
 모델 재학습이나 BN 재보정은 수행하지 않는다.
 
 ## 설치와 실행
+
+[팀 Google Drive 배포 폴더](https://drive.google.com/drive/folders/1B4ZWbUPJp-t6mzJpSYqhkOxTRM1eH0i1?usp=sharing)의
+모델·프리셋 4개 파일을 [다운로드 가이드](face-swap-model-download.md)에 따라 설치한다.
+이 번들은 [MobileFSGAN 다운로드](https://drive.google.com/file/d/1DQic3xT-CpkvLvvvc_fHFyWJDzqesciN/view?usp=drivesdk)에서 받을 수 있다.
 
 Linux NVIDIA CUDA 환경에서 저장소 런타임 의존성을 먼저 설치하고
 `requirements-mobilefsgan-cuda.txt`를 추가한다. 브라우저 WebRTC를 쓰려면
@@ -22,11 +28,11 @@ tar -xzf /path/to/mobilefsgan_k22741_inference_20261108.tar.gz \
 원본 엔진은 TensorRT **11.4.0.106**, RTX 3090, compute capability 8.6용이다.
 시작 시 버전·GPU·capability·원본 ONNX/YuNet·엔진 SHA-256을 검사한다.
 다른 장비나 TensorRT에서는 제공된 엔진을 억지로 로드하지 않고 재빌드한다.
-기존 YOLO 엔진도 같은 TensorRT 버전으로 빌드해야 한다.
+RF-DETR 엔진도 같은 TensorRT 버전으로 빌드해야 한다.
 
 ```bash
 .venv/bin/python scripts/export_tensorrt.py \
-  --checkpoint models/best.pt --output models/best_b1.engine
+  --checkpoint models/rfdetr_seg_s.pth --output models/rfdetr_seg_s_b1.engine
 
 # 원본을 보존한 별도 출력 디렉터리. 기존 디렉터리 덮어쓰기 금지.
 .venv/bin/python scripts/build_mobilefsgan_engines.py \

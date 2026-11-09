@@ -69,7 +69,7 @@ def paste_back(image, generated, mask, matrix, polygon, *, inplace=False):
     if not np.isfinite(generated).all() or not np.isfinite(mask).all():
         raise ValueError("non-finite MobileFaceSwap output")
     fake = generated[0].transpose(1, 2, 0)[:, :, ::-1] * 255
-    # Match upstream dealign(), then additionally restrict to the YOLO face mask.
+    # Match upstream dealign(), then additionally restrict to the RF-DETR face mask.
     alpha = mask[0, 0].copy()
     alpha[alpha > 0.001] = 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))

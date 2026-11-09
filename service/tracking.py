@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-from ultralytics.trackers.basetrack import TrackState
-from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
-from ultralytics.trackers.utils.stracks import multi_gmc, parse_bboxes
-from ultralytics.utils import LOGGER, YAML, IterableSimpleNamespace
+import yaml
+
+from service.botsort import BOTSORT, TrackState
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "botsort.yaml"
@@ -21,7 +21,7 @@ MAX_MASK_HOLD_FRAMES = 1
 HOLD_CONFIDENCE_DECAY = 0.90
 # 검출 결과를 쓰는 GMC 방식. 이 방식은 검출 전에 미리 계산할 수 없다.
 DETECTION_DEPENDENT_GMC = frozenset({"orb", "sift"})
-# GMC 입력 장변 상한. ultralytics 기본 축소 배율 2는 720p를 640x360으로 계산하지만 FHD는 960x540으로
+# GMC 입력 장변 상한. 기존 기본 축소 배율 2는 720p를 640x360으로 계산하지만 FHD는 960x540으로
 # 2.25배를 계산한다(#62). 첫 프레임 장변으로 배율을 정해 FHD도 720p와 같은 640x360으로 계산한다.
 GMC_MAX_LONG_EDGE = 640
 GMC_MIN_DOWNSCALE = 2
@@ -35,68 +35,6 @@ class _MaskState:
     class_id: int
     class_name: str
     last_detection_frame: int
-
-
-class _LocalBOTrack(BOTrack):
-    _local_count = 0
-
-    @classmethod
-    def next_id(cls) -> int:
-        cls._local_count += 1
-        return cls._local_count
-
-    @classmethod
-    def reset_id(cls) -> None:
-        cls._local_count = 0
-
-
-class _ConnectionBOTSORT(BOTSORT):
-    def __init__(self, args: Any):
-        self._track_class = type(
-            "ConnectionBOTrack",
-            (_LocalBOTrack,),
-            {"_local_count": 0},
-        )
-        super().__init__(args)
-        self._prepared_warp: np.ndarray | Exception | None = None
-
-    def _pre_first_associate(
-        self, strack_pool: list[BOTrack], unconfirmed: list[BOTrack], img: Any, results_high: Any
-    ) -> None:
-        """Use the GMC warp prepared for this frame, or compute it as the base tracker does."""
-        prepared, self._prepared_warp = self._prepared_warp, None
-        if prepared is None or img is None:
-            super()._pre_first_associate(strack_pool, unconfirmed, img, results_high)
-            return
-        if isinstance(prepared, Exception):
-            LOGGER.warning(f"GMC failed, falling back to identity: {prepared}")
-            prepared = np.eye(2, 3)
-        multi_gmc(strack_pool, prepared)
-        multi_gmc(unconfirmed, prepared)
-
-    def reset_id(self) -> None:
-        self._track_class.reset_id()
-
-    def init_track(self, results: Any, img: np.ndarray | None = None) -> list[BOTrack]:
-        if len(results) == 0:
-            return []
-        bboxes = parse_bboxes(results)
-        if self.args.with_reid and self.encoder is not None and img is not None:
-            features = self.encoder(img, bboxes)
-            return [
-                self._track_class(xywh, score, cls, feature)
-                for xywh, score, cls, feature in zip(
-                    bboxes,
-                    results.conf,
-                    results.cls,
-                    features,
-                    strict=False,
-                )
-            ]
-        return [
-            self._track_class(xywh, score, cls)
-            for xywh, score, cls in zip(bboxes, results.conf, results.cls, strict=False)
-        ]
 
 
 class StreamTracker:
@@ -113,7 +51,7 @@ class StreamTracker:
         config_path = config.expanduser().resolve()
         if not config_path.is_file():
             raise FileNotFoundError(f"tracker config not found: {config_path}")
-        values = YAML.load(str(config_path))
+        values = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if values.get("tracker_type") != "botsort":
             raise ValueError("tracker_type must be botsort")
         if float(values.get("track_low_thresh", -1)) != CONTINUATION_CONFIDENCE:
@@ -129,7 +67,7 @@ class StreamTracker:
         if mask_hold_frames < 0 or mask_hold_frames > MAX_MASK_HOLD_FRAMES:
             raise ValueError(f"mask_hold_frames must be in [0, {MAX_MASK_HOLD_FRAMES}]")
         self.config_path = config_path
-        self._tracker = _ConnectionBOTSORT(IterableSimpleNamespace(**values))
+        self._tracker = BOTSORT(SimpleNamespace(**values))
         self._masks: dict[int, _MaskState] = {}
         self._mask_hold_frames = mask_hold_frames
         self._gmc_scaled = False
@@ -292,6 +230,7 @@ class StreamTracker:
     def reset(self) -> None:
         self._tracker.reset()
         self._masks.clear()
+        self._gmc_scaled = False
 
 
 def _polygon_area(polygon: np.ndarray) -> float:

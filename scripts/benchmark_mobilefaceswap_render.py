@@ -134,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=Path, default=Path("config/face_presets.json"))
     parser.add_argument("--input-manifest", type=Path)
     parser.add_argument("--models", type=Path, default=Path("models/mobilefaceswap"))
-    parser.add_argument("--engine", type=Path, default=Path("models/best_b1.engine"))
+    parser.add_argument("--engine", type=Path, default=Path("models/rfdetr_seg_s_b1.engine"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)

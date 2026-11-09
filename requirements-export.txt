@@ -1,5 +1,6 @@
 -r requirements-tensorrt.txt
 onnx>=1.21,<2
 onnxruntime-gpu>=1.24,<2
-onnxslim>=0.1.94,<1
+onnxconverter-common>=1.16,<2
+polygraphy>=0.49,<1
 nvidia-modelopt[onnx]>=0.45,<1

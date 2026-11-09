@@ -89,3 +89,6 @@ Thumbs.db
 
 # Host-specific deployment configuration, certificates and private keys.
 /.runtime/
+
+# User-provided RF-DETR checkpoint (see model manifest).
+/models/rfdetr_seg_s.pth

@@ -8,7 +8,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export GRPC_PORT="${GRPC_PORT:-50061}"
 export WEB_PORT="${WEB_PORT:-8443}"
 export AI_BACKEND="${AI_BACKEND:-tensorrt}"
-export AI_ENGINE="${AI_ENGINE:-$PROJECT_ROOT/models/best_b1.engine}"
+export AI_ENGINE="${AI_ENGINE:-$PROJECT_ROOT/models/rfdetr_seg_s_b1.engine}"
 export FACE_SWAP_BACKEND="${FACE_SWAP_BACKEND:-mobilefaceswap}"
 export MOBILEFSGAN_DIR="${MOBILEFSGAN_DIR:-$PROJECT_ROOT/models/face_swap/mobilefsgan}"
 export MOBILEFSGAN_MAX_BATCH="${MOBILEFSGAN_MAX_BATCH:-8}"
@@ -82,7 +82,7 @@ if [[ "$FACE_SWAP_BACKEND" == "mobilefsgan" ]]; then
 fi
 
 "$PYTHON" -u ai_processor_server.py --host 127.0.0.1 --port "$GRPC_PORT" \
-  --backend "$AI_BACKEND" --engine "$AI_ENGINE" --model models/best.pt --device 0 \
+  --backend "$AI_BACKEND" --engine "$AI_ENGINE" --model models/rfdetr_seg_s.pth --device 0 \
   --face-metadata-device cuda:0 --face-swap-backend "$FACE_SWAP_BACKEND" --face-swap-provider cuda \
   "${SWAP_ARGS[@]}" --face-swap-warmup &
 GRPC_PID=$!

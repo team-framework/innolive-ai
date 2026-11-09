@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-from ultralytics.engine.results import Boxes
 
+from service.detection import Boxes
 from service.tracking import (
     ACTIVATION_CONFIDENCE,
     CONTINUATION_CONFIDENCE,

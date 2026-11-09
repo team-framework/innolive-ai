@@ -6,24 +6,30 @@ replace the applicable upstream license terms. The license in `LICENSE` covers
 only rights that the project copyright holders are able to grant; it does not
 relicense third-party material.
 
-## Ultralytics YOLO and BoT-SORT
+## RF-DETR
 
-The runtime pins `ultralytics==8.4.104` and directly imports Ultralytics YOLO
-and BoT-SORT components. The tracked `models/best.pt` YOLO26n-seg checkpoint
-also embeds this license notice in its metadata:
+The runtime pins `rfdetr==1.11.2` from [Roboflow RF-DETR](https://github.com/roboflow/rf-detr).
+The supplied RFDETRSegSmall checkpoint records `license=Apache-2.0` and is installed
+separately as `models/rfdetr_seg_s.pth`. This records the software/checkpoint metadata;
+it does not establish the rights to the training images. The serving adapter and
+TensorRT exporter use the upstream model and preprocessing contract.
 
-> AGPL-3.0 (https://ultralytics.com/license)
+## Independent BoT-SORT
 
-[Ultralytics](https://github.com/ultralytics/ultralytics) publishes its
-software and YOLO-trained models under GNU Affero General Public License v3.0
-by default, with an Enterprise License offered as an alternative. This
-repository follows the AGPL-3.0 path; the complete license text is in
-`LICENSE`. An Enterprise License holder must follow the terms of that separate
-agreement for the Ultralytics components.
+`service/_vendor/botsort/kalman_filter.py` is from
+[NirAharon/BoT-SORT](https://github.com/NirAharon/BoT-SORT), MIT license (2022 Nir Aharon).
+The full license is retained in `service/_vendor/botsort/LICENSE`.
+`service/botsort.py` implements the motion/IoU association and camera compensation
+for the existing no-ReID serving configuration, with stream-local IDs, class-safe
+association, bounded removed history, and empty-frame handling. It does not import
+or vendor Ultralytics code.
 
-The Python dependency is installed separately and is not vendored in this
-repository. Exporting the checkpoint to TensorRT does not by itself remove the
-licenses that apply to the source checkpoint or exporter.
+## Historical detector
+
+Earlier revisions used Ultralytics 8.4.104 and `models/best.pt` (YOLO26n-seg).
+Their original AGPL-3.0 notices remain applicable to those historical revisions.
+The current runtime, exporter and lab have removed that package and artifact.
+The repository's own `LICENSE` is unchanged by the dependency migration.
 
 ## MobileFaceSwap
 
@@ -38,7 +44,7 @@ this code license does not grant rights in those artifacts.
 
 ## Training data and external annotation tools
 
-The tracked `models/best.pt` checkpoint was trained using WIDER FACE images
+The historical `models/best.pt` checkpoint was trained using WIDER FACE images
 and bounding-box annotations after masks were generated in an external data
 pipeline with SAM 3.1 and reviewed with CVAT. The WIDER FACE dataset, generated
 masks, SAM code, and SAM weights are not included in this repository.

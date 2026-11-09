@@ -7,6 +7,8 @@ opencv-python!=4.13.0.90,>=4.11,<6
 protobuf>=6.33.5,<7
 torch==2.13.0
 torchvision==0.28.0
-ultralytics==8.4.104
+rfdetr==1.11.2
+scipy>=1.15,<2
+PyYAML>=6,<7
 uvicorn[standard]>=0.35,<1
 websockets>=15,<17

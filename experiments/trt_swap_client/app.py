@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WebSocket test client for batched YOLO face swap with fail-closed blur."""
+"""WebSocket test client for batched RF-DETR face swap with fail-closed blur."""
 
 from __future__ import annotations
 
@@ -44,12 +44,13 @@ from service.adaface_model import DEFAULT_FACE_DETECTOR, AdaFaceConfig, AdaFaceR
 from service.detection import is_face_object, is_number_plate_object
 from service.mosaic import mosaic_bgr
 from service.recognition import RecognitionConfig, SessionRegistry, StreamRecognition
-from service.runtime import IMAGE_SIZE, MAX_DETECTIONS, MAX_POLYGON_POINTS
+from service.rfdetr import RFDETRDetector
+from service.runtime import MAX_DETECTIONS, MAX_POLYGON_POINTS, RuntimeConfig, select_runtime
 from service.tracking import DETECTOR_CONFIDENCE, StreamTracker
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ENGINE = ROOT / "models" / "best_swap_b4.engine"
-DEFAULT_DETECTOR_CHECKPOINT = ROOT / "models" / "best.pt"
+DEFAULT_ENGINE = ROOT / "models" / "rfdetr_seg_s_b1.engine"
+DEFAULT_DETECTOR_CHECKPOINT = ROOT / "models" / "rfdetr_seg_s.pth"
 DEFAULT_SOURCE = Path.home() / "Documents" / "input.png"
 DEFAULT_SWAPPER = ROOT / "models" / "face_swap" / "inswapper_128.onnx"
 DEFAULT_SWAPPER_ENGINE = ROOT / "models" / "face_swap" / "inswapper_128_trt11_fp32.engine"
@@ -62,7 +63,7 @@ DEFAULT_YUNET_ENGINE = ROOT / "models" / "face_detection_yunet_trt.engine"
 DEFAULT_HLS_DIR = ROOT / "face_swap_lab_output" / "trt_hls"
 DEFAULT_SWAPPER_TRT_CACHE = ROOT / "face_swap_lab_output" / "trt_swapper_cache"
 
-# YOLO segmentation mask handling in the 128px aligned InSwapper domain.
+# RF-DETR segmentation mask handling in the 128px aligned InSwapper domain.
 # The polygon is transformed with the same affine matrix as the face crop,
 # then slightly expanded and feathered so the generated face interior is kept
 # while the surrounding background stays untouched.
@@ -755,11 +756,11 @@ def _prediction_to_bgr(prediction: np.ndarray) -> np.ndarray:
 
 
 def _transform_polygon_to_aligned(polygon: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Map a frame-space YOLO polygon into the 128px aligned crop domain."""
+    """Map a frame-space RF-DETR polygon into the 128px aligned crop domain."""
 
     points = np.asarray(polygon, dtype=np.float32).reshape((-1, 2))
     if len(points) < 3 or not np.isfinite(points).all():
-        raise ValueError("YOLO polygon has no area for aligned mask conversion")
+        raise ValueError("RF-DETR polygon has no area for aligned mask conversion")
     affine = np.asarray(matrix, dtype=np.float32).reshape((2, 3))
     if not np.isfinite(affine).all():
         raise ValueError("invalid face alignment matrix for polygon conversion")
@@ -863,7 +864,7 @@ def _build_aligned_mask(
 ) -> np.ndarray:
     """Build the uint8 feather mask in the 128px aligned domain.
 
-    The YOLO polygon is intersected here (pre-warp, uint8) so BGR+alpha share
+    The RF-DETR polygon is intersected here (pre-warp, uint8) so BGR+alpha share
     a single ROI warp. Tradeoff vs the old two-warp float path: ``warp(a*b)``
     differs from ``warp(a)*warp(b)`` under linear interpolation, plus 1/255
     quant. Kept deliberately: a second full ROI warp (or 5-channel warp) was
@@ -891,17 +892,19 @@ def _build_aligned_mask(
         return aligned_mask
     seg = np.asarray(seg_mask_aligned, dtype=np.float32)
     if seg.shape != tuple(aligned_shape):
-        raise ValueError(f"YOLO seg mask shape {seg.shape} does not match aligned {aligned_shape}")
+        raise ValueError(
+            f"RF-DETR seg mask shape {seg.shape} does not match aligned {aligned_shape}"
+        )
     if not np.isfinite(seg).all():
-        raise ValueError("YOLO seg mask contains NaN or infinity")
+        raise ValueError("RF-DETR seg mask contains NaN or infinity")
     if float(seg.max(initial=0.0)) <= 0:
-        raise RuntimeError("empty YOLO-constrained swap mask")
+        raise RuntimeError("empty RF-DETR-constrained swap mask")
     seg_u8 = np.rint(np.clip(seg, 0.0, 1.0) * 255.0).astype(np.uint8)
     aligned_mask = np.rint(
         aligned_mask.astype(np.float32) * seg_u8.astype(np.float32) / 255.0
     ).astype(np.uint8)
     if int(aligned_mask.max(initial=0)) <= 0:
-        raise RuntimeError("empty YOLO-constrained swap mask")
+        raise RuntimeError("empty RF-DETR-constrained swap mask")
     return aligned_mask
 
 
@@ -1525,9 +1528,9 @@ class InSwapper:
         mask_polygons: list[Any] | dict[int, Any] | None = None,
         latents_by_index: dict[int, np.ndarray] | None = None,
     ) -> tuple[np.ndarray, set[int]]:
-        """Run FaceAnalysis once per frame, then swap every YOLO face in one TRT batch.
+        """Run FaceAnalysis once per frame, then swap every RF-DETR face in one TRT batch.
 
-        ``mask_polygons`` optionally carries YOLO segmentation polygons aligned
+        ``mask_polygons`` optionally carries RF-DETR segmentation polygons aligned
         with ``boxes`` (list) or keyed by box index (dict). Each polygon is
         converted to the aligned crop domain and intersected pre-warp so the
         background outside the segmentation is preserved. ``latents_by_index``
@@ -1879,10 +1882,8 @@ def _group_job_indices(jobs: list[Any]) -> list[list[int]]:
 
 class SwapLab:
     def __init__(self, settings: Settings):
-        from ultralytics import YOLO
-
         self.settings = settings
-        self.model, self.detector_backend = self._load_detector(YOLO, settings.detector)
+        self.model, self.detector_backend = self._load_detector(settings.detector, settings.device)
         self.names = {int(key): str(value) for key, value in self.model.names.items()}
         if self.names != {0: "face", 1: "number_plate"}:
             raise RuntimeError(f"expected class 0=face and 1=number_plate, got {self.names}")
@@ -1922,25 +1923,23 @@ class SwapLab:
         self.dropped_frames = 0
 
     @staticmethod
-    def _load_detector(yolo: Any, detector_path: Path) -> tuple[Any, str]:
-        """Keep the swap test runnable when a serialized detector is from another TRT runtime."""
-
-        try:
-            model = yolo(str(detector_path), task="segment")
-            # Ultralytics may defer TensorRT deserialization until this property access.
-            _ = model.names
-            return model, "TensorRT" if detector_path.suffix == ".engine" else "PyTorch"
-        except Exception as error:
-            if detector_path.suffix != ".engine" or not DEFAULT_DETECTOR_CHECKPOINT.is_file():
-                raise
-            print(
-                f"Detector engine could not load ({error}); using {DEFAULT_DETECTOR_CHECKPOINT.name} "
-                "until it is rebuilt for this TensorRT runtime."
+    def _load_detector(detector_path: Path, device: str) -> tuple[Any, str]:
+        selection = select_runtime(
+            RuntimeConfig(
+                checkpoint=detector_path
+                if detector_path.suffix == ".pth"
+                else DEFAULT_DETECTOR_CHECKPOINT,
+                engine=detector_path,
+                backend="tensorrt" if detector_path.suffix == ".engine" else "pytorch",
+                device=device,
             )
-            return yolo(str(DEFAULT_DETECTOR_CHECKPOINT), task="segment"), "PyTorchFallback"
+        )
+        return RFDETRDetector(
+            selection.artifact, selection.backend, selection.device
+        ), selection.backend
 
     async def start(self) -> None:
-        self.worker = asyncio.create_task(self._batch_loop(), name="yolo-swap-batcher")
+        self.worker = asyncio.create_task(self._batch_loop(), name="rfdetr-swap-batcher")
 
     async def close(self) -> None:
         if self.worker is not None:
@@ -2124,21 +2123,10 @@ class SwapLab:
                     job.future.set_exception(payload)
 
     def _predict(self, frames: list[np.ndarray]) -> list[Any]:
-        return list(
-            self.model.predict(
-                source=frames,
-                batch=len(frames),
-                imgsz=IMAGE_SIZE,
-                conf=DETECTOR_CONFIDENCE,
-                iou=0.70,
-                classes=[0, 1],
-                max_det=MAX_DETECTIONS,
-                retina_masks=True,
-                device=self.settings.device,
-                quantize=16,
-                verbose=False,
-            )
-        )
+        return [
+            self.model.predict(frame, threshold=DETECTOR_CONFIDENCE, max_detections=MAX_DETECTIONS)
+            for frame in frames
+        ]
 
     async def _compose(
         self, frame: np.ndarray, prediction: Any, stream: StreamState, batch_size: int
@@ -2650,7 +2638,7 @@ def main() -> None:
 _HTML = """<!doctype html>
 <meta charset="utf-8"><title>TensorRT Swap Lab</title>
 <style>body{font:16px system-ui;background:#111;color:#eee;margin:2rem}video,img{width:min(48%,720px);background:#222}pre{background:#222;padding:1rem}</style>
-<h1>TensorRT Face Swap Lab</h1><p>Browser webcam → TensorRT YOLO → face swap</p>
+<h1>TensorRT Face Swap Lab</h1><p>Browser webcam → TensorRT RF-DETR → face swap</p>
 <video id="v" autoplay muted playsinline></video><video id="rtc-output" autoplay muted playsinline hidden></video><img id="ws-output" hidden><pre id="m">starting…</pre>
 <script>
 const id=crypto.randomUUID();

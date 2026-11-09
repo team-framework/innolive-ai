@@ -1,4 +1,4 @@
-"""Platform-aware YOLO runtime with one serialized inference lane."""
+"""Platform-aware RF-DETR runtime with one serialized inference lane."""
 
 from __future__ import annotations
 
@@ -34,24 +34,24 @@ if TYPE_CHECKING:
     from service.tracking import StreamTracker
 
 
-IMAGE_SIZE = 640
-STANDARD_PROFILE = "B1-640-Q90-W5"
+IMAGE_SIZE = 624
+STANDARD_PROFILE = "B1-624-Q90-W5"
 MAX_DETECTIONS = 100
 MAX_POLYGON_POINTS = 64
 POLYGON_EPSILON_START = 0.5
 POLYGON_EPSILON_GROWTH = 1.25
 BACKENDS = frozenset({"auto", "tensorrt", "pytorch"})
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHECKPOINT = ROOT / "models" / "best.pt"
-DEFAULT_ENGINE = ROOT / "models" / "best_b1.engine"
+DEFAULT_CHECKPOINT = ROOT / "models" / "rfdetr_seg_s.pth"
+DEFAULT_ENGINE = ROOT / "models" / "rfdetr_seg_s_b1.engine"
 
 
 def detector_mask_pad(height: int, width: int) -> int:
     """Output pixels spanned by one detector mask pixel, used to widen protected regions.
 
-    Mask outlines come from the IMAGE_SIZE letterboxed mask, so their edges can sit up to one
-    mask pixel inside the face. 1080x1920 frames measured 1-3px shrinkage; padding by one mask
-    pixel covers it.
+    Mask outlines come from the IMAGE_SIZE square-resized mask, so their edges can sit up to one
+    mask pixel inside the protected region. Padding by one resized mask pixel
+    compensates contour quantization without changing detector coordinates.
     """
     if height <= 0 or width <= 0:
         raise ValueError("frame dimensions must be positive")
@@ -200,7 +200,10 @@ def validate_engine(config: RuntimeConfig) -> dict[str, Any]:
         raise RuntimeError(f"invalid TensorRT manifest: {manifest_path}") from error
 
     required = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "model_name": "RFDETRSegSmall",
+        "preprocessing": "rgb-square-imagenet",
+        "background_class_id": 2,
         "standard_profile": STANDARD_PROFILE,
         "precision": "fp16",
         "dynamic": False,
@@ -256,7 +259,7 @@ def _select_tensorrt(config: RuntimeConfig) -> RuntimeSelection:
 
 
 def _select_pytorch(config: RuntimeConfig) -> RuntimeSelection:
-    if not config.checkpoint.is_file() or config.checkpoint.suffix.lower() != ".pt":
+    if not config.checkpoint.is_file() or config.checkpoint.suffix.lower() != ".pth":
         raise RuntimeError(f"PyTorch checkpoint not found: {config.checkpoint}")
     return RuntimeSelection(
         backend="pytorch",
@@ -330,22 +333,23 @@ class RuntimeManager:
 
         self.backend = self.selection.backend
         self.device = self.selection.device
-        self.artifact_sha256 = sha256_file(self.selection.artifact)
         self.ready = False
         self._closed = False
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
-        # GMC는 화면만 쓰므로 같은 프레임의 GPU 추론과 동시에 계산한다. 추론 줄이 한 번에 한 프레임만
-        # 처리하므로 스레드 하나로 충분하다.
-        self._motion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-motion")
         self._lane: PriorityLane | None = None
         self._latency: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=300))
         self.frames = 0
         self.warmup_ms: float | None = None
         try:
-            from ultralytics import YOLO
+            self.artifact_sha256 = sha256_file(self.selection.artifact)
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1-inference")
+            # GMC only reads this frame, so one worker can overlap motion with inference.
+            self._motion_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="b1-motion"
+            )
+            from service.rfdetr import RFDETRDetector
 
             started = time.perf_counter()
-            self._model = YOLO(str(self.selection.artifact), task="segment")
+            self._model = RFDETRDetector(self.selection.artifact, self.backend, self.device)
             self.names = {int(key): str(value) for key, value in self._model.names.items()}
             if self.names != EXPECTED_CLASS_NAMES:
                 raise RuntimeError(
@@ -368,26 +372,9 @@ class RuntimeManager:
 
     def _predict(self, image: np.ndarray):
         with CUDA_CAPTURE_LOCK:
-            results = list(
-                self._model.predict(
-                    source=[image],
-                    batch=1,
-                    imgsz=IMAGE_SIZE,
-                    conf=DETECTOR_CONFIDENCE,
-                    iou=0.70,
-                    classes=list(EXPECTED_CLASS_NAMES),
-                    max_det=MAX_DETECTIONS,
-                    # 마스크 윤곽을 640 기준 마스크에서 뽑는다. 원본 해상도 업샘플링은 FHD 프레임 시간의
-                    # 절반 가까이를 쓰지만 윤곽은 어차피 64점으로 줄어든다. 줄어든 경계는
-                    # detector_mask_pad만큼 보호 영역을 넓혀 보정한다.
-                    retina_masks=False,
-                    device=self.device,
-                    verbose=False,
-                )
+            return self._model.predict(
+                image, threshold=DETECTOR_CONFIDENCE, max_detections=MAX_DETECTIONS
             )
-        if len(results) != 1:
-            raise RuntimeError(f"B1 inference returned {len(results)} results")
-        return results[0]
 
     async def infer(
         self, image: np.ndarray, tracker: StreamTracker, *, live: bool = True
@@ -580,7 +567,8 @@ class RuntimeManager:
             return
         self.ready = False
         self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_motion_executor"):
             self._motion_executor.shutdown(wait=True, cancel_futures=True)
         if hasattr(self, "_model"):

@@ -23,24 +23,69 @@ from service.runtime import (
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_early_startup_failure_releases_runtime_reservation(self):
+        from types import SimpleNamespace
+
+        selection = SimpleNamespace(
+            backend="pytorch", device="cpu", artifact=Path("checkpoint.pth"), manifest=None
+        )
+        model = SimpleNamespace(names={0: "face", 1: "number_plate"}, predict=lambda *a, **k: None)
+        for failing_stage in ("hash", "executor", "motion_executor"):
+            with (
+                self.subTest(stage=failing_stage),
+                patch("service.runtime.select_runtime", return_value=selection),
+            ):
+                from concurrent.futures import ThreadPoolExecutor
+
+                executor = ThreadPoolExecutor(max_workers=1)
+                self.addCleanup(executor.shutdown)
+                with (
+                    patch(
+                        "service.runtime.sha256_file",
+                        side_effect=OSError("unreadable") if failing_stage == "hash" else None,
+                        return_value="digest",
+                    ),
+                    patch(
+                        "service.runtime.ThreadPoolExecutor",
+                        side_effect=[executor, OSError("worker unavailable")]
+                        if failing_stage == "motion_executor"
+                        else OSError("worker unavailable"),
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    RuntimeManager(RuntimeConfig())
+                self.assertEqual(RuntimeManager._live_instances, 0)
+                with (
+                    patch("service.runtime.sha256_file", return_value="digest"),
+                    patch("service.rfdetr.RFDETRDetector", return_value=model),
+                ):
+                    runtime = RuntimeManager(RuntimeConfig())
+                    try:
+                        self.assertTrue(runtime.ready)
+                    finally:
+                        runtime.close()
+
     def engine(self, root: Path, **overrides) -> Path:
-        engine = root / "best_b1.engine"
+        engine = root / "rfdetr_seg_s_b1.engine"
         engine.write_bytes(b"engine")
         manifest = {
-            "schema_version": 1,
-            "standard_profile": "B1-640-Q90-W5",
+            "schema_version": 2,
+            "model_name": "RFDETRSegSmall",
+            "preprocessing": "rgb-square-imagenet",
+            "background_class_id": 2,
+            "standard_profile": "B1-624-Q90-W5",
             "precision": "fp16",
             "dynamic": False,
             "batch": 1,
-            "image_size": 640,
+            "image_size": 624,
             "class_names": {"0": "face", "1": "number_plate"},
-            "source_checkpoint": "best.pt",
+            "source_checkpoint": "rfdetr_seg_s.pth",
             "source_sha256": hashlib.sha256(b"checkpoint").hexdigest(),
             "engine_sha256": hashlib.sha256(b"engine").hexdigest(),
         }
         manifest.update(overrides)
         engine.with_suffix(".engine.json").write_text(json.dumps(manifest))
-        (root / "best.pt").write_bytes(b"checkpoint")
+        (root / "rfdetr_seg_s.pth").write_bytes(b"checkpoint")
         return engine
 
     def test_accepts_exact_standard_manifest(self):
@@ -67,7 +112,7 @@ class RuntimeContractTests(unittest.TestCase):
             engine.write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "hash"):
                 validate_engine(RuntimeConfig(engine=engine))
-            checkpoint = Path(temporary) / "best.pt"
+            checkpoint = Path(temporary) / "rfdetr_seg_s.pth"
             checkpoint.write_bytes(b"checkpoint")
             with self.assertRaisesRegex(RuntimeError, "TensorRT"):
                 validate_engine(RuntimeConfig(engine=checkpoint))
@@ -75,13 +120,13 @@ class RuntimeContractTests(unittest.TestCase):
     def test_rejects_checkpoint_provenance_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             engine = self.engine(Path(temporary))
-            (Path(temporary) / "best.pt").write_bytes(b"different")
+            (Path(temporary) / "rfdetr_seg_s.pth").write_bytes(b"different")
             with self.assertRaisesRegex(RuntimeError, "checkpoint hash"):
                 validate_engine(RuntimeConfig(engine=engine))
 
     def test_auto_falls_back_to_pytorch_when_tensorrt_is_unavailable(self):
         with tempfile.TemporaryDirectory() as temporary:
-            checkpoint = Path(temporary) / "best.pt"
+            checkpoint = Path(temporary) / "rfdetr_seg_s.pth"
             checkpoint.write_bytes(b"checkpoint")
             config = RuntimeConfig(checkpoint=checkpoint, device="cpu")
             with patch("service.runtime._tensorrt_supported", return_value=False):
@@ -102,7 +147,9 @@ class RuntimeContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             engine = self.engine(root)
-            config = RuntimeConfig(checkpoint=root / "best.pt", engine=engine, device="cpu")
+            config = RuntimeConfig(
+                checkpoint=root / "rfdetr_seg_s.pth", engine=engine, device="cpu"
+            )
             with patch("service.runtime._tensorrt_supported", return_value=True):
                 selection = select_runtime(config)
             self.assertEqual((selection.backend, selection.device), ("pytorch", "cpu"))
@@ -112,14 +159,14 @@ class RuntimeContractTests(unittest.TestCase):
         config = RuntimeConfig(backend=" PyTorch ", device=" MPS ")
         self.assertEqual((config.backend, config.device), ("pytorch", "mps"))
 
-    def test_prediction_uses_640_and_both_model_classes(self):
+    def test_prediction_uses_shared_detector_thresholds(self):
         class FakeModel:
             def __init__(self):
                 self.kwargs = None
 
-            def predict(self, **kwargs):
+            def predict(self, image, **kwargs):
                 self.kwargs = kwargs
-                return ["prediction"]
+                return "prediction"
 
         model = FakeModel()
         runtime = RuntimeManager.__new__(RuntimeManager)
@@ -127,12 +174,11 @@ class RuntimeContractTests(unittest.TestCase):
         runtime.device = "cpu"
 
         self.assertEqual(runtime._predict(np.zeros((64, 64, 3), dtype=np.uint8)), "prediction")
-        self.assertEqual(model.kwargs["imgsz"], IMAGE_SIZE)
-        self.assertEqual(model.kwargs["classes"], [0, 1])
-        self.assertIs(model.kwargs["retina_masks"], False)
+        self.assertEqual(model.kwargs["threshold"], 0.01)
+        self.assertEqual(model.kwargs["max_detections"], 100)
 
     def test_mask_pad_is_one_detector_mask_pixel_in_output_pixels(self):
-        cases = {(1920, 1080): 3, (1080, 1920): 3, (1280, 720): 2, (640, 360): 1, (64, 64): 1}
+        cases = {(1920, 1080): 4, (1080, 1920): 4, (1280, 720): 3, (640, 360): 2, (64, 64): 1}
         for (height, width), expected in cases.items():
             with self.subTest(height=height, width=width):
                 self.assertEqual(detector_mask_pad(height, width), expected)
@@ -143,7 +189,7 @@ class RuntimeContractTests(unittest.TestCase):
 
 class _FakePrediction:
     class boxes:
-        """Mimics the ultralytics ``prediction.boxes.cpu().numpy()`` chain."""
+        """Mimics the detector-independent ``prediction.boxes.cpu().numpy()`` chain."""
 
         @staticmethod
         def cpu():

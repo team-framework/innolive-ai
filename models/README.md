@@ -1,14 +1,23 @@
 # Runtime model files
 
-`best.pt` is the serving YOLO segmentation checkpoint. The runtime uses `imgsz=640`
-and expects class `0` as `face` and class `1` as `number_plate`; both classes are
-included in the protected mosaic path, while only `face` enters AdaFace recognition.
+Download `checkpoint_best_ema.pth` from the
+[team Google Drive folder](https://drive.google.com/drive/folders/1B4ZWbUPJp-t6mzJpSYqhkOxTRM1eH0i1?usp=sharing)
+and install it as `models/rfdetr_seg_s.pth`.
+The same folder contains the MobileFSGAN bundle, `face_presets.zip`, and
+`face_presets.json`. See the [download and installation guide](../docs/face-swap-model-download.md)
+for individual links, destination paths, and SHA-256 checks.
+The serving model is RF-DETR-Seg Small, resolution 624, checkpoint class IDs
+`0=face`, `1=plate`, final background slot `2`. The public API preserves
+`0=face`, `1=number_plate`. Both classes remain protected; only faces enter
+AdaFace and synthesis. The checkpoint is installed separately, not committed.
 
-The TensorRT, AdaFace, and YuNet binaries are deployment artifacts and are not
-tracked by Git. Build the TensorRT engine on the target Linux x86_64 NVIDIA host
-from `best.pt`; do not copy an engine built on another GPU or TensorRT stack.
-The export command creates both `best_b1.engine` and its local validation manifest
-`best_b1.engine.json` next to the checkpoint. The server expects these defaults:
+Build `rfdetr_seg_s_b1.engine` and its `.engine.json` manifest on the serving
+Linux NVIDIA GPU using `python -m scripts.export_tensorrt --device 0`.
+The manifest binds the checkpoint, preprocessing, class mapping, TensorRT version,
+and engine hashes. Legacy detector engines are rejected.
+See [migration and validation](../docs/rfdetr-migration.md).
+
+The remaining optional recognition/alignment artifacts are:
 
 | File | Source | SHA-256 used for smoke testing |
 | --- | --- | --- |
@@ -75,7 +84,7 @@ For official download commands and preset installation, see
 [공식 사전학습 모델 다운로드: checkpoints.tar](https://drive.google.com/file/d/1ZIzGLDB15GRAZAbkfNR0hNWdgQpxeA_r/view)
 ([원본 프로젝트 안내](https://github.com/Seanseattle/MobileFaceSwap#readme)).
 약 543 MiB의 TAR 파일이며, 내부 `checkpoints/`를 이 서버의
-`models/mobilefaceswap/`에 맞춰 설치한다. `models/best.pt`와 metadata 모델은 그대로 사용한다.
+`models/mobilefaceswap/`에 맞춰 설치한다. 탐지는 `models/rfdetr_seg_s.pth`를 사용하고 metadata 모델은 유지한다.
 
 | 저장 위치 (`models/` 기준) | 용도 | 다운로드 파일에서 확인한 SHA-256 |
 | --- | --- | --- |

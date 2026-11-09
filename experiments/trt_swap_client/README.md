@@ -1,5 +1,7 @@
 # TensorRT Face Swap Lab (프로덕션 연동 가이드)
 
+> 현재 탐지 backend는 RF-DETR-Seg Small입니다. 새 설치·엔진·성능은 [RF-DETR 전환 가이드](../../docs/rfdetr-migration.md)를 따르세요. 아래 과거 측정의 YOLO 수치는 당시 모델 기준입니다.
+
 독립 테스트 클라이언트이자 프로덕션 face-swap 파이프라인의 기준 구현이다.
 YOLO26n-seg 검출 → 얼굴 합성 → blur fallback까지 한 프로세스에서 돌고,
 WebRTC/WebSocket/file(HLS) 출력으로 서빙한다.
@@ -10,7 +12,7 @@ python -m pip install -r requirements-trt-swap-client.txt
 
 ```bash
 python -m experiments.trt_swap_client.export_detector \
-  --checkpoint models/best.pt --output models/best_swap_b4.engine \
+  --checkpoint models/rfdetr_seg_s.pth --output models/rfdetr_seg_s_b1.engine \
   --max-batch 4 --workspace 8 --device 0
 
 python -m experiments.trt_swap_client.build_mixed_onnx \

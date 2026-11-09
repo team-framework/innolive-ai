@@ -7,8 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
-from ultralytics.engine.results import Boxes
 
+from service.detection import Boxes
 from service.recognition import (
     RecognitionConfig,
     SessionInUseError,

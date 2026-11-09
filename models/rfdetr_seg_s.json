@@ -1,0 +1,15 @@
+{
+  "source_filename": "checkpoint_best_ema.pth",
+  "installed_filename": "rfdetr_seg_s.pth",
+  "sha256": "a5da6cb2a53ff001215149bb941678a27b02acd1dba6521a419fea30defdb2cf",
+  "model_name": "RFDETRSegSmall",
+  "rfdetr_version": "1.11.2",
+  "resolution": 624,
+  "epoch": 12,
+  "checkpoint_class_names": ["face", "plate"],
+  "api_class_names": {"0": "face", "1": "number_plate"},
+  "background_class_id": 2,
+  "num_queries": 100,
+  "mask_downsample_ratio": 4,
+  "checkpoint_license_metadata": "Apache-2.0"
+}
