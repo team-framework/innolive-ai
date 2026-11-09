@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = ROOT / "models" / "best.pt"
+MODEL = ROOT / "models" / "rfdetr_seg_s.pth"
 # Git LFS pointer files are ~130 bytes; a real checkpoint is tens of MB.
 MODEL_AVAILABLE = MODEL.is_file() and MODEL.stat().st_size > 1_000_000
 
@@ -90,7 +90,7 @@ def _audio_streams(path: Path) -> list[dict]:
 
 @unittest.skipUnless(
     MODEL_AVAILABLE,
-    "models/best.pt is unavailable (unresolved Git LFS pointer); CLI needs the real model",
+    "models/rfdetr_seg_s.pth is unavailable (install the supplied RF-DETR checkpoint); CLI needs the real model",
 )
 class VodCliTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -643,7 +643,7 @@ class GrpcLoopbackIntegrationTests(unittest.IsolatedAsyncioTestCase):
             async with LoopbackServer(FaceRuntime()) as server:
                 responses = await _collect(server.stub.ProcessVideo(_requests(request)))
         self.assertEqual([r.status_message for r in responses], ["success"])
-        self.assertEqual(compose.call_args.kwargs["mask_pad"], 2)
+        self.assertEqual(compose.call_args.kwargs["mask_pad"], 3)
 
     async def test_invalid_mask_margin_rejects_only_that_frame_before_inference(self):
         runtime = FaceRuntime()

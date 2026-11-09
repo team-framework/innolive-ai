@@ -127,7 +127,7 @@ def test_objects_accepts_non_contiguous_segmentation_polygon() -> None:
     assert objects[0]["mask_area_px"] == 36.0
 
 
-def test_swapper_analyzes_one_frame_once_for_multiple_yolo_faces() -> None:
+def test_swapper_analyzes_one_frame_once_for_multiple_detected_faces() -> None:
     class Face:
         def __init__(self, bbox: list[float]) -> None:
             self.bbox = np.asarray(bbox, dtype=np.float32)
@@ -288,7 +288,7 @@ def test_aligned_seg_mask_keeps_interior_and_feathers_boundary() -> None:
     assert _aligned_seg_mask(np.asarray([[0.0, 0.0], [1.0, 1.0]])) is None
 
 
-def test_paste_inswapper_with_yolo_mask_preserves_background_outside() -> None:
+def test_paste_inswapper_with_segmentation_mask_preserves_background_outside() -> None:
     target = np.full((64, 64, 3), 100, dtype=np.uint8)
     aligned = np.full((16, 16, 3), 200, dtype=np.uint8)
     fake = np.full((16, 16, 3), 250, dtype=np.uint8)
@@ -1070,7 +1070,7 @@ def test_small_face_erosion_keeps_interior_mask() -> None:
     mask = _build_aligned_mask((128, 128), 20.0, None)
     assert mask.shape == (128, 128)
     assert int(mask.max()) > 0
-    with pytest.raises(RuntimeError, match="empty YOLO"):
+    with pytest.raises(RuntimeError, match="empty RF-DETR"):
         _build_aligned_mask((128, 128), 100.0, np.zeros((128, 128), dtype=np.float32))
 
 
